@@ -1,3 +1,4 @@
+mod scenes;
 mod tex;
 
 use std::path::{Path, PathBuf};
@@ -37,6 +38,15 @@ enum Command {
         #[arg(long)]
         assets: Vec<PathBuf>,
     },
+    /// Parse project, scene, model, material and effect JSON of every workshop scene.
+    ScanScenes {
+        /// Wallpaper Engine's stock assets/ directory.
+        #[arg(long)]
+        assets: PathBuf,
+        /// Workshop content directory (containing <id>/scene.pkg).
+        #[arg(long)]
+        workshop: PathBuf,
+    },
 }
 
 fn main() -> Result<()> {
@@ -46,6 +56,7 @@ fn main() -> Result<()> {
         Command::ScanPkgs { dir } => scan_pkgs(&dir),
         Command::Tex2png { input, out, pkg } => tex::tex2png(&input, &out, pkg.as_deref()),
         Command::ScanTex { workshop, assets } => tex::scan_tex(workshop.as_deref(), &assets),
+        Command::ScanScenes { assets, workshop } => scenes::scan_scenes(&assets, &workshop),
     }
 }
 

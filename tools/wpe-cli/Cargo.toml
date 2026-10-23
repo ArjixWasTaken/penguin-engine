@@ -9,6 +9,7 @@ anyhow = "1.0.104"
 clap = { version = "4.6.7", features = ["derive"] }
 half = "2.7.1"
 image = { version = "0.25.10", default-features = false, features = ["png"] }
+serde = "1.0.229"
 texture2ddecoder = "0.1.2"
 wpe-assets = { version = "0.1.0", path = "../../crates/wpe-assets" }
 wpe-vfs = { version = "0.1.0", path = "../../crates/wpe-vfs" }

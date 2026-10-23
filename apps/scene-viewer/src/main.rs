@@ -1,3 +1,243 @@
-fn main() {
-    println!("Hello, world!");
+use std::path::PathBuf;
+use std::sync::Arc;
+
+use anyhow::{Context, Result};
+use clap::Parser;
+use winit::application::ApplicationHandler;
+use winit::dpi::PhysicalSize;
+use winit::event::{ElementState, KeyEvent, WindowEvent};
+use winit::event_loop::{ActiveEventLoop, EventLoop};
+use winit::keyboard::{Key, NamedKey};
+use winit::window::{Window, WindowId};
+use wpe_render::{Gpu, wgpu};
+use wpe_runtime::{FillMode, Wallpaper};
+
+#[derive(Parser)]
+#[command(about = "View a Wallpaper Engine scene wallpaper")]
+struct Args {
+    /// Wallpaper directory (with project.json), scene.pkg, or scene JSON file.
+    wallpaper: PathBuf,
+    /// Wallpaper Engine's stock assets directory.
+    #[arg(long)]
+    assets: Option<PathBuf>,
+    /// Render one frame offscreen to this PNG and exit.
+    #[arg(long)]
+    screenshot: Option<PathBuf>,
+    /// Output size for --screenshot, or the initial window size.
+    #[arg(long, default_value = "1920x1080", value_parser = parse_size)]
+    size: (u32, u32),
+    #[arg(long, value_enum, default_value_t = Fill::Crop)]
+    fill: Fill,
+}
+
+#[derive(Clone, Copy, clap::ValueEnum)]
+enum Fill {
+    Crop,
+    Fit,
+    Stretch,
+}
+
+impl From<Fill> for FillMode {
+    fn from(f: Fill) -> Self {
+        match f {
+            Fill::Crop => FillMode::Crop,
+            Fill::Fit => FillMode::Fit,
+            Fill::Stretch => FillMode::Stretch,
+        }
+    }
+}
+
+fn parse_size(s: &str) -> Result<(u32, u32), String> {
+    let (w, h) = s.split_once('x').ok_or("expected WIDTHxHEIGHT")?;
+    let parse = |v: &str| v.parse::<u32>().map_err(|e| e.to_string());
+    Ok((parse(w)?, parse(h)?))
+}
+
+fn default_assets_dir() -> Option<PathBuf> {
+    let home = std::env::var_os("HOME").map(PathBuf::from)?;
+    [
+        ".local/share/Steam/steamapps/common/wallpaper_engine/assets",
+        ".steam/steam/steamapps/common/wallpaper_engine/assets",
+        ".var/app/com.valvesoftware.Steam/.local/share/Steam/steamapps/common/wallpaper_engine/assets",
+    ]
+    .into_iter()
+    .map(|p| home.join(p))
+    .find(|p| p.is_dir())
+}
+
+fn main() -> Result<()> {
+    tracing_subscriber::fmt()
+        .with_env_filter(
+            tracing_subscriber::EnvFilter::try_from_default_env()
+                .unwrap_or_else(|_| "info,wgpu_core=warn,wgpu_hal=warn".into()),
+        )
+        .init();
+    let args = Args::parse();
+    let assets = args
+        .assets
+        .clone()
+        .or_else(default_assets_dir)
+        .context("Wallpaper Engine assets directory not found; pass --assets")?;
+
+    if let Some(out) = &args.screenshot {
+        return screenshot(&args, &assets, out);
+    }
+
+    let event_loop = EventLoop::new()?;
+    let mut app = App {
+        args,
+        assets,
+        state: None,
+        error: None,
+    };
+    event_loop.run_app(&mut app)?;
+    app.error.map_or(Ok(()), Err)
+}
+
+fn screenshot(args: &Args, assets: &std::path::Path, out: &std::path::Path) -> Result<()> {
+    let instance =
+        wgpu::Instance::new(wgpu::InstanceDescriptor::new_without_display_handle_from_env());
+    let gpu = pollster::block_on(Gpu::new(instance, None))?;
+    let mut wallpaper = Wallpaper::load(
+        &gpu,
+        wgpu::TextureFormat::Rgba8Unorm,
+        assets,
+        &args.wallpaper,
+    )?;
+    wallpaper.fill = args.fill.into();
+    let pixels = wallpaper.capture(&gpu, args.size);
+    image::RgbaImage::from_raw(args.size.0, args.size.1, pixels)
+        .context("capture size mismatch")?
+        .save(out)?;
+    tracing::info!("wrote {}", out.display());
+    Ok(())
+}
+
+struct State {
+    window: Arc<Window>,
+    surface: wgpu::Surface<'static>,
+    config: wgpu::SurfaceConfiguration,
+    gpu: Gpu,
+    wallpaper: Wallpaper,
+}
+
+struct App {
+    args: Args,
+    assets: PathBuf,
+    state: Option<State>,
+    error: Option<anyhow::Error>,
+}
+
+impl App {
+    fn init(&mut self, event_loop: &ActiveEventLoop) -> Result<State> {
+        let window = Arc::new(
+            event_loop.create_window(
+                Window::default_attributes()
+                    .with_title("scene-viewer")
+                    .with_inner_size(PhysicalSize::new(self.args.size.0, self.args.size.1)),
+            )?,
+        );
+        let instance =
+            wgpu::Instance::new(wgpu::InstanceDescriptor::new_with_display_handle_from_env(
+                Box::new(event_loop.owned_display_handle()),
+            ));
+        let surface = instance.create_surface(window.clone())?;
+        let gpu = pollster::block_on(Gpu::new(instance, Some(&surface)))?;
+
+        let caps = surface.get_capabilities(&gpu.adapter);
+        let format = caps
+            .formats
+            .iter()
+            .copied()
+            .find(|f| !f.is_srgb())
+            .unwrap_or(caps.formats[0]);
+        let size = window.inner_size();
+        let mut config = surface
+            .get_default_config(&gpu.adapter, size.width.max(1), size.height.max(1))
+            .context("surface is incompatible with the adapter")?;
+        config.format = format;
+        config.present_mode = wgpu::PresentMode::AutoVsync;
+        surface.configure(&gpu.device, &config);
+
+        let mut wallpaper = Wallpaper::load(&gpu, format, &self.assets, &self.args.wallpaper)?;
+        wallpaper.fill = self.args.fill.into();
+        window.set_title(&format!("{} — scene-viewer", wallpaper.title));
+        Ok(State {
+            window,
+            surface,
+            config,
+            gpu,
+            wallpaper,
+        })
+    }
+}
+
+impl State {
+    fn redraw(&mut self) {
+        let frame = match self.surface.get_current_texture() {
+            wgpu::CurrentSurfaceTexture::Success(f)
+            | wgpu::CurrentSurfaceTexture::Suboptimal(f) => f,
+            wgpu::CurrentSurfaceTexture::Outdated | wgpu::CurrentSurfaceTexture::Lost => {
+                self.surface.configure(&self.gpu.device, &self.config);
+                return;
+            }
+            other => {
+                tracing::debug!("skipping frame: {other:?}");
+                return;
+            }
+        };
+        let view = frame.texture.create_view(&Default::default());
+        let mut encoder = self.gpu.device.create_command_encoder(&Default::default());
+        self.wallpaper.render(
+            &self.gpu,
+            &mut encoder,
+            &view,
+            (self.config.width, self.config.height),
+        );
+        self.gpu.queue.submit([encoder.finish()]);
+        self.window.pre_present_notify();
+        self.gpu.queue.present(frame);
+    }
+}
+
+impl ApplicationHandler for App {
+    fn resumed(&mut self, event_loop: &ActiveEventLoop) {
+        if self.state.is_some() {
+            return;
+        }
+        match self.init(event_loop) {
+            Ok(state) => self.state = Some(state),
+            Err(e) => {
+                self.error = Some(e);
+                event_loop.exit();
+            }
+        }
+    }
+
+    fn window_event(&mut self, event_loop: &ActiveEventLoop, _: WindowId, event: WindowEvent) {
+        let Some(state) = &mut self.state else { return };
+        match event {
+            WindowEvent::CloseRequested
+            | WindowEvent::KeyboardInput {
+                event:
+                    KeyEvent {
+                        logical_key: Key::Named(NamedKey::Escape),
+                        state: ElementState::Pressed,
+                        ..
+                    },
+                ..
+            } => event_loop.exit(),
+            WindowEvent::Resized(size) => {
+                state.config.width = size.width.max(1);
+                state.config.height = size.height.max(1);
+                state.surface.configure(&state.gpu.device, &state.config);
+                state.window.request_redraw();
+            }
+            WindowEvent::RedrawRequested => {
+                state.redraw();
+                state.window.request_redraw();
+            }
+            _ => {}
+        }
+    }
 }

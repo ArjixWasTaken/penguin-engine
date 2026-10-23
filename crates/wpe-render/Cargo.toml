@@ -5,3 +5,9 @@ edition.workspace = true
 license.workspace = true
 
 [dependencies]
+bytemuck = { version = "1.25.2", features = ["derive"] }
+glam = { version = "0.34.1", features = ["bytemuck"] }
+thiserror = "2.0.21"
+tracing = "0.1.44"
+wgpu = "30.0.1"
+wpe-assets = { version = "0.1.0", path = "../wpe-assets" }

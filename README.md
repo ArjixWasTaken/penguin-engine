@@ -26,10 +26,24 @@ Nothing from Wallpaper Engine is bundled here. With a Steam install they live at
 | `apps/scene-viewer` | Windowed scene viewer |
 | `tools/wpe-cli` | Debug tooling (`ls`/`extract` pkg, corpus scans) |
 
+## Scene viewer
+
+```sh
+cargo run --release -p scene-viewer -- ~/.local/share/Steam/steamapps/workshop/content/431960/<id>
+cargo run --release -p scene-viewer -- <wallpaper> --screenshot out.png --size 1920x1080
+```
+
+The assets directory is found automatically for common Steam installs; pass `--assets` otherwise.
+Currently renders static image layers with a built-in stand-in for `genericimage2`; real
+Wallpaper Engine shaders, effects, particles and text are upcoming milestones.
+
 ## Tools
 
 ```sh
 cargo run -p wpe-cli -- ls path/to/scene.pkg
 cargo run -p wpe-cli -- extract path/to/scene.pkg out/
 cargo run -p wpe-cli -- scan-pkgs ~/.local/share/Steam/steamapps/workshop/content/431960
+cargo run -p wpe-cli -- tex2png --pkg path/to/scene.pkg materials/foo.tex out.png
+cargo run -p wpe-cli -- scan-tex --assets <WE assets> --workshop <workshop dir>
+cargo run -p wpe-cli -- scan-scenes --assets <WE assets> --workshop <workshop dir>
 ```

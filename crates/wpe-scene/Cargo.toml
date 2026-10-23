@@ -5,3 +5,8 @@ edition.workspace = true
 license.workspace = true
 
 [dependencies]
+glam = "0.34.1"
+thiserror = "2.0.21"
+tracing = "0.1.44"
+wpe-assets = { version = "0.1.0", path = "../wpe-assets" }
+wpe-vfs = { version = "0.1.0", path = "../wpe-vfs" }
