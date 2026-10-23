@@ -1,0 +1,23 @@
+[workspace]
+resolver = "2"
+members = ["crates/*", "apps/*", "tools/*"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+license = "GPL-2.0-only"
+repository = "https://github.com/arjix/wallpaper-engine-rs"
+
+[workspace.dependencies]
+wpe-vfs = { path = "crates/wpe-vfs" }
+wpe-assets = { path = "crates/wpe-assets" }
+wpe-shader = { path = "crates/wpe-shader" }
+wpe-scene = { path = "crates/wpe-scene" }
+wpe-render = { path = "crates/wpe-render" }
+wpe-runtime = { path = "crates/wpe-runtime" }
+
+[profile.dev]
+debug = "line-tables-only"
+
+[profile.dev.package."*"]
+opt-level = 2

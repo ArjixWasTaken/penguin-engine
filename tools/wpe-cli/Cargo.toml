@@ -1,0 +1,10 @@
+[package]
+name = "wpe-cli"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+anyhow = "1.0.104"
+clap = { version = "4.6.7", features = ["derive"] }
+wpe-vfs = { version = "0.1.0", path = "../../crates/wpe-vfs" }
