@@ -44,10 +44,12 @@ impl FileSystem for PhysicalFs {
             .index
             .get(path)
             .ok_or_else(|| VfsError::NotFound(path.to_owned()))?;
-        std::fs::read(real).map(Cow::Owned).map_err(|source| VfsError::Io {
-            path: real.display().to_string(),
-            source,
-        })
+        std::fs::read(real)
+            .map(Cow::Owned)
+            .map_err(|source| VfsError::Io {
+                path: real.display().to_string(),
+                source,
+            })
     }
 
     fn files(&self) -> Box<dyn Iterator<Item = &str> + '_> {

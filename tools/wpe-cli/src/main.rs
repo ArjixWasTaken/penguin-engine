@@ -1,3 +1,5 @@
+mod tex;
+
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
@@ -19,6 +21,22 @@ enum Command {
     Extract { pkg: PathBuf, out: PathBuf },
     /// Parse every scene.pkg under a workshop content directory and report failures.
     ScanPkgs { dir: PathBuf },
+    /// Decode the first mip of a .tex to PNG. With --pkg, INPUT is a path inside that archive.
+    Tex2png {
+        input: String,
+        out: PathBuf,
+        #[arg(long)]
+        pkg: Option<PathBuf>,
+    },
+    /// Decode every .tex in workshop scene.pkg files and loose asset directories.
+    ScanTex {
+        /// Workshop content directory (containing <id>/scene.pkg).
+        #[arg(long)]
+        workshop: Option<PathBuf>,
+        /// Loose asset directories (e.g. Wallpaper Engine's assets/).
+        #[arg(long)]
+        assets: Vec<PathBuf>,
+    },
 }
 
 fn main() -> Result<()> {
@@ -26,6 +44,8 @@ fn main() -> Result<()> {
         Command::Ls { pkg } => ls(&pkg),
         Command::Extract { pkg, out } => extract(&pkg, &out),
         Command::ScanPkgs { dir } => scan_pkgs(&dir),
+        Command::Tex2png { input, out, pkg } => tex::tex2png(&input, &out, pkg.as_deref()),
+        Command::ScanTex { workshop, assets } => tex::scan_tex(workshop.as_deref(), &assets),
     }
 }
 
@@ -55,7 +75,11 @@ fn extract(path: &Path, out: &Path) -> Result<()> {
         std::fs::write(&dest, pkg.entry_bytes(e))
             .with_context(|| format!("writing {}", dest.display()))?;
     }
-    println!("extracted {} entries to {}", pkg.entries().len(), out.display());
+    println!(
+        "extracted {} entries to {}",
+        pkg.entries().len(),
+        out.display()
+    );
     Ok(())
 }
 
