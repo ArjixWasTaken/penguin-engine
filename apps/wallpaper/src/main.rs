@@ -1109,6 +1109,12 @@ impl PointerHandler for App {
             };
             let screen = &mut self.screens[i];
             let (w, h) = screen.logical;
+            tracing::trace!(
+                "{}: pointer {:?} at {:?}",
+                screen.name,
+                event.kind,
+                event.position
+            );
             match event.kind {
                 PointerEventKind::Enter { .. } | PointerEventKind::Motion { .. } => {
                     screen.wallpaper.set_pointer(glam::Vec2::new(

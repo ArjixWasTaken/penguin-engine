@@ -381,6 +381,7 @@ impl Scripts {
             .rev()
             .filter(|id| self.hit(*id, world))
             .collect();
+        tracing::trace!("cursor {kind:?} at {world}: hits {hits:?}");
         self.runtime.cursor_event(
             &mut self.host,
             CursorEvent::new(kind, state.world, state.screen, hits),
@@ -388,12 +389,11 @@ impl Scripts {
     }
 
     fn hit(&self, id: i32, world: Vec2) -> bool {
+        // Hidden layers still take cursor events, as in Wallpaper Engine:
+        // wallpapers show buttons from their own `cursorEnter`.
         let Some(l) = self.host.layer(id) else {
             return false;
         };
-        if !l.visible {
-            return false;
-        }
         let local = l
             .motion_now()
             .transform_at(0.0)
