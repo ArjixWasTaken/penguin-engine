@@ -16,6 +16,7 @@ use wpe_script::{
 use wpe_vfs::Vfs;
 
 use crate::frame::LayerSteps;
+use crate::video::VideoStream;
 
 /// What scripts can see and change of one scene object.
 struct LayerState {
@@ -31,6 +32,8 @@ struct LayerState {
     color: Vec3,
     text: Option<String>,
     text_object: Option<Box<TextObject>>,
+    /// No ancestor group is hidden, so the layer shows when `visible`.
+    ancestors_visible: bool,
     dirty_visible: bool,
     dirty_transform: bool,
     dirty_color: bool,
@@ -43,6 +46,46 @@ pub struct ScriptHost {
     by_id: HashMap<i32, usize>,
     canvas: [f32; 2],
     spectrum: Option<wpe_audio::AudioSpectrum>,
+    /// Each layer's video, for `getVideoTexture()`.
+    videos: HashMap<i32, Arc<VideoStream>>,
+}
+
+/// A `getVideoTexture()` member; `None` lets the script see its default.
+fn video_call(video: &VideoStream, method: &str, args: &[ScriptValue]) -> Option<ScriptValue> {
+    let arg = || args.first().and_then(ScriptValue::as_f64);
+    Some(match method {
+        "exists" => ScriptValue::Bool(true),
+        "play" => {
+            video.set_paused(false);
+            return None;
+        }
+        "pause" => {
+            video.set_paused(true);
+            return None;
+        }
+        "stop" => {
+            video.stop();
+            return None;
+        }
+        "setCurrentTime" => {
+            video.seek(arg()?);
+            return None;
+        }
+        "setRate" => {
+            video.set_rate(arg()?);
+            return None;
+        }
+        "setLoop" => {
+            video.set_looping(args.first()?.as_bool()?);
+            return None;
+        }
+        "isPlaying" => ScriptValue::Bool(video.is_playing()),
+        "getCurrentTime" => ScriptValue::Number(video.position()),
+        "duration" => ScriptValue::Number(video.duration()),
+        "rate" => ScriptValue::Number(video.rate()),
+        "loop" => ScriptValue::Bool(video.looping()),
+        _ => return None,
+    })
 }
 
 fn vec3(v: Vec3) -> ScriptValue {
@@ -139,6 +182,22 @@ impl SceneHost for ScriptHost {
                 }
             }
             _ => {}
+        }
+    }
+
+    fn invoke(
+        &mut self,
+        layer: i32,
+        target: &str,
+        method: &str,
+        args: &[ScriptValue],
+    ) -> Option<ScriptValue> {
+        match target {
+            "video" => {
+                tracing::trace!("layer {layer} video.{method}({args:?})");
+                video_call(self.videos.get(&layer)?, method, args)
+            }
+            _ => None,
         }
     }
 
@@ -244,6 +303,7 @@ impl Scripts {
         scene: &wpe_assets::Scene,
         layers: &[ImageLayer],
         steps: &HashMap<i32, LayerSteps>,
+        videos: HashMap<i32, Arc<VideoStream>>,
         canvas: Vec2,
         text: Option<wpe_text::TextRenderer>,
     ) -> Option<Self> {
@@ -274,6 +334,7 @@ impl Scripts {
             by_id: HashMap::new(),
             canvas: canvas.to_array(),
             spectrum: None,
+            videos,
         };
         for obj in &scene.objects {
             let Some(c) = obj.common() else { continue };
@@ -290,7 +351,8 @@ impl Scripts {
                 },
                 steps: steps.get(&c.id).cloned().unwrap_or_default(),
                 size: layer.map_or(Vec2::ONE, |l| l.size),
-                visible: layer.map_or(c.visible.value, |l| l.visible),
+                visible: layer.map_or(c.visible.value, |l| l.self_visible),
+                ancestors_visible: layer.is_none_or(|l| l.ancestors_visible),
                 origin: motion.origin,
                 scale: motion.scale,
                 angles: motion.angles,
@@ -353,6 +415,17 @@ impl Scripts {
         let dt = (time - self.last_time).clamp(0.0, 0.25);
         self.last_time = time;
         self.host.spectrum = spectrum;
+        let ended: Vec<i32> = self
+            .host
+            .videos
+            .iter()
+            .filter(|(_, v)| v.take_ended())
+            .map(|(&id, _)| id)
+            .collect();
+        for id in ended {
+            tracing::trace!("layer {id} video ended");
+            self.runtime.video_ended(&mut self.host, id);
+        }
         let cursor = self.cursor_state(pointer);
         self.runtime.update(&mut self.host, time, dt, Some(cursor));
         self.apply(gpu, vfs, renderer);
@@ -430,7 +503,7 @@ impl Scripts {
             }
             if l.dirty_visible {
                 for &step in &l.steps.all {
-                    renderer.set_visible(step, l.visible);
+                    renderer.set_visible(step, l.visible && l.ancestors_visible);
                 }
             }
             if l.dirty_transform {

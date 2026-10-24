@@ -111,7 +111,7 @@ pub struct Wallpaper {
     pub fill: FillMode,
     camera: OrthoCamera,
     renderer: SceneRenderer,
-    videos: Vec<(Arc<GpuTexture>, video::VideoStream)>,
+    videos: Vec<(Arc<GpuTexture>, Arc<video::VideoStream>)>,
     bindings: Vec<frame::Binding>,
     particles: Vec<frame::ParticleInstance>,
     scripts: Option<script::Scripts>,
@@ -222,12 +222,18 @@ impl Wallpaper {
             a: 1.0,
         };
         renderer.set_frame(gpu, frame.targets, frame.steps);
+        for id in &frame.hidden {
+            for &step in frame.layer_steps.get(id).map_or(&[][..], |s| &s.all) {
+                renderer.set_visible(step, false);
+            }
+        }
         let scripts = script::Scripts::load(
             vfs,
             &files.project,
             &files.scene,
             &scene.layers,
             &frame.layer_steps,
+            frame.layer_videos,
             scene.camera.scene_size,
             text_renderer,
         );

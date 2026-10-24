@@ -390,6 +390,10 @@ impl SceneRenderer {
         let mut written = vec![false; self.targets.len()];
         let mut i = 0;
         while i < self.steps.len() {
+            if self.hidden[i] && matches!(self.steps[i], PreparedStep::Copy { .. }) {
+                i += 1;
+                continue;
+            }
             if let PreparedStep::Copy { from, to } = self.steps[i] {
                 let (src, dst) = (self.targets.get(from), self.targets.get(to));
                 encoder.copy_texture_to_texture(
@@ -409,6 +413,11 @@ impl SceneRenderer {
             let end = (i..self.steps.len())
                 .find(|&j| self.steps[j].draw_target() != Some(target))
                 .unwrap_or(self.steps.len());
+            // Hidden draws must not clear their target either.
+            if self.hidden[i..end].iter().all(|&h| h) {
+                i = end;
+                continue;
+            }
             let load = if written[target.0] {
                 wgpu::LoadOp::Load
             } else if target == TargetId::DEFAULT {

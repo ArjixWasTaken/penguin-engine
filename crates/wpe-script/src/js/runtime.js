@@ -211,7 +211,7 @@
 		}
 		playSingleAnimation(anim, cfg) { return this.createAnimationLayer(anim, cfg); }
 		destroyAnimationLayer(l) { return !!this._invoke('', 'destroyAnimationLayer', [l && l.name !== undefined ? l.name : l], false); }
-		getVideoTexture() { return makeVideo(this); }
+		getVideoTexture() { return this._invoke('video', 'exists', [], false) ? makeVideo(this) : null; }
 
 		getBoneCount() { return this._invoke('', 'getBoneCount', [], 0); }
 		getBoneIndex(name) { return this._invoke('', 'getBoneIndex', [String(name)], -1); }

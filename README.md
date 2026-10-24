@@ -29,9 +29,10 @@ dialect to SPIR-V and run through wgpu:
 - sound layers and audio-reactive spectrum (`--audio`)
 - particles (sprite, trail, rope) without geometry shaders
 - puppet warp (`.mdl` skinned meshes and bone animations)
-- SceneScript (QuickJS): scripted text, visibility, transforms, colours, clicks
+- SceneScript (QuickJS): scripted text, visibility, transforms, colours, clicks, video playback
+  control (`getVideoTexture()`: play/pause/seek/rate/loop, ended callbacks)
 
-Not yet: 3D models, HDR scenes, SceneScript-driven video/sound/animation control, desktop
+Not yet: 3D models, HDR scenes, SceneScript-driven sound/animation control, desktop
 background (wallpaper) mode and the wallpaper picker UI.
 
 ## Layout

@@ -12,6 +12,8 @@ struct MockHost {
     logs: Vec<String>,
     created: Vec<serde_json::Value>,
     spectrum: f32,
+    /// Layer 1 has a video; calls made on it.
+    video_calls: Vec<(String, Vec<ScriptValue>)>,
 }
 
 impl MockHost {
@@ -58,6 +60,23 @@ impl SceneHost for MockHost {
             ..Default::default()
         });
         Some(id)
+    }
+    fn invoke(
+        &mut self,
+        layer: LayerId,
+        target: &str,
+        method: &str,
+        args: &[ScriptValue],
+    ) -> Option<ScriptValue> {
+        if target != "video" || layer != 1 {
+            return None;
+        }
+        self.video_calls.push((method.to_owned(), args.to_vec()));
+        match method {
+            "exists" => Some(ScriptValue::Bool(true)),
+            "duration" => Some(ScriptValue::Number(8.0)),
+            _ => None,
+        }
     }
     fn canvas_size(&self) -> [f32; 2] {
         [1920.0, 1080.0]
@@ -556,4 +575,52 @@ fn console_goes_to_host_log() {
         ScriptValue::Bool(true),
     );
     assert_eq!(host.logs, vec!["hello 1 2 {\"a\":1}".to_owned()]);
+}
+
+#[test]
+fn video_texture_controls_and_ended_callbacks() {
+    let mut host = MockHost::with_layers(&["video", "still"]);
+    let mut rt = ScriptRuntime::new().unwrap();
+    let src = r#"
+        let ended = 0, still, video;
+        export function init() {
+            video = thisScene.getLayer('video').getVideoTexture();
+            still = thisScene.getLayer('still').getVideoTexture();
+            video.loop = false;
+            video.setCurrentTime(video.duration / 2);
+            video.play();
+            video.addEndedCallback(() => { ended++; });
+        }
+        export function update() {
+            return (still === null) + ' ' + ended;
+        }
+    "#;
+    add(
+        &mut rt,
+        &mut host,
+        2,
+        "text",
+        src,
+        None,
+        ScriptValue::String(String::new()),
+    );
+    rt.update(&mut host, 0.0, 0.016, None);
+    assert_eq!(
+        host.prop(2, "text"),
+        Some(&ScriptValue::String("true 0".into()))
+    );
+    let calls: Vec<&str> = host.video_calls.iter().map(|(m, _)| m.as_str()).collect();
+    assert_eq!(
+        calls,
+        ["exists", "setLoop", "duration", "setCurrentTime", "play"]
+    );
+    assert_eq!(host.video_calls[3].1, [ScriptValue::Number(4.0)]);
+
+    rt.video_ended(&mut host, 1);
+    rt.update(&mut host, 0.1, 0.016, None);
+    assert_eq!(
+        host.prop(2, "text"),
+        Some(&ScriptValue::String("true 1".into()))
+    );
+    assert!(rt.take_failures().is_empty());
 }

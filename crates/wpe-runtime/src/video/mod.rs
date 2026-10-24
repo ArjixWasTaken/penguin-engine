@@ -180,6 +180,8 @@ fn create_mpv(hwdec: &str) -> Result<Mpv, VideoError> {
             ("vo", "libmpv"),
             ("hwdec", hwdec),
             ("loop-file", "inf"),
+            // At the end of a non-looping video, hold the last frame.
+            ("keep-open", "yes"),
             ("audio", "no"),
             ("keepaspect", "no"),
             ("terminal", "no"),
@@ -205,13 +207,13 @@ enum Frames {
 }
 
 pub struct VideoStream {
-    #[allow(
-        dead_code,
-        reason = "playback control awaits SceneScript video bindings"
-    )]
     mpv: Arc<Mpv>,
     frames: Frames,
     started: Arc<AtomicBool>,
+    /// Playback was at the end when last checked.
+    at_end: AtomicBool,
+    /// Length in seconds, known once mpv has opened the file.
+    duration: std::sync::OnceLock<f64>,
     wake: Arc<Wake>,
     stop: Arc<AtomicBool>,
     thread: Option<JoinHandle<()>>,
@@ -323,6 +325,8 @@ impl VideoStream {
             mpv,
             frames,
             started,
+            at_end: AtomicBool::new(false),
+            duration: std::sync::OnceLock::new(),
             wake,
             stop,
             thread: Some(thread),
@@ -358,31 +362,70 @@ impl VideoStream {
     }
 }
 
-#[allow(
-    dead_code,
-    reason = "playback control awaits SceneScript video bindings"
-)]
+/// Playback control, as SceneScript's video texture API exposes it.
 impl VideoStream {
-    pub fn set_paused(&self, paused: bool) {
-        if let Err(e) = self.mpv.set_property("pause", paused) {
-            tracing::warn!("pausing video: {e}");
+    fn set(&self, name: &str, value: impl libmpv2::SetData, what: &str) {
+        if let Err(e) = self.mpv.set_property(name, value) {
+            tracing::warn!("{what}: {e}");
         }
+    }
+
+    /// Scripts often call this every frame; unchanged state isn't resent.
+    pub fn set_paused(&self, paused: bool) {
+        if self.mpv.get_property::<bool>("pause").ok() != Some(paused) {
+            self.set("pause", paused, "pausing video");
+        }
+    }
+
+    pub fn is_playing(&self) -> bool {
+        !self.mpv.get_property::<bool>("pause").unwrap_or(false)
+            && !self
+                .mpv
+                .get_property::<bool>("eof-reached")
+                .unwrap_or(false)
+    }
+
+    /// Pause and rewind to the start.
+    pub fn stop(&self) {
+        self.set_paused(true);
+        self.seek(0.0);
     }
 
     /// Jump to `seconds` from the start.
     pub fn seek(&self, seconds: f64) {
+        self.duration();
         if let Err(e) = self
             .mpv
-            .command("seek", &[&seconds.to_string(), "absolute+exact"])
+            .command("seek", &[&seconds.max(0.0).to_string(), "absolute+exact"])
         {
             tracing::warn!("seeking video: {e}");
         }
     }
 
+    pub fn rate(&self) -> f64 {
+        self.mpv.get_property("speed").unwrap_or(1.0)
+    }
+
     pub fn set_rate(&self, rate: f64) {
-        if let Err(e) = self.mpv.set_property("speed", rate) {
-            tracing::warn!("setting video speed: {e}");
+        // mpv's speed range.
+        let rate = rate.clamp(0.01, 100.0);
+        if self.rate() != rate {
+            self.set("speed", rate, "setting video speed");
         }
+    }
+
+    pub fn looping(&self) -> bool {
+        self.mpv
+            .get_property::<String>("loop-file")
+            .is_ok_and(|v| v != "no")
+    }
+
+    pub fn set_looping(&self, looping: bool) {
+        self.set(
+            "loop-file",
+            if looping { "inf" } else { "no" },
+            "setting video looping",
+        );
     }
 
     /// Playback position in seconds.
@@ -390,9 +433,33 @@ impl VideoStream {
         self.mpv.get_property("time-pos").unwrap_or(0.0)
     }
 
-    /// Length in seconds, once known.
+    /// Length in seconds. Scripts ask right after loading, so this waits
+    /// (briefly) for mpv to open the file.
     pub fn duration(&self) -> f64 {
-        self.mpv.get_property("duration").unwrap_or(0.0)
+        if let Some(&d) = self.duration.get() {
+            return d;
+        }
+        let deadline = Instant::now() + Duration::from_secs(2);
+        loop {
+            if let Ok(d) = self.mpv.get_property::<f64>("duration") {
+                return *self.duration.get_or_init(|| d);
+            }
+            if Instant::now() >= deadline {
+                return 0.0;
+            }
+            std::thread::sleep(Duration::from_millis(2));
+        }
+    }
+
+    /// Whether playback reached the end (of a non-looping video) since the
+    /// last call. mpv then holds the last frame, paused.
+    pub fn take_ended(&self) -> bool {
+        let at_end = self
+            .mpv
+            .get_property::<bool>("eof-reached")
+            .unwrap_or(false);
+        let was = self.at_end.swap(at_end, Ordering::Relaxed);
+        at_end && !was
     }
 }
 

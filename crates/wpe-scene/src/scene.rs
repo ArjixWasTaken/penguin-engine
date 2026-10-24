@@ -70,6 +70,11 @@ pub struct ImageLayer {
     pub name: String,
     /// The layer and all its ancestors are visible.
     pub visible: bool,
+    /// The layer's own flag, ancestors aside.
+    pub self_visible: bool,
+    /// No ancestor group is hidden, so the layer shows whenever it is made
+    /// visible itself.
+    pub ancestors_visible: bool,
     /// World transform of the card centre (alignment already applied).
     pub transform: Mat4,
     /// Card size in scene pixels.
@@ -304,6 +309,8 @@ impl Scene {
                     id: img.common.id,
                     name: img.common.name.clone(),
                     visible: is_visible(&nodes, props, img.common.id),
+                    self_visible: props.flag(&img.common.visible),
+                    ancestors_visible: ancestors_visible(&nodes, props, img.common.id),
                     transform,
                     size,
                     color: vec3(*props.value(&img.color)),
@@ -401,6 +408,8 @@ fn text_layer(nodes: &HashMap<i32, Node>, props: &UserProperties, text: &TextObj
         id: common.id,
         name: common.name.clone(),
         visible: is_visible(nodes, props, common.id),
+        self_visible: props.flag(&common.visible),
+        ancestors_visible: ancestors_visible(nodes, props, common.id),
         transform: motion.transform_at(0.0),
         size: Vec2::ONE,
         color: Vec3::ONE,
@@ -451,6 +460,8 @@ fn particle_layer(
         id: common.id,
         name: common.name.clone(),
         visible: is_visible(nodes, props, common.id),
+        self_visible: props.flag(&common.visible),
+        ancestors_visible: ancestors_visible(nodes, props, common.id),
         transform: motion.transform_at(0.0),
         size: Vec2::ONE,
         color: Vec3::ONE,
@@ -543,12 +554,20 @@ fn parent_transform(
 /// A layer shows when it is visible itself and no ancestor group is hidden;
 /// hidden image parents only anchor their children's transforms.
 fn is_visible(nodes: &HashMap<i32, Node>, props: &UserProperties, id: i32) -> bool {
-    let mut current = Some(id);
-    for depth in 0..MAX_DEPTH {
+    nodes
+        .get(&id)
+        .is_none_or(|node| props.flag(&node.common.visible))
+        && ancestors_visible(nodes, props, id)
+}
+
+/// No group above `id` is hidden.
+fn ancestors_visible(nodes: &HashMap<i32, Node>, props: &UserProperties, id: i32) -> bool {
+    let mut current = nodes.get(&id).and_then(|n| n.common.parent);
+    for _ in 1..MAX_DEPTH {
         let Some(node) = current.and_then(|id| nodes.get(&id)) else {
             return true;
         };
-        if (depth == 0 || node.group) && !props.flag(&node.common.visible) {
+        if node.group && !props.flag(&node.common.visible) {
             return false;
         }
         current = node.common.parent;

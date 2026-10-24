@@ -24,7 +24,11 @@ use crate::video::VideoStream;
 pub struct Frame {
     pub targets: Vec<TargetDesc>,
     pub steps: Vec<Step>,
-    pub videos: Vec<(Arc<GpuTexture>, VideoStream)>,
+    pub videos: Vec<(Arc<GpuTexture>, Arc<VideoStream>)>,
+    /// The video each layer shows, by layer id, for scripts.
+    pub layer_videos: HashMap<i32, Arc<VideoStream>>,
+    /// Layers whose draws start switched off.
+    pub hidden: Vec<i32>,
     pub bindings: Vec<Binding>,
     pub particles: Vec<ParticleInstance>,
     /// Draws of each on-screen layer, by layer id.
@@ -330,7 +334,15 @@ pub struct FrameBuilder<'a> {
     /// Sprite-sheet pages after the first, by texture and page index.
     pages: HashMap<(usize, usize), Arc<GpuTexture>>,
     /// Video textures and the streams feeding them.
-    videos: Vec<(Arc<GpuTexture>, VideoStream)>,
+    videos: Vec<(Arc<GpuTexture>, Arc<VideoStream>)>,
+    /// Streams by the texture they play, keyed like `uploaded`.
+    video_textures: HashMap<usize, Arc<VideoStream>>,
+    /// The first video each layer uploads (its own texture comes first).
+    layer_videos: HashMap<i32, Arc<VideoStream>>,
+    /// The layer being built, on screen or not.
+    building: Option<i32>,
+    /// Layers drawn but initially hidden.
+    hidden: Vec<i32>,
     bindings: Vec<Binding>,
     parallax: Option<(Parallax, Vec2)>,
     /// Draws using their compiled material, and all draws.
@@ -351,6 +363,10 @@ impl<'a> FrameBuilder<'a> {
             frame_copy: None,
             links: HashMap::new(),
             videos: Vec::new(),
+            video_textures: HashMap::new(),
+            layer_videos: HashMap::new(),
+            building: None,
+            hidden: Vec::new(),
             bindings: Vec::new(),
             parallax: None,
             pages: HashMap::new(),
@@ -367,6 +383,8 @@ impl<'a> FrameBuilder<'a> {
             targets: self.targets,
             steps: self.steps,
             videos: self.videos,
+            layer_videos: self.layer_videos,
+            hidden: self.hidden,
             bindings: self.bindings,
             particles: self.particles,
             layer_steps: self.layer_steps,
@@ -393,6 +411,16 @@ impl<'a> FrameBuilder<'a> {
 
     fn upload(&mut self, tex: &Arc<Texture>, label: &str) -> Arc<GpuTexture> {
         let key = Arc::as_ptr(tex) as usize;
+        let gpu_tex = self.upload_once(tex, key, label);
+        if let (Some(id), Some(stream)) = (self.building, self.video_textures.get(&key)) {
+            self.layer_videos
+                .entry(id)
+                .or_insert_with(|| stream.clone());
+        }
+        gpu_tex
+    }
+
+    fn upload_once(&mut self, tex: &Arc<Texture>, key: usize, label: &str) -> Arc<GpuTexture> {
         if let Some(t) = self.uploaded.get(&key) {
             return t.clone();
         }
@@ -405,7 +433,11 @@ impl<'a> FrameBuilder<'a> {
                 }
                 let gpu_tex = Arc::new(upload_texture(self.gpu, &single, label));
                 match VideoStream::start(self.gpu, mp4, &gpu_tex) {
-                    Ok(stream) => self.videos.push((gpu_tex.clone(), stream)),
+                    Ok(stream) => {
+                        let stream = Arc::new(stream);
+                        self.video_textures.insert(key, stream.clone());
+                        self.videos.push((gpu_tex.clone(), stream));
+                    }
                     Err(e) => tracing::warn!("{label}: video playback unavailable: {e}"),
                 }
                 gpu_tex
@@ -546,6 +578,15 @@ impl<'a> FrameBuilder<'a> {
         }
     }
 
+    /// A copy belonging to the current layer, hidden along with it.
+    fn push_copy(&mut self, from: TargetId, to: TargetId) {
+        let step = self.steps.len();
+        if let Some(steps) = self.current_steps() {
+            steps.all.push(step);
+        }
+        self.steps.push(Step::Copy { from, to });
+    }
+
     fn push_draw(
         &mut self,
         target: TargetId,
@@ -557,10 +598,7 @@ impl<'a> FrameBuilder<'a> {
     ) {
         if resolved.reads_frame {
             let copy = self.frame_copy();
-            self.steps.push(Step::Copy {
-                from: TargetId::DEFAULT,
-                to: copy,
-            });
+            self.push_copy(TargetId::DEFAULT, copy);
         }
         self.stats.0 += 1;
         self.stats.1 += 1;
@@ -592,7 +630,9 @@ impl<'a> FrameBuilder<'a> {
     }
 
     /// Add every layer: first the hidden or visible layers other layers
-    /// sample, rendered offscreen, then the visible ones onto the screen.
+    /// sample, rendered offscreen, then the rest onto the screen. Hidden
+    /// layers are drawn too, switched off, so scripts can show them; hidden
+    /// particle systems are left out to spare their simulation.
     pub fn layers(&mut self, layers: &[ImageLayer]) {
         let mut referenced: Vec<i32> = layers.iter().flat_map(linked_ids).collect();
         referenced.sort_unstable();
@@ -611,9 +651,16 @@ impl<'a> FrameBuilder<'a> {
             self.layer(layer, Some(link));
             self.links.insert(id, link);
         }
-        for layer in layers.iter().filter(|l| l.visible) {
-            self.layer(layer, None);
+        for layer in layers {
+            if layer.visible {
+                self.layer(layer, None);
+            } else if layer.particle.is_none() {
+                self.layer(layer, None);
+                self.hidden.push(layer.id);
+            }
         }
+        self.current_layer = None;
+        self.building = None;
     }
 
     /// Scene bloom: bright-pass and blur a copy of the frame at quarter and
@@ -734,6 +781,7 @@ impl<'a> FrameBuilder<'a> {
     /// Draw `layer` onto the screen, or into `offscreen` filling it.
     fn layer(&mut self, layer: &ImageLayer, offscreen: Option<TargetId>) {
         self.current_layer = offscreen.is_none().then_some(layer.id);
+        self.building = Some(layer.id);
         if let Some(source) = &layer.particle {
             if offscreen.is_none() {
                 self.particle_layer(layer, source);
@@ -1065,7 +1113,7 @@ impl<'a> FrameBuilder<'a> {
                             continue;
                         };
                         match cmd.command {
-                            CommandKind::Copy => self.steps.push(Step::Copy { from, to }),
+                            CommandKind::Copy => self.push_copy(from, to),
                             _ => tracing::warn!(
                                 "effect {}: swap commands not supported",
                                 effect.name
