@@ -34,6 +34,12 @@ struct Args {
     /// Play sound layers and react to system audio (window mode).
     #[arg(long)]
     audio: bool,
+    /// Log the frame rate every few seconds.
+    #[arg(long)]
+    stats: bool,
+    /// Frame rate cap (0 = follow the display).
+    #[arg(long, default_value_t = 0)]
+    fps: u32,
 }
 
 #[derive(Clone, Copy, clap::ValueEnum)]
@@ -120,7 +126,17 @@ fn screenshot(args: &Args, assets: &std::path::Path, out: &std::path::Path) -> R
     Ok(())
 }
 
+/// Frame counter for `--stats`.
+struct Stats {
+    since: std::time::Instant,
+    frames: u32,
+    busy: std::time::Duration,
+}
+
 struct State {
+    stats: Option<Stats>,
+    /// When the next capped frame is due.
+    next_frame: std::time::Instant,
     window: Arc<Window>,
     surface: wgpu::Surface<'static>,
     config: wgpu::SurfaceConfiguration,
@@ -171,6 +187,12 @@ impl App {
         wallpaper.set_audio(self.args.audio);
         window.set_title(&format!("{} — scene-viewer", wallpaper.title));
         Ok(State {
+            next_frame: std::time::Instant::now(),
+            stats: self.args.stats.then(|| Stats {
+                since: std::time::Instant::now(),
+                frames: 0,
+                busy: Default::default(),
+            }),
             window,
             surface,
             config,
@@ -182,6 +204,28 @@ impl App {
 
 impl State {
     fn redraw(&mut self) {
+        let started = std::time::Instant::now();
+        self.draw();
+        if let Some(stats) = &mut self.stats {
+            stats.frames += 1;
+            stats.busy += started.elapsed();
+            let elapsed = stats.since.elapsed();
+            if elapsed.as_secs_f32() >= 3.0 {
+                tracing::info!(
+                    "{:.1} fps, {:.2} ms CPU per frame",
+                    stats.frames as f32 / elapsed.as_secs_f32(),
+                    stats.busy.as_secs_f32() * 1000.0 / stats.frames as f32
+                );
+                *stats = Stats {
+                    since: std::time::Instant::now(),
+                    frames: 0,
+                    busy: Default::default(),
+                };
+            }
+        }
+    }
+
+    fn draw(&mut self) {
         let frame = match self.surface.get_current_texture() {
             wgpu::CurrentSurfaceTexture::Success(f)
             | wgpu::CurrentSurfaceTexture::Suboptimal(f) => f,
@@ -209,6 +253,14 @@ impl State {
 }
 
 impl ApplicationHandler for App {
+    fn new_events(&mut self, _: &ActiveEventLoop, cause: winit::event::StartCause) {
+        if let (winit::event::StartCause::ResumeTimeReached { .. }, Some(state)) =
+            (cause, &self.state)
+        {
+            state.window.request_redraw();
+        }
+    }
+
     fn resumed(&mut self, event_loop: &ActiveEventLoop) {
         if self.state.is_some() {
             return;
@@ -250,7 +302,15 @@ impl ApplicationHandler for App {
             }
             WindowEvent::RedrawRequested => {
                 state.redraw();
-                state.window.request_redraw();
+                if self.args.fps == 0 {
+                    state.window.request_redraw();
+                } else {
+                    let interval = std::time::Duration::from_secs_f64(1.0 / self.args.fps as f64);
+                    let next =
+                        state.next_frame.max(std::time::Instant::now() - interval) + interval;
+                    state.next_frame = next;
+                    event_loop.set_control_flow(winit::event_loop::ControlFlow::WaitUntil(next));
+                }
             }
             _ => {}
         }
