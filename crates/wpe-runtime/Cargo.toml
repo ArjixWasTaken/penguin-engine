@@ -18,6 +18,7 @@ thiserror = "2.0.21"
 tracing = "0.1.44"
 wpe-assets = { version = "0.1.0", path = "../wpe-assets" }
 wpe-audio = { version = "0.1.0", path = "../wpe-audio" }
+wpe-library = { version = "0.1.0", path = "../wpe-library" }
 wpe-mdl = { version = "0.1.0", path = "../wpe-mdl" }
 wpe-media = { version = "0.1.0", path = "../wpe-media" }
 wpe-particles = { version = "0.1.0", path = "../wpe-particles" }
