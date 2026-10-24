@@ -11,8 +11,8 @@ use wpe_assets::material::{Blending, Material, MaterialPass, PassOverride};
 use wpe_assets::tex::Texture;
 use wpe_render::{
     BlendMode, Camera, CardMesh, DEFAULT_FORMAT, Draw, Gpu, GpuTexture, ImageDraw, MaterialDraw,
-    ShaderProgram, SpriteAnimation, SpriteFrame, Step, TargetDesc, TargetId, TargetSize, TexRef,
-    upload_texture, wgpu,
+    Mesh, MeshData, ShaderProgram, SpriteAnimation, SpriteFrame, Step, TargetDesc, TargetId,
+    TargetSize, TexRef, upload_texture, wgpu,
 };
 use wpe_scene::{Animation, Bloom, ImageLayer, Motion, Parallax, apply_override};
 use wpe_vfs::Vfs;
@@ -66,6 +66,71 @@ struct Resolved {
     animated: Vec<(String, Vec<f32>, Animation)>,
 }
 
+/// A puppet-warped layer: its parsed model and animation state.
+pub struct LayerPuppet {
+    mdl: Arc<wpe_mdl::Mdl>,
+    puppet: wpe_mdl::Puppet,
+}
+
+impl LayerPuppet {
+    fn combos(&self) -> BTreeMap<String, String> {
+        let bones = self.puppet.bone_count();
+        if bones == 0 {
+            return BTreeMap::new();
+        }
+        BTreeMap::from([
+            ("SKINNING".to_owned(), "1".to_owned()),
+            ("BONECOUNT".to_owned(), bones.to_string()),
+        ])
+    }
+
+    /// The puppet mesh in layer-local pixels; UVs scaled onto a padded texture.
+    fn mesh(&self, uv_scale: Vec2) -> Mesh {
+        let m = &self.mdl.meshes[0];
+        let n = m.positions.len();
+        let normals: Vec<f32> = if m.normals.len() == n {
+            m.normals.iter().flatten().copied().collect()
+        } else {
+            [0.0, 0.0, 1.0].repeat(n)
+        };
+        let streams = vec![
+            (
+                "a_Position".to_owned(),
+                3,
+                m.positions.iter().flatten().copied().collect(),
+            ),
+            (
+                "a_TexCoord".to_owned(),
+                2,
+                m.texcoords
+                    .iter()
+                    .flat_map(|t| [t[0] * uv_scale.x, t[1] * uv_scale.y])
+                    .collect(),
+            ),
+            ("a_Normal".to_owned(), 3, normals),
+            (
+                "a_BlendIndices".to_owned(),
+                4,
+                m.blend_indices
+                    .iter()
+                    .flatten()
+                    .map(|&i| i as f32)
+                    .collect(),
+            ),
+            (
+                "a_BlendWeights".to_owned(),
+                4,
+                m.blend_weights.iter().flatten().copied().collect(),
+            ),
+        ];
+        Mesh::Triangles(MeshData {
+            vertex_count: n as u32,
+            attributes: streams,
+            indices: Some(m.indices.clone()),
+        })
+    }
+}
+
 /// A value recomputed every frame and written into one draw.
 pub enum Binding {
     /// The layer's animated and/or parallax-shifted transform.
@@ -82,6 +147,11 @@ pub enum Binding {
         alpha: f32,
         /// `g_Color4` stays white (blend-mode passes).
         neutral: bool,
+    },
+    /// A puppet's skinning matrices (`g_Bones`).
+    Bones {
+        step: usize,
+        puppet: Arc<LayerPuppet>,
     },
     /// An animated material constant.
     Constant {
@@ -160,6 +230,16 @@ impl Binding {
                 base,
                 animation,
             } => renderer.set_uniform(*step, uniform, animation.sample(time, base)),
+            Self::Bones { step, puppet } => {
+                let mut padded = Vec::new();
+                puppet.puppet.bones(time as f64, &mut padded);
+                // `mat4x3` columns are written tightly; the block layout pads them.
+                let bones = padded
+                    .chunks_exact(4)
+                    .flat_map(|column| column[..3].to_vec())
+                    .collect();
+                renderer.set_uniform(*step, "g_Bones", bones);
+            }
         }
     }
 }
@@ -179,6 +259,8 @@ pub struct FrameBuilder<'a> {
     frame_copy: Option<TargetId>,
     /// Offscreen outputs of layers other layers sample, by layer id.
     links: HashMap<i32, TargetId>,
+    /// Parsed puppet models by path; `None` caches a failure.
+    mdls: HashMap<String, Option<Arc<wpe_mdl::Mdl>>>,
     /// Sprite-sheet pages after the first, by texture and page index.
     pages: HashMap<(usize, usize), Arc<GpuTexture>>,
     /// Video textures and the streams feeding them.
@@ -206,6 +288,7 @@ impl<'a> FrameBuilder<'a> {
             bindings: Vec::new(),
             parallax: None,
             pages: HashMap::new(),
+            mdls: HashMap::new(),
             stats: (0, 0),
         }
     }
@@ -288,7 +371,18 @@ impl<'a> FrameBuilder<'a> {
         pass: &MaterialPass,
         targets: &HashMap<String, TargetId>,
     ) -> Option<Resolved> {
-        let prepared = material::prepare(self.vfs, &mut self.store, pass, &BTreeMap::new())
+        self.resolve_with(label, pass, targets, &BTreeMap::new())
+    }
+
+    /// [`Self::resolve`] with combos overriding the material's.
+    fn resolve_with(
+        &mut self,
+        label: &str,
+        pass: &MaterialPass,
+        targets: &HashMap<String, TargetId>,
+        combos: &BTreeMap<String, String>,
+    ) -> Option<Resolved> {
+        let prepared = material::prepare(self.vfs, &mut self.store, pass, combos)
             .inspect_err(|e| tracing::warn!("{label} ({}): {e}", pass.shader))
             .ok()?;
         let program = self.program(&prepared.shader, &pass.shader)?;
@@ -387,7 +481,7 @@ impl<'a> FrameBuilder<'a> {
         target: TargetId,
         resolved: Resolved,
         model: Mat4,
-        mesh: CardMesh,
+        mesh: impl Into<Mesh>,
         blend: BlendMode,
         camera: Camera,
     ) {
@@ -583,6 +677,37 @@ impl<'a> FrameBuilder<'a> {
         }
     }
 
+    /// The puppet deforming `layer`, if its model has one that parses.
+    fn puppet(&mut self, layer: &ImageLayer) -> Option<Arc<LayerPuppet>> {
+        let path = layer.puppet.as_deref()?;
+        let mdl = self
+            .mdls
+            .entry(path.to_owned())
+            .or_insert_with(|| {
+                self.vfs
+                    .read(path)
+                    .map_err(|e| e.to_string())
+                    .and_then(|b| wpe_mdl::Mdl::parse(&b).map_err(|e| e.to_string()))
+                    .inspect_err(|e| tracing::warn!("puppet {path}: {e}"))
+                    .ok()
+                    .map(Arc::new)
+            })
+            .clone()?;
+        mdl.meshes.first()?;
+        let puppet = wpe_mdl::Puppet::new(&mdl, &layer.animation_layers);
+        Some(Arc::new(LayerPuppet { mdl, puppet }))
+    }
+
+    /// Upload the puppet's bones into the draw just pushed, every frame.
+    fn bind_puppet(&mut self, puppet: Option<Arc<LayerPuppet>>) {
+        if let Some(puppet) = puppet.filter(|p| p.puppet.bone_count() > 0) {
+            self.bindings.push(Binding::Bones {
+                step: self.steps.len() - 1,
+                puppet,
+            });
+        }
+    }
+
     /// Parallax for a layer drawn with the scene camera, if it moves at all.
     fn layer_parallax(&self, layer: &ImageLayer) -> Option<LayerParallax> {
         let (settings, scene) = self.parallax?;
@@ -637,12 +762,18 @@ impl<'a> FrameBuilder<'a> {
 
     fn plain_layer(&mut self, layer: &ImageLayer, offscreen: Option<TargetId>) {
         let label = format!("layer {:?}", layer.name);
-        match self.resolve(&label, &layer.material, &HashMap::new()) {
+        let puppet = self.puppet(layer);
+        let combos = puppet.as_ref().map(|p| p.combos()).unwrap_or_default();
+        match self.resolve_with(&label, &layer.material, &HashMap::new(), &combos) {
             Some(mut r) => {
                 Self::layer_constants(layer, &mut r.constants, false);
-                let mesh = CardMesh {
-                    size: layer.size,
-                    uv_scale: r.uv_scale,
+                let mesh = match &puppet {
+                    Some(p) => p.mesh(r.uv_scale),
+                    None => CardMesh {
+                        size: layer.size,
+                        uv_scale: r.uv_scale,
+                    }
+                    .into(),
                 };
                 match offscreen {
                     Some(target) => self.push_draw(
@@ -663,6 +794,7 @@ impl<'a> FrameBuilder<'a> {
                     ),
                 }
                 self.bind_layer(layer, offscreen.is_none(), false);
+                self.bind_puppet(puppet);
             }
             None if offscreen.is_none() => self.fallback(layer),
             None => {}
@@ -711,7 +843,14 @@ impl<'a> FrameBuilder<'a> {
 
         // The layer's own image, untransformed, filling the first buffer.
         let label = format!("layer {:?}", layer.name);
-        let Some(mut base) = self.resolve(&label, &layer.material, &HashMap::new()) else {
+        let puppet = if layer.fullscreen || layer.compose {
+            None
+        } else {
+            self.puppet(layer)
+        };
+        let combos = puppet.as_ref().map(|p| p.combos()).unwrap_or_default();
+        let Some(mut base) = self.resolve_with(&label, &layer.material, &HashMap::new(), &combos)
+        else {
             return self.fallback(layer);
         };
         Self::layer_constants(layer, &mut base.constants, false);
@@ -719,24 +858,29 @@ impl<'a> FrameBuilder<'a> {
             (
                 Camera::Fixed(Mat4::IDENTITY),
                 Mat4::IDENTITY,
-                CardMesh::FULLSCREEN,
+                Mesh::from(CardMesh::FULLSCREEN),
             )
         } else if layer.compose {
             let mesh = CardMesh {
                 size: layer.size,
                 uv_scale: Vec2::ONE,
             };
-            (Camera::Scene, layer.transform, mesh)
+            (Camera::Scene, layer.transform, mesh.into())
         } else {
             let ortho = local_camera(layer.size);
-            let mesh = CardMesh {
-                size: layer.size,
-                uv_scale: base.uv_scale,
+            let mesh = match &puppet {
+                Some(p) => p.mesh(base.uv_scale),
+                None => CardMesh {
+                    size: layer.size,
+                    uv_scale: base.uv_scale,
+                }
+                .into(),
             };
             (Camera::Fixed(ortho), Mat4::IDENTITY, mesh)
         };
         let base_blend = blend_mode(&layer.material.blending);
         self.push_draw(prev, base, model, mesh, base_blend, camera);
+        self.bind_puppet(puppet);
         self.bind_layer(layer, layer.compose && !layer.fullscreen, false);
 
         let mut last_output: Option<usize> = None;

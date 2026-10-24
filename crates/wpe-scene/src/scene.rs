@@ -93,6 +93,9 @@ pub struct ImageLayer {
     /// For text layers, the object whose rendered text is the layer's image
     /// (see [`text_texture_name`]); its size and anchoring are known once rendered.
     pub text: Option<Box<TextObject>>,
+    /// Puppet `.mdl` deforming the image, and the object's animation layers.
+    pub puppet: Option<String>,
+    pub animation_layers: Vec<serde_json::Value>,
 }
 
 /// A layer's transform inputs and keyframe animations.
@@ -309,6 +312,8 @@ impl Scene {
                         .cloned()
                         .collect(),
                     text: None,
+                    puppet: loaded.puppet,
+                    animation_layers: img.animationlayers.clone(),
                 };
                 (index, layer)
             })
@@ -353,6 +358,7 @@ struct LoadedImage {
     fullscreen: bool,
     solid: bool,
     passthrough: bool,
+    puppet: Option<String>,
 }
 
 /// Name of the texture slot a text layer's rendered image is bound to.
@@ -402,6 +408,8 @@ fn text_layer(nodes: &HashMap<i32, Node>, props: &UserProperties, text: &TextObj
             .cloned()
             .collect(),
         text: Some(Box::new(text.clone())),
+        puppet: None,
+        animation_layers: Vec::new(),
     }
 }
 
@@ -442,6 +450,7 @@ fn load_image(
         fullscreen: model.fullscreen,
         solid: model.solidlayer,
         passthrough: model.passthrough,
+        puppet: model.puppet.filter(|p| !p.is_empty()),
     }))
 }
 

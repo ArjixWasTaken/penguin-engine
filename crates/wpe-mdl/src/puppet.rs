@@ -1,0 +1,299 @@
+use glam::{EulerRot, Mat4, Quat, Vec3};
+use serde_json::Value;
+
+use crate::{Mdl, PlayMode};
+
+/// One entry of an image object's scene `animationlayers` array.
+#[derive(Debug, Clone, PartialEq)]
+pub struct AnimationLayer {
+    /// [`crate::MdlAnimation::id`] this layer plays.
+    pub animation: i32,
+    /// Playback speed multiplier (negative plays backwards).
+    pub rate: f64,
+    /// Layer weight, clamped to 0..=1 when applied.
+    pub blend: f64,
+    /// Hidden layers contribute nothing.
+    pub visible: bool,
+    /// Additive layers add their delta from frame 0 on top of the layers
+    /// below; others blend over them.
+    pub additive: bool,
+}
+
+impl AnimationLayer {
+    /// Read a scene `animationlayers` entry. User-property bound values
+    /// (`{"user": …, "value": …}`) use their `value`. Returns `None` without
+    /// an `animation` id.
+    pub fn from_json(v: &Value) -> Option<Self> {
+        let get = |key: &str| {
+            let x = v.get(key)?;
+            match x.as_object().and_then(|o| o.get("value")) {
+                Some(inner) => Some(inner),
+                None => Some(x),
+            }
+        };
+        let num = |x: &Value| {
+            x.as_f64()
+                .or_else(|| x.as_str().and_then(|s| s.trim().parse().ok()))
+        };
+        let flag = |x: &Value| {
+            x.as_bool()
+                .or_else(|| x.as_f64().map(|n| n != 0.0))
+                .or_else(|| x.as_str().map(|s| s == "true" || s == "1"))
+        };
+        Some(Self {
+            animation: get("animation").and_then(num)? as i32,
+            rate: get("rate").and_then(num).unwrap_or(1.0),
+            blend: get("blend").and_then(num).unwrap_or(1.0),
+            visible: get("visible").and_then(flag).unwrap_or(true),
+            additive: get("additive").and_then(flag).unwrap_or(false),
+        })
+    }
+}
+
+#[derive(Debug, Clone)]
+struct PuppetBone {
+    parent: Option<usize>,
+    rest_translation: Vec3,
+    rest_scale: Vec3,
+    rest_rotation: Quat,
+    inverse_bind_world: Mat4,
+    rest_world: Mat4,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct Frame {
+    position: Vec3,
+    scale: Vec3,
+    rotation: Quat,
+}
+
+#[derive(Debug, Clone)]
+struct Animation {
+    id: i32,
+    mode: PlayMode,
+    fps: f64,
+    length: u32,
+    tracks: Vec<Vec<Frame>>,
+}
+
+impl Animation {
+    /// Frames to blend between at `time` seconds of playback, and the factor.
+    fn sample_point(&self, time: f64) -> (usize, usize, f32) {
+        let length = u64::from(self.length);
+        if length == 0 || self.fps.is_nan() || self.fps <= 0.0 || !time.is_finite() {
+            return (0, 0, 0.0);
+        }
+        let frame_time = 1.0 / self.fps;
+        let max_time = f64::from(self.length) / self.fps;
+        let wrap = |time: f64, length: u64, max_time: f64| {
+            let mut cur = time % max_time;
+            if cur < 0.0 {
+                cur += max_time;
+            }
+            let rate = cur / frame_time;
+            let a = (rate as u64) % length;
+            let b = (a + 1) % length;
+            (a, b, (rate - a as f64).clamp(0.0, 1.0))
+        };
+        let (a, b, t) = match self.mode {
+            PlayMode::Single if time >= max_time => (length - 1, length - 1, 0.0),
+            PlayMode::Single | PlayMode::Loop => wrap(time, length, max_time),
+            PlayMode::Mirror => {
+                let fold = |f: u64| {
+                    if f >= length {
+                        (length - 1).saturating_sub(f - length)
+                    } else {
+                        f
+                    }
+                };
+                let (a, b, t) = wrap(time, length * 2, max_time * 2.0);
+                (fold(a), fold(b), t)
+            }
+        };
+        (a as usize, b as usize, t as f32)
+    }
+}
+
+#[derive(Debug, Clone)]
+struct Layer {
+    params: AnimationLayer,
+    animation: Option<usize>,
+}
+
+/// A puppet's skeleton driven by its scene animation layers.
+///
+/// Evaluation follows Wallpaper Engine (and the reference renderer): every
+/// bone starts from its rest pose; visible layers are applied bottom to top —
+/// non-additive layers blend toward their interpolated pose by `blend`,
+/// additive layers add `blend ×` their delta from frame 0. Bone matrices are
+/// `animated_world · inverse(bind_world)`, mapping a vertex from where the
+/// file stores it to where its bone currently is.
+#[derive(Debug, Clone)]
+pub struct Puppet {
+    bones: Vec<PuppetBone>,
+    animations: Vec<Animation>,
+    layers: Vec<Layer>,
+}
+
+impl Puppet {
+    /// Build from a parsed model and the image object's `animationlayers`
+    /// (raw scene JSON). Layers whose animation id is not in the file are
+    /// kept but play nothing.
+    pub fn new(mdl: &Mdl, animation_layers: &[Value]) -> Self {
+        let source = mdl.skeleton.as_ref().map_or(&[][..], |s| &s.bones[..]);
+        let mut bind_world: Vec<Mat4> = Vec::with_capacity(source.len());
+        let mut rest_world: Vec<Mat4> = Vec::with_capacity(source.len());
+        let mut bones = Vec::with_capacity(source.len());
+        for b in source {
+            let parent_bind = b.parent.map_or(Mat4::IDENTITY, |p| bind_world[p]);
+            let parent_rest = b.parent.map_or(Mat4::IDENTITY, |p| rest_world[p]);
+            bind_world.push(parent_bind * b.bind);
+            rest_world.push(parent_rest * b.rest_local());
+            let (scale, rotation, translation) = b.rest_local().to_scale_rotation_translation();
+            bones.push(PuppetBone {
+                parent: b.parent,
+                rest_translation: translation,
+                rest_scale: scale,
+                rest_rotation: rotation,
+                inverse_bind_world: bind_world.last().unwrap().inverse(),
+                rest_world: *rest_world.last().unwrap(),
+            });
+        }
+        let animations: Vec<Animation> = mdl
+            .animations
+            .iter()
+            .map(|a| Animation {
+                id: a.id,
+                mode: a.mode,
+                fps: f64::from(a.fps),
+                length: a.length,
+                tracks: a
+                    .tracks
+                    .iter()
+                    .map(|t| {
+                        t.iter()
+                            .map(|f| Frame {
+                                position: f.position,
+                                scale: f.scale,
+                                rotation: Quat::from_euler(
+                                    EulerRot::ZYX,
+                                    f.angle.z,
+                                    f.angle.y,
+                                    f.angle.x,
+                                ),
+                            })
+                            .collect()
+                    })
+                    .collect(),
+            })
+            .collect();
+        let mut puppet = Self {
+            bones,
+            animations,
+            layers: Vec::new(),
+        };
+        puppet.set_layers(
+            animation_layers
+                .iter()
+                .filter_map(AnimationLayer::from_json)
+                .collect(),
+        );
+        puppet
+    }
+
+    /// Replace the animation layers (e.g. after a user property changed).
+    pub fn set_layers(&mut self, layers: Vec<AnimationLayer>) {
+        self.layers = layers
+            .into_iter()
+            .map(|params| Layer {
+                animation: self
+                    .animations
+                    .iter()
+                    .position(|a| a.id == params.animation),
+                params,
+            })
+            .collect();
+    }
+
+    /// The current animation layers, bottom to top.
+    pub fn layers(&self) -> impl Iterator<Item = &AnimationLayer> {
+        self.layers.iter().map(|l| &l.params)
+    }
+
+    /// Number of layers whose animation exists in the model.
+    pub fn matched_layers(&self) -> usize {
+        self.layers.iter().filter(|l| l.animation.is_some()).count()
+    }
+
+    /// Number of bones; the value of the `BONECOUNT` shader combo.
+    pub fn bone_count(&self) -> usize {
+        self.bones.len()
+    }
+
+    /// Rest-pose world transform of bone `i` in puppet space (where the bone
+    /// sits on the assembled character; used for attachments).
+    pub fn rest_world(&self, i: usize) -> Option<Mat4> {
+        self.bones.get(i).map(|b| b.rest_world)
+    }
+
+    /// Skinning matrices at `time` seconds since the layer started playing.
+    pub fn bone_matrices(&self, time: f64, out: &mut Vec<Mat4>) {
+        out.clear();
+        out.reserve(self.bones.len());
+        for (i, bone) in self.bones.iter().enumerate() {
+            let mut translation = bone.rest_translation;
+            let mut scale = bone.rest_scale;
+            let mut rotation = bone.rest_rotation;
+            for layer in &self.layers {
+                let Some(anim) = layer.animation.map(|a| &self.animations[a]) else {
+                    continue;
+                };
+                if !layer.params.visible {
+                    continue;
+                }
+                let Some(track) = anim.tracks.get(i).filter(|t| !t.is_empty()) else {
+                    continue;
+                };
+                let (a, b, t) = anim.sample_point(time * layer.params.rate);
+                let last = track.len() - 1;
+                let (fa, fb, base) = (track[a.min(last)], track[b.min(last)], track[0]);
+                let pos = fa.position.lerp(fb.position, t);
+                let scl = fa.scale.lerp(fb.scale, t);
+                let rot = fa.rotation.slerp(fb.rotation, t);
+                let w = layer.params.blend.clamp(0.0, 1.0) as f32;
+                if layer.params.additive {
+                    translation += w * (pos - base.position);
+                    scale += w * (scl - base.scale);
+                    let delta = rot * base.rotation.conjugate();
+                    rotation *= Quat::IDENTITY.slerp(delta, w);
+                } else {
+                    translation = translation.lerp(pos, w);
+                    scale = scale.lerp(scl, w);
+                    rotation = rotation.slerp(rot, w);
+                }
+            }
+            let local = Mat4::from_scale_rotation_translation(scale, rotation, translation);
+            let world = bone.parent.map_or(local, |p| out[p] * local);
+            out.push(world);
+        }
+        for (m, bone) in out.iter_mut().zip(&self.bones) {
+            *m *= bone.inverse_bind_world;
+        }
+    }
+
+    /// `g_Bones` contents at `time` seconds: 16 floats per bone, each bone a
+    /// column-major 4×4 affine matrix (columns 0–2 linear part, column 3
+    /// translation; the fourth float of every column is 0, 0, 0, 1).
+    ///
+    /// This is byte-for-byte the std140 layout of `uniform mat4x3
+    /// g_Bones[BONECOUNT]` (four vec3 columns, each padded to 16 bytes, so 64
+    /// bytes per element) and needs no transpose: the shaders compute
+    /// `mul(vec4(pos, 1), g_Bones[i])` = `g_Bones[i] * vec4(pos, 1)`. For a
+    /// tightly packed `mat4x3` drop every fourth float.
+    pub fn bones(&self, time: f64, out: &mut Vec<f32>) {
+        let mut mats = Vec::with_capacity(self.bones.len());
+        self.bone_matrices(time, &mut mats);
+        out.clear();
+        out.extend(mats.iter().flat_map(Mat4::to_cols_array));
+    }
+}
