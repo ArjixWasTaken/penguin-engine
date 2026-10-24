@@ -55,6 +55,24 @@ fn main() {
         page.set_paused(false);
         page.set_scale(2.0);
     }
+    // `PROBE_CLICKS=n`: n left clicks in the middle, 150 ms apart.
+    if let Some(n) = std::env::var("PROBE_CLICKS")
+        .ok()
+        .and_then(|n| n.parse::<u32>().ok())
+    {
+        use wpe_web::{Button, Input};
+        std::thread::sleep(Duration::from_millis(500));
+        if let Ok(js) = std::env::var("PROBE_JS") {
+            page.eval(js);
+        }
+        let (x, y) = (960.0, 540.0);
+        page.input(Input::Move(x, y));
+        for _ in 0..n {
+            page.input(Input::Button(Button::Left, true, x, y));
+            page.input(Input::Button(Button::Left, false, x, y));
+            std::thread::sleep(Duration::from_millis(150));
+        }
+    }
     let deadline = Instant::now() + Duration::from_secs_f32(seconds);
     let mut frames = 0;
     let mut last = None;

@@ -11,6 +11,7 @@ use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
 use dpi::PhysicalSize;
+use embedder_traits::user_contents::UserStyleSheet;
 use euclid::Scale;
 use http::{HeaderValue, StatusCode};
 use servo::{
@@ -27,6 +28,11 @@ use crate::gpu::Ring;
 use crate::local::{self, LocalFiles};
 use crate::policy::{self, NetworkPolicy, Verdict};
 use crate::{Button, Frame, Input, PageOptions, Shared, WebError};
+
+/// Clicks select nothing: Servo selects a clicked `<canvas>` and paints its
+/// whole box in the selection colour, which Chromium (and so Wallpaper
+/// Engine) doesn't. A user style, so a page's own `user-select` still wins.
+const USER_CSS: &str = "* { user-select: none; }";
 
 pub enum Cmd {
     Open {
@@ -646,6 +652,10 @@ fn open_page(
     content.add_script(Rc::new(UserScript::new(
         crate::shim::script(&local::for_page(&options.properties), &options.general),
         None,
+    )));
+    content.add_stylesheet(Rc::new(UserStyleSheet::new(
+        USER_CSS.to_owned(),
+        origin.join("__wpe/user.css").expect("a valid url"),
     )));
     let mut local = LocalFiles::new(&options.root);
     local.update(&options.properties);

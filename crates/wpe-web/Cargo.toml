@@ -5,6 +5,8 @@ edition.workspace = true
 license.workspace = true
 
 [dependencies]
+# `UserStyleSheet` is not re-exported by `servo`.
+embedder_traits = { package = "servo-embedder-traits", version = "=0.7.0" }
 servo = { version = "=0.7.0", default-features = false, features = ["bundled", "js_jit", "webgl", "media-gstreamer"] }
 euclid = "0.22"
 url = "2.5"

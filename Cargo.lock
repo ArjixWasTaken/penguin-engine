@@ -12377,6 +12377,7 @@ dependencies = [
  "rustls",
  "serde_json",
  "servo",
+ "servo-embedder-traits",
  "surfman",
  "thiserror 2.0.21",
  "tracing",
