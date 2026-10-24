@@ -1,0 +1,17 @@
+[package]
+name = "wpe-media"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+data-url = "0.3.2"
+image = { version = "0.25.10", default-features = false, features = ["png", "jpeg", "gif", "bmp", "webp"] }
+percent-encoding = "2.3.2"
+serde = "1.0.229"
+serde_json = "1.0.154"
+thiserror = "2.0.21"
+tracing = "0.1.44"
+ureq = "3.5.0"
+zbus = "5.19.0"
