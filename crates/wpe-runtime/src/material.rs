@@ -47,6 +47,11 @@ impl TextureStore {
             .clone()
     }
 
+    /// Make `name` resolve to `texture` (generated images such as text).
+    pub fn insert(&mut self, name: impl Into<String>, texture: Texture) {
+        self.textures.insert(name.into(), Some(Arc::new(texture)));
+    }
+
     /// Picture size (or first sprite frame size) of a texture.
     pub fn size(&mut self, vfs: &Vfs, name: &str) -> Option<Vec2> {
         let t = self.get(vfs, name)?;

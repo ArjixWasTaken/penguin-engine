@@ -181,9 +181,10 @@ pub fn upload_texture(gpu: &Gpu, tex: &Texture, label: &str) -> GpuTexture {
                 bytes_per_row: Some(row_bytes as u32),
                 rows_per_image: Some(mip.height.div_ceil(bd)),
             },
+            // Mips smaller than a compression block still copy whole blocks.
             wgpu::Extent3d {
-                width: mip.width,
-                height: mip.height,
+                width: mip.width.next_multiple_of(bd),
+                height: mip.height.next_multiple_of(bd),
                 depth_or_array_layers: mip.depth,
             },
         );

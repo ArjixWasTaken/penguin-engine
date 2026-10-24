@@ -1,0 +1,18 @@
+[package]
+name = "wpe-text"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+cosmic-text = "0.19.0"
+serde = "1.0.229"
+serde_json = "1.0.154"
+thiserror = "2.0.21"
+tracing = "0.1.44"
+ttf-parser = "0.25.1"
+wpe-assets = { workspace = true }
+wpe-vfs = { workspace = true }
+
+[dev-dependencies]
+image = { version = "0.25.10", default-features = false, features = ["png"] }

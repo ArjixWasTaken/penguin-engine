@@ -2,7 +2,7 @@ use std::collections::HashMap;
 
 use glam::{Mat4, Vec2, Vec3};
 use wpe_assets::material::{Material, MaterialPass, PassOverride};
-use wpe_assets::scene::{ImageEffect, ImageObject, ObjectCommon, SceneObject};
+use wpe_assets::scene::{ImageEffect, ImageObject, ObjectCommon, SceneObject, TextObject};
 use wpe_assets::{AssetError, ImageModel, load_json};
 use wpe_vfs::Vfs;
 
@@ -90,6 +90,9 @@ pub struct ImageLayer {
     /// `colorBlendMode`; 0 is plain alpha blending.
     pub color_blend_mode: i32,
     pub effects: Vec<ImageEffect>,
+    /// For text layers, the object whose rendered text is the layer's image
+    /// (see [`text_texture_name`]); its size and anchoring are known once rendered.
+    pub text: Option<Box<TextObject>>,
 }
 
 /// A layer's transform inputs and keyframe animations.
@@ -102,6 +105,8 @@ pub struct Motion {
     pub angles: Vec3,
     /// Alignment offset added to the origin.
     pub offset: Vec3,
+    /// Offset of the card in the layer's own (scaled, rotated) space.
+    pub local_offset: Vec3,
     pub origin_animation: Option<Animation>,
     pub scale_animation: Option<Animation>,
     pub angles_animation: Option<Animation>,
@@ -135,7 +140,9 @@ impl Motion {
         let origin = animate3(self.origin, &self.origin_animation, time) + self.offset;
         let scale = animate3(self.scale, &self.scale_animation, time);
         let angles = animate3(self.angles, &self.angles_animation, time);
-        self.parent * local_transform(origin, scale, angles)
+        self.parent
+            * local_transform(origin, scale, angles)
+            * Mat4::from_translation(self.local_offset)
     }
 
     pub fn color_at(&self, base: Vec3, time: f32) -> Vec3 {
@@ -218,12 +225,12 @@ impl Scene {
             .collect();
 
         let mut images = Vec::new();
-        for obj in &scene.objects {
+        for (index, obj) in scene.objects.iter().enumerate() {
             let SceneObject::Image(img) = obj else {
                 continue;
             };
             match load_image(vfs, img, &mut texture_size) {
-                Ok(Some(loaded)) => images.push((img, loaded)),
+                Ok(Some(loaded)) => images.push((index, img, loaded)),
                 Ok(None) => {}
                 Err(e) => tracing::warn!("skipping layer {:?}: {e}", img.common.name),
             }
@@ -235,7 +242,7 @@ impl Scene {
             }
             Some(_) => images
                 .iter()
-                .filter_map(|(_, l)| l.size)
+                .filter_map(|(_, _, l)| l.size)
                 .max_by(|a, b| (a.x * a.y).total_cmp(&(b.x * b.y)))
                 .unwrap_or(DEFAULT_ORTHO),
             None => {
@@ -244,9 +251,9 @@ impl Scene {
             }
         };
 
-        let layers = images
+        let mut layers: Vec<(usize, ImageLayer)> = images
             .into_iter()
-            .map(|(img, loaded)| {
+            .map(|(index, img, loaded)| {
                 let common = &img.common;
                 let anim = |a: &Option<serde_json::Value>| a.as_ref().and_then(Animation::parse);
                 let (size, motion) = if loaded.fullscreen {
@@ -269,6 +276,7 @@ impl Scene {
                         scale: vec3(*props.value(&common.scale)),
                         angles: vec3(*props.value(&common.angles)),
                         offset: alignment_offset(&img.alignment, size).extend(0.0),
+                        local_offset: Vec3::ZERO,
                         origin_animation: anim(&common.origin.animation),
                         scale_animation: anim(&common.scale.animation),
                         angles_animation: anim(&common.angles.animation),
@@ -278,7 +286,7 @@ impl Scene {
                     (size, motion)
                 };
                 let transform = motion.transform_at(0.0);
-                ImageLayer {
+                let layer = ImageLayer {
                     id: img.common.id,
                     name: img.common.name.clone(),
                     visible: is_visible(&nodes, props, img.common.id),
@@ -300,9 +308,18 @@ impl Scene {
                         .filter(|fx| props.flag(&fx.visible))
                         .cloned()
                         .collect(),
-                }
+                    text: None,
+                };
+                (index, layer)
             })
             .collect();
+        for (index, obj) in scene.objects.iter().enumerate() {
+            if let SceneObject::Text(text) = obj {
+                layers.push((index, text_layer(&nodes, props, text)));
+            }
+        }
+        layers.sort_by_key(|(index, _)| *index);
+        let layers = layers.into_iter().map(|(_, l)| l).collect();
 
         Self {
             camera: OrthoCamera {
@@ -336,6 +353,56 @@ struct LoadedImage {
     fullscreen: bool,
     solid: bool,
     passthrough: bool,
+}
+
+/// Name of the texture slot a text layer's rendered image is bound to.
+pub fn text_texture_name(id: i32) -> String {
+    format!("__text_{id}")
+}
+
+fn text_layer(nodes: &HashMap<i32, Node>, props: &UserProperties, text: &TextObject) -> ImageLayer {
+    let common = &text.common;
+    let anim = |a: &Option<serde_json::Value>| a.as_ref().and_then(Animation::parse);
+    let motion = Motion {
+        parent: parent_transform(nodes, props, common.parent, 0),
+        origin: vec3(*props.value(&common.origin)),
+        scale: vec3(*props.value(&common.scale)),
+        angles: vec3(*props.value(&common.angles)),
+        origin_animation: anim(&common.origin.animation),
+        scale_animation: anim(&common.scale.animation),
+        angles_animation: anim(&common.angles.animation),
+        color_animation: anim(&text.color.animation),
+        alpha_animation: anim(&text.alpha.animation),
+        ..Default::default()
+    };
+    ImageLayer {
+        id: common.id,
+        name: common.name.clone(),
+        visible: is_visible(nodes, props, common.id),
+        transform: motion.transform_at(0.0),
+        size: Vec2::ONE,
+        color: Vec3::ONE,
+        alpha: props.value(&text.alpha),
+        brightness: props.value(&text.brightness),
+        material: MaterialPass {
+            shader: "genericimage2".to_owned(),
+            textures: vec![Some(text_texture_name(common.id))],
+            ..Default::default()
+        },
+        motion,
+        parallax_depth: vec2(*props.value(&common.parallax_depth)),
+        solid: false,
+        compose: false,
+        fullscreen: false,
+        color_blend_mode: 0,
+        effects: text
+            .effects
+            .iter()
+            .filter(|fx| props.flag(&fx.visible))
+            .cloned()
+            .collect(),
+        text: Some(Box::new(text.clone())),
+    }
 }
 
 fn load_image(

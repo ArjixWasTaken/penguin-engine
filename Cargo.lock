@@ -3951,8 +3951,33 @@ dependencies = [
  "serde",
  "texture2ddecoder",
  "wpe-assets",
+ "wpe-mdl",
+ "wpe-particles",
  "wpe-runtime",
  "wpe-scene",
+ "wpe-vfs",
+]
+
+[[package]]
+name = "wpe-mdl"
+version = "0.1.0"
+dependencies = [
+ "binrw",
+ "bitflags 2.13.2",
+ "glam",
+ "serde_json",
+ "thiserror 2.0.21",
+]
+
+[[package]]
+name = "wpe-particles"
+version = "0.1.0"
+dependencies = [
+ "glam",
+ "serde_json",
+ "thiserror 2.0.21",
+ "tracing",
+ "wpe-assets",
  "wpe-vfs",
 ]
 
@@ -3986,6 +4011,7 @@ dependencies = [
  "wpe-render",
  "wpe-scene",
  "wpe-shader",
+ "wpe-text",
  "wpe-vfs",
 ]
 

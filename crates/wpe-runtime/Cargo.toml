@@ -16,4 +16,5 @@ wpe-audio = { version = "0.1.0", path = "../wpe-audio" }
 wpe-render = { version = "0.1.0", path = "../wpe-render" }
 wpe-scene = { version = "0.1.0", path = "../wpe-scene" }
 wpe-shader = { version = "0.1.0", path = "../wpe-shader" }
+wpe-text = { version = "0.1.0", path = "../wpe-text" }
 wpe-vfs = { version = "0.1.0", path = "../wpe-vfs" }

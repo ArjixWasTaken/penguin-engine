@@ -21,6 +21,64 @@ pub use files::{LoadError, WallpaperFiles};
 pub use material::{SlotTexture, TextureStore};
 pub use wpe_scene::FillMode;
 
+fn rgba_texture(width: u32, height: u32, pixels: Vec<u8>) -> Texture {
+    Texture {
+        format: TexFormat::Rgba8,
+        flags: wpe_assets::tex::TexFlags::CLAMP_UVS,
+        texb_version: 0,
+        width,
+        height,
+        map_width: width,
+        map_height: height,
+        depth: 1,
+        images: vec![TexImage {
+            mips: vec![Mip {
+                width,
+                height,
+                depth: 1,
+                data: pixels,
+            }],
+        }],
+        sprite_frames: Vec::new(),
+        variants: Vec::new(),
+        video: None,
+    }
+}
+
+/// Rasterise every text layer, sizing and anchoring its card and making its
+/// image available to its material.
+fn render_text_layers(
+    vfs: &wpe_vfs::Vfs,
+    props: &wpe_scene::UserProperties,
+    scene: &mut Scene,
+    store: &mut TextureStore,
+) {
+    if !scene.layers.iter().any(|l| l.text.is_some()) {
+        return;
+    }
+    let mut renderer = wpe_text::TextRenderer::new();
+    let user = |name: &str| props.get(name).cloned();
+    for layer in &mut scene.layers {
+        let Some(obj) = layer.text.as_deref() else {
+            continue;
+        };
+        let style = wpe_text::TextStyle::from_object(obj, user);
+        let text = wpe_text::resolve_text(obj, user);
+        match renderer.render(vfs, &style, &text) {
+            Ok(image) => {
+                layer.size = glam::Vec2::from_array(image.card_size);
+                layer.motion.local_offset = glam::Vec2::from_array(image.anchor_offset).extend(0.0);
+                layer.transform = layer.motion.transform_at(0.0);
+                store.insert(
+                    wpe_scene::text_texture_name(layer.id),
+                    rgba_texture(image.width, image.height, image.pixels),
+                );
+            }
+            Err(e) => tracing::warn!("text layer {:?}: {e}", layer.name),
+        }
+    }
+}
+
 fn white_texture() -> Texture {
     Texture {
         format: TexFormat::Rgba8,
@@ -127,7 +185,8 @@ impl Wallpaper {
         let vfs = &files.vfs;
         let mut store = TextureStore::default();
         let props = wpe_scene::UserProperties::from_project(&files.project);
-        let scene = Scene::build(vfs, &files.scene, &props, |name| store.size(vfs, name));
+        let mut scene = Scene::build(vfs, &files.scene, &props, |name| store.size(vfs, name));
+        render_text_layers(vfs, &props, &mut scene, &mut store);
         tracing::info!(
             "scene {}: {}x{}, {} image layers",
             files.scene_file,
