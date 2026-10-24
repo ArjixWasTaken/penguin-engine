@@ -421,6 +421,20 @@ impl VideoStream {
         }
     }
 
+    /// Wait (up to `timeout`) for a seek to land on its frame.
+    pub fn wait_seeked(&self, timeout: Duration) {
+        let deadline = Instant::now() + timeout;
+        while self.mpv.get_property::<bool>("seeking").unwrap_or(false) && Instant::now() < deadline
+        {
+            std::thread::sleep(Duration::from_millis(5));
+        }
+    }
+
+    /// The codec of the sound being played, if any is (`set_audio`).
+    pub fn audio_codec(&self) -> Option<String> {
+        self.mpv.get_property::<String>("audio-codec-name").ok()
+    }
+
     pub fn rate(&self) -> f64 {
         self.mpv.get_property("speed").unwrap_or(1.0)
     }

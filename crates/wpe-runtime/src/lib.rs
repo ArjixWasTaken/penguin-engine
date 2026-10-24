@@ -585,6 +585,28 @@ impl Wallpaper {
         }
     }
 
+    /// Move every video to `seconds` (looping ones wrap around), so a
+    /// screenshot shows that moment of them.
+    pub fn seek_videos(&self, seconds: f32) {
+        for (_, stream) in self.videos() {
+            let duration = stream.duration();
+            let at = f64::from(seconds);
+            stream.seek(if duration > 0.0 { at % duration } else { at });
+        }
+        for (_, stream) in self.videos() {
+            stream.wait_seeked(std::time::Duration::from_secs(2));
+        }
+    }
+
+    /// The codecs of the video sound being played (video wallpapers with
+    /// audio on).
+    pub fn video_audio(&self) -> Vec<String> {
+        self.videos()
+            .iter()
+            .filter_map(|(_, stream)| stream.audio_codec())
+            .collect()
+    }
+
     /// A video wallpaper's sound follows the audio setting (videos inside
     /// scenes stay silent, as in Wallpaper Engine).
     fn apply_video_audio(&self) {

@@ -137,6 +137,7 @@ fn screenshot(args: &Args, assets: &std::path::Path, out: &std::path::Path) -> R
     if args.audio {
         wallpaper.set_audio(true);
     }
+    wallpaper.seek_videos(args.time);
     for frame in 1..args.frames {
         wallpaper.time_override = Some(args.time + frame as f32 / 30.0);
         // Every half second, press and release somewhere on a 4x4 grid.
@@ -158,6 +159,9 @@ fn screenshot(args: &Args, assets: &std::path::Path, out: &std::path::Path) -> R
         .context("capture size mismatch")?
         .save(out)?;
     tracing::info!("wrote {}", out.display());
+    if args.audio {
+        tracing::info!("video sound playing: {:?}", wallpaper.video_audio());
+    }
     Ok(())
 }
 
