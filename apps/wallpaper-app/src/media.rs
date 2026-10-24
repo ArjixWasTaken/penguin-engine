@@ -10,6 +10,9 @@ use tokio::sync::Semaphore;
 
 use crate::commands::Library;
 
+/// A picture's bytes and media type, made from a preview file.
+type Make = fn(&std::path::Path) -> Option<(Vec<u8>, &'static str)>;
+
 /// Thumbnails made at once; the rest wait their turn.
 static WORKERS: LazyLock<Arc<Semaphore>> = LazyLock::new(|| Arc::new(Semaphore::new(4)));
 
@@ -31,7 +34,7 @@ fn serve<R: Runtime>(
     ctx: UriSchemeContext<'_, R>,
     request: Request<Vec<u8>>,
     responder: UriSchemeResponder,
-    make: fn(&std::path::Path) -> Option<(Vec<u8>, &'static str)>,
+    make: Make,
 ) {
     let app = ctx.app_handle().clone();
     let id = request.uri().path().trim_start_matches('/').to_owned();
