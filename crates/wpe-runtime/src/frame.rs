@@ -14,7 +14,7 @@ use wpe_render::{
     ShaderProgram, SpriteAnimation, SpriteFrame, Step, TargetDesc, TargetId, TargetSize, TexRef,
     upload_texture, wgpu,
 };
-use wpe_scene::{Bloom, ImageLayer, apply_override};
+use wpe_scene::{Animation, Bloom, ImageLayer, Motion, apply_override};
 use wpe_vfs::Vfs;
 
 use crate::material::{self, SlotTexture, TextureStore};
@@ -25,6 +25,7 @@ pub struct Frame {
     pub targets: Vec<TargetDesc>,
     pub steps: Vec<Step>,
     pub videos: Vec<(Arc<GpuTexture>, VideoStream)>,
+    pub bindings: Vec<Binding>,
 }
 
 /// Names under which the current chain input and framebuffer copies appear
@@ -62,6 +63,59 @@ struct Resolved {
     reads_frame: bool,
     uv_scale: Vec2,
     sprites: Vec<SpriteAnimation>,
+    animated: Vec<(String, Vec<f32>, Animation)>,
+}
+
+/// A value recomputed every frame and written into one draw.
+pub enum Binding {
+    /// The layer's animated transform.
+    Model { step: usize, motion: Motion },
+    /// The layer's animated colour and alpha uniforms.
+    Color {
+        step: usize,
+        motion: Motion,
+        color: glam::Vec3,
+        alpha: f32,
+        /// `g_Color4` stays white (blend-mode passes).
+        neutral: bool,
+    },
+    /// An animated material constant.
+    Constant {
+        step: usize,
+        uniform: String,
+        base: Vec<f32>,
+        animation: Animation,
+    },
+}
+
+impl Binding {
+    pub fn apply(&self, renderer: &mut wpe_render::SceneRenderer, time: f32) {
+        match self {
+            Self::Model { step, motion } => renderer.set_model(*step, motion.transform_at(time)),
+            Self::Color {
+                step,
+                motion,
+                color,
+                alpha,
+                neutral,
+            } => {
+                let c = motion.color_at(*color, time);
+                let a = motion.alpha_at(*alpha, time);
+                if !neutral {
+                    renderer.set_uniform(*step, "g_Color4", vec![c.x, c.y, c.z, a]);
+                }
+                renderer.set_uniform(*step, "g_Color", c.to_array().to_vec());
+                renderer.set_uniform(*step, "g_UserAlpha", vec![a]);
+                renderer.set_uniform(*step, "g_Alpha", vec![a]);
+            }
+            Self::Constant {
+                step,
+                uniform,
+                base,
+                animation,
+            } => renderer.set_uniform(*step, uniform, animation.sample(time, base)),
+        }
+    }
 }
 
 /// Shader programs by shader name and final combos; `None` caches a failure.
@@ -83,6 +137,7 @@ pub struct FrameBuilder<'a> {
     pages: HashMap<(usize, usize), Arc<GpuTexture>>,
     /// Video textures and the streams feeding them.
     videos: Vec<(Arc<GpuTexture>, VideoStream)>,
+    bindings: Vec<Binding>,
     /// Draws using their compiled material, and all draws.
     pub stats: (usize, usize),
 }
@@ -101,6 +156,7 @@ impl<'a> FrameBuilder<'a> {
             frame_copy: None,
             links: HashMap::new(),
             videos: Vec::new(),
+            bindings: Vec::new(),
             pages: HashMap::new(),
             stats: (0, 0),
         }
@@ -111,6 +167,7 @@ impl<'a> FrameBuilder<'a> {
             targets: self.targets,
             steps: self.steps,
             videos: self.videos,
+            bindings: self.bindings,
         }
     }
 
@@ -234,6 +291,7 @@ impl<'a> FrameBuilder<'a> {
             reads_frame,
             uv_scale,
             sprites,
+            animated: prepared.animated,
         })
     }
 
@@ -294,6 +352,15 @@ impl<'a> FrameBuilder<'a> {
         }
         self.stats.0 += 1;
         self.stats.1 += 1;
+        let step = self.steps.len();
+        for (uniform, base, animation) in resolved.animated {
+            self.bindings.push(Binding::Constant {
+                step,
+                uniform,
+                base,
+                animation,
+            });
+        }
         self.steps.push(Step::Draw {
             target,
             draw: Draw::Material(MaterialDraw {
@@ -468,6 +535,27 @@ impl<'a> FrameBuilder<'a> {
         }
     }
 
+    /// Bind the layer's animations to the draw just pushed.
+    fn bind_layer(&mut self, layer: &ImageLayer, model: bool, neutral: bool) {
+        let step = self.steps.len() - 1;
+        let m = &layer.motion;
+        if model && m.is_transform_animated() {
+            self.bindings.push(Binding::Model {
+                step,
+                motion: m.clone(),
+            });
+        }
+        if m.color_animation.is_some() || m.alpha_animation.is_some() {
+            self.bindings.push(Binding::Color {
+                step,
+                motion: m.clone(),
+                color: layer.color,
+                alpha: layer.alpha,
+                neutral,
+            });
+        }
+    }
+
     fn final_blend(layer: &ImageLayer) -> BlendMode {
         match layer.color_blend_mode {
             7 => BlendMode::Normal,
@@ -503,6 +591,7 @@ impl<'a> FrameBuilder<'a> {
                         Camera::Scene,
                     ),
                 }
+                self.bind_layer(layer, offscreen.is_none(), false);
             }
             None if offscreen.is_none() => self.fallback(layer),
             None => {}
@@ -577,6 +666,7 @@ impl<'a> FrameBuilder<'a> {
         };
         let base_blend = blend_mode(&layer.material.blending);
         self.push_draw(prev, base, model, mesh, base_blend, camera);
+        self.bind_layer(layer, layer.compose && !layer.fullscreen, false);
 
         let mut last_output: Option<usize> = None;
         for (effect, overrides) in effects {
@@ -682,6 +772,7 @@ impl<'a> FrameBuilder<'a> {
                             BlendMode::Normal,
                             Camera::Fixed(Mat4::IDENTITY),
                         );
+                        self.bind_layer(layer, false, neutral);
                         if is_output {
                             last_output = Some(self.steps.len() - 1);
                         }
@@ -714,6 +805,12 @@ impl<'a> FrameBuilder<'a> {
                 size: layer.size,
                 uv_scale: Vec2::ONE,
             };
+            if layer.motion.is_transform_animated() {
+                self.bindings.push(Binding::Model {
+                    step: index,
+                    motion: layer.motion.clone(),
+                });
+            }
         }
     }
 }

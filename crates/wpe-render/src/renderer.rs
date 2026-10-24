@@ -159,6 +159,23 @@ impl SceneRenderer {
             .collect();
     }
 
+    /// Replace the model matrix of the draw at `step` (its index in the
+    /// list given to [`Self::set_frame`]).
+    pub fn set_model(&mut self, step: usize, model: Mat4) {
+        match self.steps.get_mut(step) {
+            Some(PreparedStep::Material(_, d)) => d.draw.model = model,
+            Some(PreparedStep::Image(_, d)) => d.draw.model = model,
+            _ => {}
+        }
+    }
+
+    /// Override a uniform of the material draw at `step` from the next frame on.
+    pub fn set_uniform(&mut self, step: usize, name: &str, values: Vec<f32>) {
+        if let Some(PreparedStep::Material(_, d)) = self.steps.get_mut(step) {
+            d.overrides.insert(name.to_owned(), values);
+        }
+    }
+
     fn prepare_image(&self, gpu: &Gpu, draw: ImageDraw) -> PreparedImageDraw {
         let uniforms = gpu.device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("image uniforms"),

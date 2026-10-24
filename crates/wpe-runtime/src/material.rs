@@ -73,6 +73,8 @@ pub struct PreparedMaterial {
     pub textures: Vec<Option<SlotTexture>>,
     /// Shader defaults overlaid with the material's constants.
     pub constants: HashMap<String, Vec<f32>>,
+    /// Constants with keyframe animations: uniform, base value, animation.
+    pub animated: Vec<(String, Vec<f32>, wpe_scene::Animation)>,
 }
 
 /// `TEX<N>FORMAT` value `common_fragment.h` compares a slot against.
@@ -169,9 +171,17 @@ pub fn prepare(
     )?;
 
     let mut constants = shader.info.defaults.clone();
+    let mut animated = Vec::new();
     for (key, value) in &pass.constantshadervalues {
         match shader.info.uniform_for_constant(key) {
             Some(uniform) => {
+                if let Some(anim) = value
+                    .animation
+                    .as_ref()
+                    .and_then(wpe_scene::Animation::parse)
+                {
+                    animated.push((uniform.clone(), value.value.0.clone(), anim));
+                }
                 constants.insert(uniform, value.value.0.clone());
             }
             None => tracing::debug!("material constant {key} matches no uniform"),
@@ -181,5 +191,6 @@ pub fn prepare(
         shader,
         textures,
         constants,
+        animated,
     })
 }

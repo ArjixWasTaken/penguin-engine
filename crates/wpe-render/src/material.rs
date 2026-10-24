@@ -354,7 +354,9 @@ pub struct MaterialDraw {
 }
 
 pub(crate) struct PreparedMaterialDraw {
-    draw: MaterialDraw,
+    pub(crate) draw: MaterialDraw,
+    /// Uniform values replaced every frame (animations, scripts).
+    pub(crate) overrides: HashMap<String, Vec<f32>>,
     block: UniformBlock,
     uniforms: Option<wgpu::Buffer>,
     vertices: wgpu::Buffer,
@@ -466,6 +468,7 @@ impl PreparedMaterialDraw {
         let vertices = vertex_buffer(gpu, &draw.program, &draw.mesh);
         Self {
             draw,
+            overrides: HashMap::new(),
             block,
             uniforms,
             vertices,
@@ -624,6 +627,11 @@ impl PreparedMaterialDraw {
                 && !self.draw.constants.contains_key(name)
             {
                 self.block.write(member, &mat4(Mat4::IDENTITY));
+            }
+        }
+        for (name, v) in &self.overrides {
+            if let Some(member) = r.uniforms.get(name) {
+                self.block.write(member, v);
             }
         }
         for (slot, tex) in self.draw.textures.iter().enumerate() {

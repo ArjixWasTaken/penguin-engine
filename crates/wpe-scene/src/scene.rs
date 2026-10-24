@@ -6,7 +6,7 @@ use wpe_assets::scene::{ImageEffect, ImageObject, ObjectCommon, SceneObject};
 use wpe_assets::{AssetError, ImageModel, load_json};
 use wpe_vfs::Vfs;
 
-use crate::{OrthoCamera, UserProperties, alignment_offset, local_transform};
+use crate::{Animation, OrthoCamera, UserProperties, alignment_offset, local_transform};
 
 const DEFAULT_ORTHO: Vec2 = Vec2::new(1920.0, 1080.0);
 
@@ -46,6 +46,8 @@ pub struct ImageLayer {
     pub brightness: f32,
     /// First material pass with the object's `instance` override applied.
     pub material: MaterialPass,
+    /// What `transform`, `color` and `alpha` are made of, for animation.
+    pub motion: Motion,
     /// The model is a solid colour layer with no texture.
     pub solid: bool,
     /// A passthrough compose layer: its image is what is already on screen.
@@ -55,6 +57,58 @@ pub struct ImageLayer {
     /// `colorBlendMode`; 0 is plain alpha blending.
     pub color_blend_mode: i32,
     pub effects: Vec<ImageEffect>,
+}
+
+/// A layer's transform inputs and keyframe animations.
+#[derive(Debug, Clone, Default)]
+pub struct Motion {
+    /// World transform of the parent chain.
+    pub parent: Mat4,
+    pub origin: Vec3,
+    pub scale: Vec3,
+    pub angles: Vec3,
+    /// Alignment offset added to the origin.
+    pub offset: Vec3,
+    pub origin_animation: Option<Animation>,
+    pub scale_animation: Option<Animation>,
+    pub angles_animation: Option<Animation>,
+    pub color_animation: Option<Animation>,
+    pub alpha_animation: Option<Animation>,
+}
+
+fn animate3(base: Vec3, anim: &Option<Animation>, time: f32) -> Vec3 {
+    match anim {
+        Some(a) => {
+            let v = a.sample(time, &base.to_array());
+            Vec3::new(v[0], v[1], v[2])
+        }
+        None => base,
+    }
+}
+
+impl Motion {
+    pub fn is_transform_animated(&self) -> bool {
+        self.origin_animation.is_some()
+            || self.scale_animation.is_some()
+            || self.angles_animation.is_some()
+    }
+
+    pub fn transform_at(&self, time: f32) -> Mat4 {
+        let origin = animate3(self.origin, &self.origin_animation, time) + self.offset;
+        let scale = animate3(self.scale, &self.scale_animation, time);
+        let angles = animate3(self.angles, &self.angles_animation, time);
+        self.parent * local_transform(origin, scale, angles)
+    }
+
+    pub fn color_at(&self, base: Vec3, time: f32) -> Vec3 {
+        animate3(base, &self.color_animation, time)
+    }
+
+    pub fn alpha_at(&self, base: f32, time: f32) -> f32 {
+        self.alpha_animation
+            .as_ref()
+            .map_or(base, |a| a.sample(time, &[base])[0])
+    }
 }
 
 impl ImageLayer {
@@ -155,25 +209,37 @@ impl Scene {
         let layers = images
             .into_iter()
             .map(|(img, loaded)| {
-                let (size, transform) = if loaded.fullscreen {
-                    (ortho, Mat4::from_translation((ortho / 2.0).extend(0.0)))
+                let common = &img.common;
+                let anim = |a: &Option<serde_json::Value>| a.as_ref().and_then(Animation::parse);
+                let (size, motion) = if loaded.fullscreen {
+                    let motion = Motion {
+                        parent: Mat4::IDENTITY,
+                        origin: (ortho / 2.0).extend(0.0),
+                        scale: Vec3::ONE,
+                        angles: Vec3::ZERO,
+                        offset: Vec3::ZERO,
+                        ..Default::default()
+                    };
+                    (ortho, motion)
                 } else {
-                    let common = &img.common;
                     let size = loaded
                         .size
                         .unwrap_or_else(|| vec3(*props.value(&common.origin)).truncate() * 2.0);
-                    let origin = vec3(*props.value(&common.origin))
-                        + alignment_offset(&img.alignment, size).extend(0.0);
-                    let local = local_transform(
-                        origin,
-                        vec3(*props.value(&common.scale)),
-                        vec3(*props.value(&common.angles)),
-                    );
-                    (
-                        size,
-                        parent_transform(&nodes, props, common.parent, 0) * local,
-                    )
+                    let motion = Motion {
+                        parent: parent_transform(&nodes, props, common.parent, 0),
+                        origin: vec3(*props.value(&common.origin)),
+                        scale: vec3(*props.value(&common.scale)),
+                        angles: vec3(*props.value(&common.angles)),
+                        offset: alignment_offset(&img.alignment, size).extend(0.0),
+                        origin_animation: anim(&common.origin.animation),
+                        scale_animation: anim(&common.scale.animation),
+                        angles_animation: anim(&common.angles.animation),
+                        color_animation: anim(&img.color.animation),
+                        alpha_animation: anim(&img.alpha.animation),
+                    };
+                    (size, motion)
                 };
+                let transform = motion.transform_at(0.0);
                 ImageLayer {
                     id: img.common.id,
                     name: img.common.name.clone(),
@@ -184,6 +250,7 @@ impl Scene {
                     alpha: props.value(&img.alpha),
                     brightness: props.value(&img.brightness),
                     material: loaded.material,
+                    motion,
                     solid: loaded.solid,
                     compose: loaded.passthrough,
                     fullscreen: loaded.fullscreen,

@@ -52,6 +52,7 @@ pub struct Wallpaper {
     camera: OrthoCamera,
     renderer: SceneRenderer,
     videos: Vec<(Arc<GpuTexture>, video::VideoStream)>,
+    bindings: Vec<frame::Binding>,
     start: Instant,
     /// Cursor over the output, 0..1 with Y down.
     pointer: Vec2,
@@ -112,11 +113,18 @@ impl Wallpaper {
             camera: scene.camera,
             renderer,
             videos: frame.videos,
+            bindings: frame.bindings,
             start: Instant::now(),
             pointer: Vec2::splat(0.5),
             parallax_influence: files.scene.general.cameraparallaxmouseinfluence.value,
             time_override: None,
         })
+    }
+
+    fn animate(&mut self, time: f32) {
+        for binding in &self.bindings {
+            binding.apply(&mut self.renderer, time);
+        }
     }
 
     fn upload_video_frames(&mut self, gpu: &Gpu) {
@@ -158,6 +166,7 @@ impl Wallpaper {
     ) {
         self.upload_video_frames(gpu);
         let globals = self.globals(size);
+        self.animate(globals.time);
         self.renderer.render(gpu, encoder, globals, output, size);
     }
 
@@ -168,6 +177,7 @@ impl Wallpaper {
         }
         self.upload_video_frames(gpu);
         let globals = self.globals(size);
+        self.animate(globals.time);
         self.renderer.capture(gpu, globals, size)
     }
 }
