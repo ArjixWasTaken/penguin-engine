@@ -62,7 +62,8 @@ fn vec3(v: [f32; 3]) -> Vec3 {
     Vec3::from_array(v)
 }
 
-fn apply_override(pass: &mut MaterialPass, over: &PassOverride) {
+/// Overlay a pass override (non-empty textures, combos, constants) onto `pass`.
+pub fn apply_override(pass: &mut MaterialPass, over: &PassOverride) {
     for (i, tex) in over.textures.iter().enumerate() {
         let Some(tex) = tex.as_ref().filter(|t| !t.is_empty()) else {
             continue;

@@ -1,89 +1,21 @@
 //! Embeddable wallpaper runtime: load a wallpaper and drive its render loop.
 
-use std::cell::RefCell;
+mod files;
+pub mod material;
+
 use std::collections::HashMap;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::sync::Arc;
 
-use glam::{Mat4, Vec2, Vec4};
+use glam::{Mat4, Vec4};
 use wpe_assets::material::Blending;
 use wpe_assets::tex::{Mip, TexFormat, TexImage, Texture};
-use wpe_assets::{AssetError, Project, load_json, resolve_scene_file};
 use wpe_render::{BlendMode, Gpu, GpuTexture, ImageDraw, SceneRenderer, upload_texture, wgpu};
 use wpe_scene::{ImageLayer, OrthoCamera, Scene};
-use wpe_vfs::{PhysicalFs, PkgFs, Vfs, VfsError};
 
+pub use files::{LoadError, WallpaperFiles};
+pub use material::TextureStore;
 pub use wpe_scene::FillMode;
-
-#[derive(Debug, thiserror::Error)]
-pub enum LoadError {
-    #[error(transparent)]
-    Vfs(#[from] VfsError),
-    #[error(transparent)]
-    Asset(#[from] AssetError),
-    #[error("{0} is not a wallpaper directory, .pkg or scene .json")]
-    BadPath(PathBuf),
-}
-
-/// Where a wallpaper's files come from.
-struct Source {
-    dir: PathBuf,
-    pkg: Option<PathBuf>,
-    scene_file: Option<String>,
-}
-
-impl Source {
-    fn resolve(path: &Path) -> Result<Self, LoadError> {
-        let bad = || LoadError::BadPath(path.to_owned());
-        if path.is_dir() {
-            let pkg = path.join("scene.pkg");
-            return Ok(Self {
-                dir: path.to_owned(),
-                pkg: pkg.is_file().then_some(pkg),
-                scene_file: None,
-            });
-        }
-        let dir = path.parent().ok_or_else(bad)?.to_owned();
-        let name = path
-            .file_name()
-            .ok_or_else(bad)?
-            .to_string_lossy()
-            .into_owned();
-        match path.extension().and_then(|e| e.to_str()) {
-            Some("pkg") => Ok(Self {
-                dir,
-                pkg: Some(path.to_owned()),
-                scene_file: None,
-            }),
-            Some("json") => Ok(Self {
-                dir,
-                pkg: None,
-                scene_file: Some(name),
-            }),
-            _ => Err(bad()),
-        }
-    }
-}
-
-/// Mount the stock assets, then the wallpaper directory, then its package.
-fn build_vfs(assets: &Path, source: &Source) -> Result<Vfs, LoadError> {
-    let mut vfs = Vfs::new();
-    vfs.mount("assets", PhysicalFs::new(assets)?);
-    vfs.mount("wallpaper", PhysicalFs::new(&source.dir)?);
-    if let Some(pkg) = &source.pkg {
-        vfs.mount("pkg", PkgFs::open(pkg)?);
-    }
-    Ok(vfs)
-}
-
-/// Path of the `.tex` a material texture name refers to.
-fn texture_path(vfs: &Vfs, name: &str) -> String {
-    if name.ends_with(".tex") && vfs.contains(name) {
-        name.to_owned()
-    } else {
-        format!("materials/{name}.tex")
-    }
-}
 
 fn white_texture() -> Texture {
     Texture {
@@ -135,74 +67,25 @@ impl Wallpaper {
         assets: &Path,
         path: &Path,
     ) -> Result<Self, LoadError> {
-        let source = Source::resolve(path)?;
-        let vfs = build_vfs(assets, &source)?;
-
-        let project_path = source.dir.join("project.json");
-        let project: Project = if project_path.is_file() {
-            wpe_assets::parse_json(&std::fs::read_to_string(&project_path).map_err(|e| {
-                VfsError::Io {
-                    path: project_path.display().to_string(),
-                    source: e,
-                }
-            })?)
-            .map_err(|source| AssetError::Json {
-                path: project_path.display().to_string(),
-                source,
-            })?
-        } else {
-            Project::default()
-        };
-        let scene_file = source
-            .scene_file
-            .clone()
-            .unwrap_or_else(|| resolve_scene_file(&project, &vfs));
-        let scene_json: wpe_assets::Scene = load_json(&vfs, &scene_file)?;
-
-        let textures: RefCell<HashMap<String, Option<Texture>>> = RefCell::default();
-        let load_texture = |name: &str| {
-            textures
-                .borrow_mut()
-                .entry(name.to_owned())
-                .or_insert_with(|| {
-                    let path = texture_path(&vfs, name);
-                    let parsed = vfs
-                        .read(&path)
-                        .map_err(|e| e.to_string())
-                        .and_then(|b| Texture::parse(&b).map_err(|e| e.to_string()));
-                    parsed
-                        .inspect_err(|e| tracing::warn!("texture {name}: {e}"))
-                        .ok()
-                })
-                .as_ref()
-                .map(|t| match t.sprite_frames.first() {
-                    Some(f) if t.is_sprite() => Vec2::new(f.width, f.height),
-                    _ => Vec2::new(t.map_width as f32, t.map_height as f32),
-                })
-        };
-        let scene = Scene::build(&vfs, &scene_json, load_texture);
+        let files = WallpaperFiles::open_with_assets_dir(assets, path)?;
+        let vfs = &files.vfs;
+        let mut store = TextureStore::default();
+        let scene = Scene::build(vfs, &files.scene, |name| store.size(vfs, name));
         tracing::info!(
-            "scene {scene_file}: {}x{}, {} image layers",
+            "scene {}: {}x{}, {} image layers",
+            files.scene_file,
             scene.camera.scene_size.x,
             scene.camera.scene_size.y,
             scene.layers.len()
         );
 
-        let mut textures = textures.into_inner();
         let mut uploaded: HashMap<String, Arc<GpuTexture>> = HashMap::new();
         let mut upload = |name: &str| -> Option<Arc<GpuTexture>> {
             if let Some(t) = uploaded.get(name) {
                 return Some(t.clone());
             }
-            let tex = textures
-                .entry(name.to_owned())
-                .or_insert_with(|| {
-                    vfs.read(&texture_path(&vfs, name))
-                        .ok()
-                        .and_then(|b| Texture::parse(&b).ok())
-                })
-                .as_ref()?;
-            let gpu_tex = Arc::new(upload_texture(gpu, tex, name));
+            let tex = store.get(vfs, name)?;
+            let gpu_tex = Arc::new(upload_texture(gpu, &tex, name));
             uploaded.insert(name.to_owned(), gpu_tex.clone());
             Some(gpu_tex)
         };
@@ -239,7 +122,11 @@ impl Wallpaper {
         renderer.set_draws(gpu, draws);
 
         Ok(Self {
-            title: project.title.unwrap_or_else(|| scene_file.clone()),
+            title: files
+                .project
+                .title
+                .clone()
+                .unwrap_or(files.scene_file.clone()),
             fill: FillMode::default(),
             camera: scene.camera,
             renderer,

@@ -6,12 +6,14 @@
 //! wallpaper's own `scene.pkg` (or its unpacked directory). Lookups are
 //! case-insensitive and the most recently mounted layer wins.
 
+mod alias;
 mod path;
 mod physical;
 mod pkg;
 
 use std::borrow::Cow;
 
+pub use alias::AliasFs;
 pub use path::normalize;
 pub use physical::PhysicalFs;
 pub use pkg::{PkgEntry, PkgFs};
@@ -42,6 +44,20 @@ pub trait FileSystem: Send + Sync {
 
     /// All normalized file paths in this source, in no particular order.
     fn files(&self) -> Box<dyn Iterator<Item = &str> + '_>;
+}
+
+impl<T: FileSystem + ?Sized> FileSystem for std::sync::Arc<T> {
+    fn contains(&self, path: &str) -> bool {
+        (**self).contains(path)
+    }
+
+    fn read(&self, path: &str) -> Result<Cow<'_, [u8]>> {
+        (**self).read(path)
+    }
+
+    fn files(&self) -> Box<dyn Iterator<Item = &str> + '_> {
+        (**self).files()
+    }
 }
 
 /// A stack of [`FileSystem`] layers; later mounts shadow earlier ones.

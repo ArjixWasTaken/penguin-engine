@@ -5,5 +5,5 @@ mod scene;
 mod transform;
 
 pub use camera::{FillMode, OrthoCamera};
-pub use scene::{ImageLayer, Scene};
+pub use scene::{ImageLayer, Scene, apply_override};
 pub use transform::{alignment_offset, local_transform};

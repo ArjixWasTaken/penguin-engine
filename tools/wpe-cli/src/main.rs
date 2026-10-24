@@ -1,4 +1,5 @@
 mod scenes;
+mod shaders;
 mod tex;
 
 use std::path::{Path, PathBuf};
@@ -29,6 +30,19 @@ enum Command {
         #[arg(long)]
         pkg: Option<PathBuf>,
     },
+    /// Compile every material shader variant used by workshop scenes and group the failures.
+    ScanShaders {
+        #[arg(long)]
+        assets: PathBuf,
+        #[arg(long)]
+        workshop: PathBuf,
+        /// Only scan the first N wallpapers.
+        #[arg(long)]
+        limit: Option<usize>,
+        /// List every error group.
+        #[arg(long)]
+        verbose: bool,
+    },
     /// Decode every .tex in workshop scene.pkg files and loose asset directories.
     ScanTex {
         /// Workshop content directory (containing <id>/scene.pkg).
@@ -55,6 +69,12 @@ fn main() -> Result<()> {
         Command::Extract { pkg, out } => extract(&pkg, &out),
         Command::ScanPkgs { dir } => scan_pkgs(&dir),
         Command::Tex2png { input, out, pkg } => tex::tex2png(&input, &out, pkg.as_deref()),
+        Command::ScanShaders {
+            assets,
+            workshop,
+            limit,
+            verbose,
+        } => shaders::scan_shaders(&assets, &workshop, limit, verbose),
         Command::ScanTex { workshop, assets } => tex::scan_tex(workshop.as_deref(), &assets),
         Command::ScanScenes { assets, workshop } => scenes::scan_scenes(&assets, &workshop),
     }
