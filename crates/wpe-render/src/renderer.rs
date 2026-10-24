@@ -73,6 +73,8 @@ pub struct SceneRenderer {
     blit_bind_group: Option<(u64, wgpu::BindGroup)>,
     targets: Targets,
     steps: Vec<PreparedStep>,
+    /// Steps skipped this frame.
+    hidden: Vec<bool>,
     placeholders: Placeholders,
     /// Uniforms written into every material draw that declares them.
     globals: std::collections::HashMap<String, Vec<f32>>,
@@ -137,6 +139,7 @@ impl SceneRenderer {
             blit_bind_group: None,
             targets: Targets::new(gpu),
             steps: Vec::new(),
+            hidden: Vec::new(),
             placeholders: Placeholders::new(gpu),
             globals: Default::default(),
             clear_color: wgpu::Color::BLACK,
@@ -161,6 +164,21 @@ impl SceneRenderer {
                 Step::Copy { from, to } => PreparedStep::Copy { from, to },
             })
             .collect();
+        self.hidden = vec![false; self.steps.len()];
+    }
+
+    /// Show or hide the draw at `step`.
+    pub fn set_visible(&mut self, step: usize, visible: bool) {
+        if let Some(hidden) = self.hidden.get_mut(step) {
+            *hidden = !visible;
+        }
+    }
+
+    /// Bind `texture` to `g_Texture<slot>` of the material draw at `step`.
+    pub fn set_texture(&mut self, step: usize, slot: usize, texture: Arc<GpuTexture>) {
+        if let Some(PreparedStep::Material(_, d)) = self.steps.get_mut(step) {
+            d.set_texture(slot, texture);
+        }
     }
 
     /// Replace the model matrix of the draw at `step` (its index in the
@@ -413,7 +431,10 @@ impl SceneRenderer {
                 })],
                 ..Default::default()
             });
-            for step in &self.steps[i..end] {
+            for (step, hidden) in self.steps[i..end].iter().zip(&self.hidden[i..end]) {
+                if *hidden {
+                    continue;
+                }
                 match step {
                     PreparedStep::Image(_, d) if format == DEFAULT_FORMAT => {
                         pass.set_pipeline(

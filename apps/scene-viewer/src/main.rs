@@ -300,6 +300,13 @@ impl ApplicationHandler for App {
                     position.y as f32 / size.height.max(1) as f32,
                 ));
             }
+            WindowEvent::MouseInput {
+                state: button_state,
+                button: winit::event::MouseButton::Left,
+                ..
+            } => state
+                .wallpaper
+                .mouse_button(button_state == ElementState::Pressed),
             WindowEvent::RedrawRequested => {
                 state.redraw();
                 if self.args.fps == 0 {

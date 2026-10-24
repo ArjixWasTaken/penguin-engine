@@ -27,6 +27,19 @@ pub struct Frame {
     pub videos: Vec<(Arc<GpuTexture>, VideoStream)>,
     pub bindings: Vec<Binding>,
     pub particles: Vec<ParticleInstance>,
+    /// Draws of each on-screen layer, by layer id.
+    pub layer_steps: HashMap<i32, LayerSteps>,
+}
+
+/// The draws an on-screen layer produced.
+#[derive(Debug, Clone, Default)]
+pub struct LayerSteps {
+    pub all: Vec<usize>,
+    /// Draws placed with the layer's transform.
+    pub model: Vec<usize>,
+    /// Draws carrying the layer's colour uniforms, and whether `g_Color4`
+    /// stays white in them.
+    pub color: Vec<(usize, bool)>,
 }
 
 /// Names under which the current chain input and framebuffer copies appear
@@ -309,6 +322,9 @@ pub struct FrameBuilder<'a> {
     /// Offscreen outputs of layers other layers sample, by layer id.
     links: HashMap<i32, TargetId>,
     particles: Vec<ParticleInstance>,
+    /// The on-screen layer whose draws are being added.
+    current_layer: Option<i32>,
+    layer_steps: HashMap<i32, LayerSteps>,
     /// Parsed puppet models by path; `None` caches a failure.
     mdls: HashMap<String, Option<Arc<wpe_mdl::Mdl>>>,
     /// Sprite-sheet pages after the first, by texture and page index.
@@ -340,6 +356,8 @@ impl<'a> FrameBuilder<'a> {
             pages: HashMap::new(),
             mdls: HashMap::new(),
             particles: Vec::new(),
+            current_layer: None,
+            layer_steps: HashMap::new(),
             stats: (0, 0),
         }
     }
@@ -351,6 +369,7 @@ impl<'a> FrameBuilder<'a> {
             videos: self.videos,
             bindings: self.bindings,
             particles: self.particles,
+            layer_steps: self.layer_steps,
         }
     }
 
@@ -547,6 +566,9 @@ impl<'a> FrameBuilder<'a> {
         self.stats.0 += 1;
         self.stats.1 += 1;
         let step = self.steps.len();
+        if let Some(steps) = self.current_steps() {
+            steps.all.push(step);
+        }
         for (uniform, base, animation) in resolved.animated {
             self.bindings.push(Binding::Constant {
                 step,
@@ -712,6 +734,7 @@ impl<'a> FrameBuilder<'a> {
 
     /// Draw `layer` onto the screen, or into `offscreen` filling it.
     fn layer(&mut self, layer: &ImageLayer, offscreen: Option<TargetId>) {
+        self.current_layer = offscreen.is_none().then_some(layer.id);
         if let Some(source) = &layer.particle {
             if offscreen.is_none() {
                 self.particle_layer(layer, source);
@@ -828,6 +851,9 @@ impl<'a> FrameBuilder<'a> {
     }
 
     fn bind_model(&mut self, layer: &ImageLayer, step: usize) {
+        if let Some(steps) = self.current_steps() {
+            steps.model.push(step);
+        }
         let parallax = self.layer_parallax(layer);
         if layer.motion.is_transform_animated() || parallax.is_some() {
             self.bindings.push(Binding::Model {
@@ -846,6 +872,9 @@ impl<'a> FrameBuilder<'a> {
     /// Bind the layer's animations to the draw just pushed.
     fn bind_layer(&mut self, layer: &ImageLayer, model: bool, neutral: bool) {
         let step = self.steps.len() - 1;
+        if let Some(steps) = self.current_steps() {
+            steps.color.push((step, neutral));
+        }
         let m = &layer.motion;
         if model {
             self.bind_model(layer, step);
@@ -859,6 +888,11 @@ impl<'a> FrameBuilder<'a> {
                 neutral,
             });
         }
+    }
+
+    fn current_steps(&mut self) -> Option<&mut LayerSteps> {
+        let id = self.current_layer?;
+        Some(self.layer_steps.entry(id).or_default())
     }
 
     fn final_blend(layer: &ImageLayer) -> BlendMode {

@@ -741,6 +741,18 @@ impl PreparedMaterialDraw {
         geometry.draw(pass);
     }
 
+    /// Bind `texture` to slot `slot` from the next update.
+    pub fn set_texture(&mut self, slot: usize, texture: Arc<GpuTexture>) {
+        if self.draw.textures.len() <= slot {
+            self.draw.textures.resize(slot + 1, None);
+        }
+        let resolution = resolution(&texture);
+        self.draw.textures[slot] = Some(TexRef::Asset(texture));
+        self.overrides
+            .insert(format!("g_Texture{slot}Resolution"), resolution.to_vec());
+        self.bind_group = None;
+    }
+
     /// Replace the mesh; it is uploaded on the next update.
     pub fn set_mesh(&mut self, mesh: Mesh) {
         self.draw.mesh = mesh;

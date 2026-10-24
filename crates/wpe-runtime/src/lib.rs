@@ -3,6 +3,7 @@
 mod files;
 mod frame;
 pub mod material;
+mod script;
 mod video;
 
 use std::path::Path;
@@ -21,7 +22,7 @@ pub use files::{LoadError, WallpaperFiles};
 pub use material::{SlotTexture, TextureStore};
 pub use wpe_scene::FillMode;
 
-fn rgba_texture(width: u32, height: u32, pixels: Vec<u8>) -> Texture {
+pub(crate) fn rgba_texture(width: u32, height: u32, pixels: Vec<u8>) -> Texture {
     Texture {
         format: TexFormat::Rgba8,
         flags: wpe_assets::tex::TexFlags::CLAMP_UVS,
@@ -52,9 +53,9 @@ fn render_text_layers(
     props: &wpe_scene::UserProperties,
     scene: &mut Scene,
     store: &mut TextureStore,
-) {
+) -> Option<wpe_text::TextRenderer> {
     if !scene.layers.iter().any(|l| l.text.is_some()) {
-        return;
+        return None;
     }
     let mut renderer = wpe_text::TextRenderer::new();
     let user = |name: &str| props.get(name).cloned();
@@ -77,6 +78,7 @@ fn render_text_layers(
             Err(e) => tracing::warn!("text layer {:?}: {e}", layer.name),
         }
     }
+    Some(renderer)
 }
 
 fn white_texture() -> Texture {
@@ -112,6 +114,11 @@ pub struct Wallpaper {
     videos: Vec<(Arc<GpuTexture>, video::VideoStream)>,
     bindings: Vec<frame::Binding>,
     particles: Vec<frame::ParticleInstance>,
+    scripts: Option<script::Scripts>,
+    /// The wallpaper's files, for assets loaded while running (text fonts).
+    vfs: wpe_vfs::Vfs,
+    /// Spectrum of the latest audio frame, for scripts.
+    spectrum: Option<wpe_audio::AudioSpectrum>,
     start: Instant,
     /// Smoothed cursor over the output, 0..1 with Y down.
     pointer: Vec2,
@@ -187,7 +194,7 @@ impl Wallpaper {
         let mut store = TextureStore::default();
         let props = wpe_scene::UserProperties::from_project(&files.project);
         let mut scene = Scene::build(vfs, &files.scene, &props, |name| store.size(vfs, name));
-        render_text_layers(vfs, &props, &mut scene, &mut store);
+        let text_renderer = render_text_layers(vfs, &props, &mut scene, &mut store);
         tracing::info!(
             "scene {}: {}x{}, {} image layers",
             files.scene_file,
@@ -215,6 +222,15 @@ impl Wallpaper {
             a: 1.0,
         };
         renderer.set_frame(gpu, frame.targets, frame.steps);
+        let scripts = script::Scripts::load(
+            vfs,
+            &files.project,
+            &files.scene,
+            &scene.layers,
+            &frame.layer_steps,
+            scene.camera.scene_size,
+            text_renderer,
+        );
 
         Ok(Self {
             title: files
@@ -228,6 +244,8 @@ impl Wallpaper {
             videos: frame.videos,
             bindings: frame.bindings,
             particles: frame.particles,
+            scripts,
+            spectrum: None,
             start: Instant::now(),
             pointer: Vec2::splat(0.5),
             pointer_target: Vec2::splat(0.5),
@@ -239,6 +257,7 @@ impl Wallpaper {
             audio: None,
             sounds: None,
             sound_layers: sound_layers(&files, &props),
+            vfs: files.vfs,
         })
     }
 
@@ -275,8 +294,29 @@ impl Wallpaper {
             return;
         };
         let spectrum = capture.spectrum();
+        self.spectrum = Some(spectrum);
         for (name, values) in spectrum.uniforms() {
             self.renderer.set_global_uniform(name, values);
+        }
+    }
+
+    fn run_scripts(&mut self, gpu: &Gpu, time: f32) {
+        if let Some(scripts) = &mut self.scripts {
+            scripts.update(
+                gpu,
+                &self.vfs,
+                &mut self.renderer,
+                time,
+                self.pointer,
+                self.spectrum,
+            );
+        }
+    }
+
+    /// The left mouse button was pressed or released at the current pointer.
+    pub fn mouse_button(&mut self, down: bool) {
+        if let Some(scripts) = &mut self.scripts {
+            scripts.mouse_button(self.pointer_target, down);
         }
     }
 
@@ -356,6 +396,7 @@ impl Wallpaper {
         let globals = self.globals(size);
         self.animate(globals.time);
         self.update_audio();
+        self.run_scripts(gpu, globals.time);
         self.renderer.render(gpu, encoder, globals, output, size);
     }
 
@@ -367,6 +408,7 @@ impl Wallpaper {
         self.upload_video_frames(gpu);
         let globals = self.globals(size);
         self.animate(globals.time);
+        self.run_scripts(gpu, globals.time);
         self.renderer.capture(gpu, globals, size)
     }
 }

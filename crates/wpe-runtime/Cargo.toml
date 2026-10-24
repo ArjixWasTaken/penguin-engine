@@ -8,6 +8,7 @@ license.workspace = true
 chrono = { version = "0.4.45", default-features = false, features = ["clock"] }
 dirs = "7.0.0"
 glam = "0.34.1"
+serde_json = "1.0.154"
 sha1_smol = { version = "1.0.1", features = ["std"] }
 thiserror = "2.0.21"
 tracing = "0.1.44"
@@ -17,6 +18,7 @@ wpe-mdl = { version = "0.1.0", path = "../wpe-mdl" }
 wpe-particles = { version = "0.1.0", path = "../wpe-particles" }
 wpe-render = { version = "0.1.0", path = "../wpe-render" }
 wpe-scene = { version = "0.1.0", path = "../wpe-scene" }
+wpe-script = { version = "0.1.0", path = "../wpe-script" }
 wpe-shader = { version = "0.1.0", path = "../wpe-shader" }
 wpe-text = { version = "0.1.0", path = "../wpe-text" }
 wpe-vfs = { version = "0.1.0", path = "../wpe-vfs" }

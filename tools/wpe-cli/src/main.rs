@@ -1,6 +1,7 @@
 mod mdl;
 mod particles;
 mod scenes;
+mod scripts;
 mod shaders;
 mod tex;
 
@@ -89,6 +90,22 @@ enum Command {
         #[arg(long)]
         workshop: PathBuf,
     },
+    /// Load every SceneScript in workshop scenes against a mock scene, run init and
+    /// 120 updates, and group compile/runtime errors.
+    ScanScripts {
+        /// Wallpaper Engine's stock assets/ directory (for scripts/jsclasses/baseclasses.js).
+        #[arg(long)]
+        assets: PathBuf,
+        /// Workshop content directory (containing <id>/scene.pkg).
+        #[arg(long)]
+        workshop: PathBuf,
+        /// Use the built-in Vec/Mat classes instead of Wallpaper Engine's baseclasses.js.
+        #[arg(long)]
+        builtin_classes: bool,
+        /// List every error group.
+        #[arg(long)]
+        verbose: bool,
+    },
 }
 
 fn main() -> Result<()> {
@@ -117,6 +134,12 @@ fn main() -> Result<()> {
             verbose,
         } => particles::scan_particles(&assets, &workshop, seconds, limit, verbose),
         Command::ScanScenes { assets, workshop } => scenes::scan_scenes(&assets, &workshop),
+        Command::ScanScripts {
+            assets,
+            workshop,
+            builtin_classes,
+            verbose,
+        } => scripts::scan_scripts(&assets, &workshop, builtin_classes, verbose),
     }
 }
 
