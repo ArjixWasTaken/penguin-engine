@@ -14,7 +14,7 @@ use wpe_render::{
     ShaderProgram, SpriteAnimation, SpriteFrame, Step, TargetDesc, TargetId, TargetSize, TexRef,
     upload_texture, wgpu,
 };
-use wpe_scene::{Animation, Bloom, ImageLayer, Motion, apply_override};
+use wpe_scene::{Animation, Bloom, ImageLayer, Motion, Parallax, apply_override};
 use wpe_vfs::Vfs;
 
 use crate::material::{self, SlotTexture, TextureStore};
@@ -68,8 +68,12 @@ struct Resolved {
 
 /// A value recomputed every frame and written into one draw.
 pub enum Binding {
-    /// The layer's animated transform.
-    Model { step: usize, motion: Motion },
+    /// The layer's animated and/or parallax-shifted transform.
+    Model {
+        step: usize,
+        motion: Motion,
+        parallax: Option<LayerParallax>,
+    },
     /// The layer's animated colour and alpha uniforms.
     Color {
         step: usize,
@@ -88,10 +92,52 @@ pub enum Binding {
     },
 }
 
+/// What camera parallax needs to shift one layer.
+#[derive(Debug, Clone, Copy)]
+pub struct LayerParallax {
+    pub settings: Parallax,
+    pub depth: Vec2,
+    /// Scene size; the camera looks at its centre.
+    pub scene: Vec2,
+}
+
+impl LayerParallax {
+    /// Translation WE applies: the layer's offset from the camera plus the
+    /// mouse offset, scaled by depth and the scene amount.
+    fn offset(&self, position: glam::Vec3, pointer: Vec2) -> glam::Vec3 {
+        let mouse = Vec2::new(0.5 - pointer.x, pointer.y - 0.5)
+            * self.scene
+            * self.settings.mouse_influence;
+        let shift =
+            (position.truncate() - self.scene / 2.0 + mouse) * self.depth * self.settings.amount;
+        shift.extend(0.0)
+    }
+}
+
+/// Per-frame inputs bindings are evaluated against.
+#[derive(Debug, Clone, Copy)]
+pub struct FrameState {
+    pub time: f32,
+    /// Smoothed cursor position over the output, 0..1 with Y down.
+    pub pointer: Vec2,
+}
+
 impl Binding {
-    pub fn apply(&self, renderer: &mut wpe_render::SceneRenderer, time: f32) {
+    pub fn apply(&self, renderer: &mut wpe_render::SceneRenderer, frame: FrameState) {
+        let time = frame.time;
         match self {
-            Self::Model { step, motion } => renderer.set_model(*step, motion.transform_at(time)),
+            Self::Model {
+                step,
+                motion,
+                parallax,
+            } => {
+                let mut model = motion.transform_at(time);
+                if let Some(p) = parallax {
+                    model =
+                        Mat4::from_translation(p.offset(motion.position(), frame.pointer)) * model;
+                }
+                renderer.set_model(*step, model);
+            }
             Self::Color {
                 step,
                 motion,
@@ -138,6 +184,7 @@ pub struct FrameBuilder<'a> {
     /// Video textures and the streams feeding them.
     videos: Vec<(Arc<GpuTexture>, VideoStream)>,
     bindings: Vec<Binding>,
+    parallax: Option<(Parallax, Vec2)>,
     /// Draws using their compiled material, and all draws.
     pub stats: (usize, usize),
 }
@@ -157,6 +204,7 @@ impl<'a> FrameBuilder<'a> {
             links: HashMap::new(),
             videos: Vec::new(),
             bindings: Vec::new(),
+            parallax: None,
             pages: HashMap::new(),
             stats: (0, 0),
         }
@@ -535,15 +583,38 @@ impl<'a> FrameBuilder<'a> {
         }
     }
 
+    /// Parallax for a layer drawn with the scene camera, if it moves at all.
+    fn layer_parallax(&self, layer: &ImageLayer) -> Option<LayerParallax> {
+        let (settings, scene) = self.parallax?;
+        (layer.parallax_depth != Vec2::ZERO && settings.amount != 0.0).then_some(LayerParallax {
+            settings,
+            depth: layer.parallax_depth,
+            scene,
+        })
+    }
+
+    fn bind_model(&mut self, layer: &ImageLayer, step: usize) {
+        let parallax = self.layer_parallax(layer);
+        if layer.motion.is_transform_animated() || parallax.is_some() {
+            self.bindings.push(Binding::Model {
+                step,
+                motion: layer.motion.clone(),
+                parallax,
+            });
+        }
+    }
+
+    /// Enable camera parallax for layers added afterwards.
+    pub fn set_parallax(&mut self, parallax: Option<Parallax>, scene: Vec2) {
+        self.parallax = parallax.map(|p| (p, scene));
+    }
+
     /// Bind the layer's animations to the draw just pushed.
     fn bind_layer(&mut self, layer: &ImageLayer, model: bool, neutral: bool) {
         let step = self.steps.len() - 1;
         let m = &layer.motion;
-        if model && m.is_transform_animated() {
-            self.bindings.push(Binding::Model {
-                step,
-                motion: m.clone(),
-            });
+        if model {
+            self.bind_model(layer, step);
         }
         if m.color_animation.is_some() || m.alpha_animation.is_some() {
             self.bindings.push(Binding::Color {
@@ -806,12 +877,7 @@ impl<'a> FrameBuilder<'a> {
                 uv_scale: Vec2::ONE,
             }
             .into();
-            if layer.motion.is_transform_animated() {
-                self.bindings.push(Binding::Model {
-                    step: index,
-                    motion: layer.motion.clone(),
-                });
-            }
+            self.bind_model(layer, index);
         }
     }
 }

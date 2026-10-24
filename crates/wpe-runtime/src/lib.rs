@@ -85,6 +85,7 @@ impl Wallpaper {
         );
 
         let mut builder = FrameBuilder::new(gpu, vfs, store, white_texture());
+        builder.set_parallax(scene.parallax, scene.camera.scene_size);
         builder.layers(&scene.layers);
         if let Some(bloom) = scene.bloom {
             builder.bloom(bloom);
@@ -122,8 +123,12 @@ impl Wallpaper {
     }
 
     fn animate(&mut self, time: f32) {
+        let frame = frame::FrameState {
+            time,
+            pointer: self.pointer,
+        };
         for binding in &self.bindings {
-            binding.apply(&mut self.renderer, time);
+            binding.apply(&mut self.renderer, frame);
         }
     }
 

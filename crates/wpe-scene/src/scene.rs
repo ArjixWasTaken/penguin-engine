@@ -17,6 +17,8 @@ pub struct Scene {
     pub clear_color: Vec3,
     /// Scene-wide bloom post-processing, when enabled.
     pub bloom: Option<Bloom>,
+    /// Mouse/position parallax, when enabled.
+    pub parallax: Option<Parallax>,
     /// Image layers in draw order (back to front), including hidden ones
     /// other layers may sample.
     pub layers: Vec<ImageLayer>,
@@ -28,6 +30,15 @@ pub struct Bloom {
     pub strength: f32,
     pub threshold: f32,
     pub tint: Vec3,
+}
+
+/// `general.cameraparallax*` settings.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Parallax {
+    pub amount: f32,
+    /// Smoothing time of the mouse response, in seconds.
+    pub delay: f32,
+    pub mouse_influence: f32,
 }
 
 /// A textured card resolved from an image object, its model and material.
@@ -48,6 +59,8 @@ pub struct ImageLayer {
     pub material: MaterialPass,
     /// What `transform`, `color` and `alpha` are made of, for animation.
     pub motion: Motion,
+    /// How strongly camera parallax moves this layer.
+    pub parallax_depth: Vec2,
     /// The model is a solid colour layer with no texture.
     pub solid: bool,
     /// A passthrough compose layer: its image is what is already on screen.
@@ -87,6 +100,11 @@ fn animate3(base: Vec3, anim: &Option<Animation>, time: f32) -> Vec3 {
 }
 
 impl Motion {
+    /// Layer position before parallax: origin plus alignment offset.
+    pub fn position(&self) -> Vec3 {
+        self.origin + self.offset
+    }
+
     pub fn is_transform_animated(&self) -> bool {
         self.origin_animation.is_some()
             || self.scale_animation.is_some()
@@ -251,6 +269,7 @@ impl Scene {
                     brightness: props.value(&img.brightness),
                     material: loaded.material,
                     motion,
+                    parallax_depth: vec2(*props.value(&common.parallax_depth)),
                     solid: loaded.solid,
                     compose: loaded.passthrough,
                     fullscreen: loaded.fullscreen,
@@ -271,6 +290,11 @@ impl Scene {
                 zoom: props.value(&general.zoom),
             },
             clear_color: vec3(*props.value(&general.clearcolor)),
+            parallax: props.flag(&general.cameraparallax).then(|| Parallax {
+                amount: props.value(&general.cameraparallaxamount),
+                delay: props.value(&general.cameraparallaxdelay),
+                mouse_influence: props.value(&general.cameraparallaxmouseinfluence),
+            }),
             bloom: props.flag(&general.bloom).then(|| Bloom {
                 strength: props.value(&general.bloomstrength),
                 threshold: props.value(&general.bloomthreshold),
