@@ -77,7 +77,8 @@ pub struct ScriptOptions {
     /// Source of Wallpaper Engine's `assets/scripts/jsclasses/baseclasses.js`.
     /// When absent a compatible built-in implementation is used.
     pub base_classes: Option<String>,
-    /// Wall-clock budget for one script function call per frame.
+    /// Wall-clock budget for one script function call per frame. It only
+    /// stops runaway loops, so it allows for a busy machine.
     pub call_budget: Duration,
     /// Budget for evaluating a module and running its `init`.
     pub load_budget: Duration,
@@ -89,7 +90,7 @@ impl Default for ScriptOptions {
     fn default() -> Self {
         Self {
             base_classes: None,
-            call_budget: Duration::from_millis(50),
+            call_budget: Duration::from_millis(250),
             load_budget: Duration::from_secs(1),
             memory_limit: 256 << 20,
         }

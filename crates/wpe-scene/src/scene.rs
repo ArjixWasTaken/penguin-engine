@@ -99,6 +99,9 @@ pub struct ImageLayer {
     /// `colorBlendMode`; 0 is plain alpha blending.
     pub color_blend_mode: i32,
     pub effects: Vec<ImageEffect>,
+    /// Index of each of `effects` in the object's `effects` (hidden ones are
+    /// left out of `effects`).
+    pub effect_indices: Vec<usize>,
     /// For text layers, the object whose rendered text is the layer's image
     /// (see [`text_texture_name`]); its size and anchoring are known once rendered.
     pub text: Option<Box<TextObject>>,
@@ -351,6 +354,13 @@ impl Scene {
                         .filter(|fx| props.flag(&fx.visible))
                         .cloned()
                         .collect(),
+                    effect_indices: img
+                        .effects
+                        .iter()
+                        .enumerate()
+                        .filter(|(_, fx)| props.flag(&fx.visible))
+                        .map(|(i, _)| i)
+                        .collect(),
                     text: None,
                     particle: None,
                     puppet: loaded.puppet,
@@ -454,6 +464,13 @@ fn text_layer(nodes: &HashMap<i32, Node>, props: &UserProperties, text: &TextObj
             .filter(|fx| props.flag(&fx.visible))
             .cloned()
             .collect(),
+        effect_indices: text
+            .effects
+            .iter()
+            .enumerate()
+            .filter(|(_, fx)| props.flag(&fx.visible))
+            .map(|(i, _)| i)
+            .collect(),
         text: Some(Box::new(text.clone())),
         particle: None,
         puppet: None,
@@ -497,6 +514,7 @@ fn particle_layer(
         fullscreen: false,
         color_blend_mode: 0,
         effects: Vec::new(),
+        effect_indices: Vec::new(),
         text: None,
         particle: Some(ParticleSource {
             path: p.particle.clone(),

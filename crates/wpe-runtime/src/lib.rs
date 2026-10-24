@@ -261,6 +261,13 @@ impl Wallpaper {
             built.layers.len()
         );
         let objects = objects(&wallpaper.scene_json);
+        if objects.iter().any(|o| o.to_string().contains("\"script\"")) {
+            // Scripts ask videos' length and seek them from `init`; open the
+            // files now so those calls don't wait.
+            for stream in built.videos.values() {
+                stream.duration();
+            }
+        }
         let sounds = wallpaper.sounds.states();
         wallpaper.scripts = script::Scripts::load(
             &wallpaper.vfs,
@@ -273,7 +280,7 @@ impl Wallpaper {
         if wallpaper.scripts.is_some() || !wallpaper.system_slots.is_empty() {
             wallpaper.media = media::Media::start();
         }
-        wallpaper.sync_scripts(gpu);
+        wallpaper.sync_scripts(gpu, 0.0);
         Ok(wallpaper)
     }
 
@@ -359,13 +366,15 @@ impl Wallpaper {
     }
 
     /// Apply the scene changes scripts queued (rebuilding the frame when the
-    /// structure changed) and push their writes to the renderer.
-    fn sync_scripts(&mut self, gpu: &Gpu) {
+    /// structure changed) and push their writes to the renderer. `time` is
+    /// the frame's scene time, to re-animate a rebuilt frame.
+    fn sync_scripts(&mut self, gpu: &Gpu, time: f32) {
         let Some(mut scripts) = self.scripts.take() else {
             return;
         };
         let mut edits = scripts.take_edits();
         if !edits.is_empty() {
+            tracing::trace!("script edits: {edits:?}");
             script::resolve_paths(&mut edits, |path| self.vfs.read(path).is_ok());
             script::apply_edits(&mut self.scene_json, &edits);
             match serde_json::from_value::<wpe_assets::Scene>(self.scene_json.clone()) {
@@ -380,6 +389,8 @@ impl Wallpaper {
                     );
                     let objects = objects(&self.scene_json);
                     scripts.rebind(&built.view(&objects, &self.sounds.states()));
+                    // The new frame's draws haven't been animated yet.
+                    self.animate(time);
                 }
                 Err(e) => tracing::warn!("scene edited by scripts doesn't parse: {e}"),
             }
@@ -452,7 +463,7 @@ impl Wallpaper {
             let ended = self.clocks.borrow_mut().take_ended();
             scripts.update(time, self.pointer, self.spectrum, &ended);
         }
-        self.sync_scripts(gpu);
+        self.sync_scripts(gpu, time);
     }
 
     /// Video textures and the streams feeding them.

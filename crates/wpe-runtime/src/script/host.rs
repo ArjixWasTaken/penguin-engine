@@ -49,6 +49,10 @@ pub struct LayerState {
     /// No ancestor group is hidden, so the layer shows when `visible`.
     pub ancestors_visible: bool,
     pub touched: Touched,
+    /// Material constants scripts set: (effect index or `None` for the
+    /// layer's material, pass index or `None` for all, constant name).
+    pub constants: HashMap<(Option<usize>, Option<usize>, String), Vec<f32>>,
+    pub dirty_constants: bool,
     pub dirty_visible: bool,
     pub dirty_transform: bool,
     pub dirty_color: bool,
@@ -123,6 +127,8 @@ impl LayerState {
             text_object: layer.and_then(|l| l.text.clone()),
             motion,
             touched: Touched::default(),
+            constants: HashMap::new(),
+            dirty_constants: false,
             dirty_visible: false,
             dirty_transform: false,
             dirty_color: false,
@@ -166,11 +172,91 @@ impl LayerState {
         if !self.touched.color {
             (self.alpha, self.color) = (layer.alpha, layer.color);
         }
+        self.dirty_constants = !self.constants.is_empty();
         self.dirty_visible = self.touched.visible;
         self.dirty_transform = self.touched.transform;
         self.dirty_color = self.touched.color;
         self.dirty_text = self.touched.text;
     }
+}
+
+/// A material or effect property path scripts write.
+#[derive(Debug, Clone, PartialEq)]
+enum MaterialPath {
+    /// `effects/<i>/visible`.
+    EffectVisible(usize),
+    /// `material/<name>`, `effects/<i>/material/<name>` or
+    /// `effects/<i>/passes/<j>/constantshadervalues/<name>`.
+    Constant {
+        effect: Option<usize>,
+        pass: Option<usize>,
+        name: String,
+    },
+}
+
+fn material_path(path: &str) -> Option<MaterialPath> {
+    if let Some(name) = path.strip_prefix("material/") {
+        return Some(MaterialPath::Constant {
+            effect: None,
+            pass: None,
+            name: name.to_owned(),
+        });
+    }
+    let rest = path.strip_prefix("effects/")?;
+    let (index, rest) = rest.split_once('/')?;
+    let effect = index.parse().ok()?;
+    if rest == "visible" {
+        return Some(MaterialPath::EffectVisible(effect));
+    }
+    if let Some(name) = rest.strip_prefix("material/") {
+        return Some(MaterialPath::Constant {
+            effect: Some(effect),
+            pass: None,
+            name: name.to_owned(),
+        });
+    }
+    let (pass, name) = rest.strip_prefix("passes/")?.split_once('/')?;
+    Some(MaterialPath::Constant {
+        effect: Some(effect),
+        pass: Some(pass.parse().ok()?),
+        name: name.strip_prefix("constantshadervalues/")?.to_owned(),
+    })
+}
+
+/// A script value as uniform floats.
+fn floats(v: &ScriptValue) -> Option<Vec<f32>> {
+    Some(match v {
+        ScriptValue::Number(n) => vec![*n as f32],
+        ScriptValue::Bool(b) => vec![*b as u8 as f32],
+        ScriptValue::Vec2(c) => c.iter().map(|&x| x as f32).collect(),
+        ScriptValue::Vec3(c) => c.iter().map(|&x| x as f32).collect(),
+        ScriptValue::Vec4(c) => c.iter().map(|&x| x as f32).collect(),
+        ScriptValue::String(s) => {
+            let n: Vec<f32> = s
+                .split_whitespace()
+                .filter_map(|x| x.parse().ok())
+                .collect();
+            (!n.is_empty()).then_some(n)?
+        }
+        _ => return None,
+    })
+}
+
+/// The JSON value at `path` (`effects/0/visible`) inside `obj`.
+fn json_at<'a>(obj: &'a Value, path: &str) -> Option<&'a Value> {
+    path.split('/').try_fold(obj, |node, key| match node {
+        Value::Object(map) => map.get(key),
+        Value::Array(items) => items.get(key.parse::<usize>().ok()?),
+        _ => None,
+    })
+}
+
+fn json_at_mut<'a>(obj: &'a mut Value, path: &str) -> Option<&'a mut Value> {
+    path.split('/').try_fold(obj, |node, key| match node {
+        Value::Object(map) => map.get_mut(key),
+        Value::Array(items) => items.get_mut(key.parse::<usize>().ok()?),
+        _ => None,
+    })
 }
 
 /// The scene value under `key` in an object configuration, looking through
@@ -437,6 +523,73 @@ impl ScriptHost {
         })
     }
 
+    fn material_get(&self, layer: i32, property: &str, path: MaterialPath) -> Option<ScriptValue> {
+        let l = self.layer(layer)?;
+        if let MaterialPath::Constant {
+            effect,
+            pass,
+            ref name,
+        } = path
+            && let Some(v) = l.constants.get(&(effect, pass, name.clone()))
+        {
+            return Some(match v[..] {
+                [x] => ScriptValue::Number(x as f64),
+                [x, y] => ScriptValue::Vec2([x as f64, y as f64]),
+                [x, y, z] => ScriptValue::Vec3([x as f64, y as f64, z as f64]),
+                _ => ScriptValue::Json(v.iter().map(|&x| x as f64).collect::<Vec<_>>().into()),
+            });
+        }
+        let v = json_at(&l.config, property)?;
+        let v = v.get("value").unwrap_or(v);
+        Some(match path {
+            MaterialPath::EffectVisible(_) => ScriptValue::Bool(v.as_bool().unwrap_or(true)),
+            MaterialPath::Constant { .. } => ScriptValue::from_scene_json(property, v),
+        })
+    }
+
+    fn material_set(
+        &mut self,
+        layer: i32,
+        property: &str,
+        path: MaterialPath,
+        value: &ScriptValue,
+    ) {
+        let Some(l) = self.layer_mut(layer) else {
+            return;
+        };
+        match path {
+            MaterialPath::EffectVisible(_) => {
+                let Some(visible) = value.as_bool() else {
+                    return;
+                };
+                let current = json_at(&l.config, property).map(|v| v.get("value").unwrap_or(v));
+                if current.and_then(Value::as_bool).unwrap_or(true) == visible {
+                    return;
+                }
+                if let Some(slot) = property
+                    .rsplit_once('/')
+                    .and_then(|(parent, _)| json_at_mut(&mut l.config, parent))
+                    .and_then(Value::as_object_mut)
+                {
+                    slot.insert("visible".to_owned(), visible.into());
+                }
+                self.edits.push(SceneEdit::Set {
+                    id: layer,
+                    key: property.to_owned(),
+                    value: visible.into(),
+                });
+            }
+            MaterialPath::Constant { effect, pass, name } => {
+                let Some(values) = floats(value) else { return };
+                let key = (effect, pass, name);
+                if l.constants.get(&key) != Some(&values) {
+                    l.constants.insert(key, values);
+                    l.dirty_constants = true;
+                }
+            }
+        }
+    }
+
     fn is_particles(&self, layer: i32) -> bool {
         self.layer(layer)
             .is_some_and(|l| l.info.kind == LayerKind::Particle)
@@ -645,6 +798,9 @@ impl SceneHost for ScriptHost {
     }
 
     fn get(&self, layer: i32, property: &str) -> Option<ScriptValue> {
+        if let Some(path) = material_path(property) {
+            return self.material_get(layer, property, path);
+        }
         if let Some(key) = property.strip_prefix("instanceoverride/") {
             return self.particle_get(layer, key);
         }
@@ -691,6 +847,10 @@ impl SceneHost for ScriptHost {
     }
 
     fn set(&mut self, layer: i32, property: &str, value: ScriptValue) {
+        if let Some(path) = material_path(property) {
+            self.material_set(layer, property, path, &value);
+            return;
+        }
         if let Some(key) = property.strip_prefix("instanceoverride/") {
             self.particle_set(layer, key, &value);
             return;

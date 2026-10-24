@@ -8,10 +8,8 @@ mod host;
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use glam::{Vec2, Vec3};
+use glam::Vec2;
 use serde_json::Value;
-use wpe_assets::scene::SceneObject;
-use wpe_assets::value::Dynamic;
 use wpe_render::{CardMesh, Gpu, GpuTexture, SceneRenderer};
 use wpe_scene::ImageLayer;
 use wpe_script::{CursorEvent, CursorEventKind, CursorState, ScriptRuntime, ScriptValue};
@@ -19,7 +17,7 @@ use wpe_vfs::Vfs;
 
 pub use edit::{SceneEdit, apply as apply_edits, resolve_paths};
 pub use host::ParticleCommand;
-use host::{LayerState, ScriptHost, vec3};
+use host::{LayerState, ScriptHost};
 
 use crate::bones::SharedBones;
 use crate::clock::SharedClocks;
@@ -58,59 +56,53 @@ pub struct Scripts {
     pressed: bool,
 }
 
-/// A scripted property: name, script source, scriptproperties, initial value.
-type Scripted<'a> = (
-    &'static str,
-    Option<&'a str>,
-    Option<&'a Value>,
-    ScriptValue,
-);
+/// A scripted value in an object's configuration: its path (`visible`,
+/// `instanceoverride/rate`, `effects/0/passes/0/constantshadervalues/alpha`,
+/// ...), script, `scriptproperties` and initial value.
+struct Scripted<'a> {
+    path: String,
+    source: &'a str,
+    properties: Option<&'a Value>,
+    initial: ScriptValue,
+}
 
-/// Every scripted value of an object.
-fn scripted(obj: &SceneObject) -> Vec<Scripted<'_>> {
-    fn entry<'a, T>(
-        property: &'static str,
-        d: &'a Dynamic<T>,
-        value: ScriptValue,
-    ) -> Option<Scripted<'a>> {
-        let script = d.script.as_deref()?;
-        Some((property, Some(script), d.script_properties.as_ref(), value))
-    }
-    let Some(c) = obj.common() else {
-        return Vec::new();
-    };
-    let v3 = |v: &wpe_assets::value::Vec3| vec3(Vec3::from_array(**v));
-    let mut out = vec![
-        entry("visible", &c.visible, ScriptValue::Bool(c.visible.value)),
-        entry("origin", &c.origin, v3(&c.origin.value)),
-        entry("scale", &c.scale, v3(&c.scale.value)),
-        entry("angles", &c.angles, v3(&c.angles.value)),
-    ];
-    match obj {
-        SceneObject::Image(i) => {
-            out.push(entry(
-                "alpha",
-                &i.alpha,
-                ScriptValue::Number(i.alpha.value as f64),
-            ));
-            out.push(entry("color", &i.color, v3(&i.color.value)));
+/// Every scripted value of an object configuration, in file order.
+fn scripted(config: &Value) -> Vec<Scripted<'_>> {
+    fn walk<'a>(v: &'a Value, path: &str, out: &mut Vec<Scripted<'a>>) {
+        match v {
+            Value::Object(map) => {
+                if let Some(source) = map.get("script").and_then(Value::as_str) {
+                    if !path.is_empty() {
+                        let value = map.get("value").unwrap_or(&Value::Null);
+                        out.push(Scripted {
+                            path: path.to_owned(),
+                            source,
+                            properties: map.get("scriptproperties"),
+                            initial: ScriptValue::from_scene_json(path, value),
+                        });
+                    }
+                    return;
+                }
+                for (key, child) in map {
+                    let child_path = if path.is_empty() {
+                        key.clone()
+                    } else {
+                        format!("{path}/{key}")
+                    };
+                    walk(child, &child_path, out);
+                }
+            }
+            Value::Array(items) => {
+                for (i, child) in items.iter().enumerate() {
+                    walk(child, &format!("{path}/{i}"), out);
+                }
+            }
+            _ => {}
         }
-        SceneObject::Text(t) => {
-            out.push(entry(
-                "text",
-                &t.text,
-                ScriptValue::String(t.text.value.clone()),
-            ));
-            out.push(entry(
-                "alpha",
-                &t.alpha,
-                ScriptValue::Number(t.alpha.value as f64),
-            ));
-            out.push(entry("color", &t.color, v3(&t.color.value)));
-        }
-        _ => {}
     }
-    out.into_iter().flatten().collect()
+    let mut out = Vec::new();
+    walk(config, "", &mut out);
+    out
 }
 
 impl Scripts {
@@ -124,7 +116,7 @@ impl Scripts {
         clocks: SharedClocks,
         bones: SharedBones,
     ) -> Option<Self> {
-        let scripts: Vec<_> = view.doc.objects.iter().map(scripted).collect();
+        let scripts: Vec<_> = view.objects.iter().map(scripted).collect();
         if scripts.iter().all(Vec::is_empty) {
             return None;
         }
@@ -159,14 +151,20 @@ impl Scripts {
             }
         }
 
-        for (obj, entries) in view.doc.objects.iter().zip(scripts) {
-            let Some(c) = obj.common() else { continue };
-            for (property, source, props, initial) in entries {
-                let Some(source) = source else { continue };
-                if let Err(e) =
-                    runtime.add_property_script(&mut host, c.id, property, source, props, initial)
-                {
-                    tracing::warn!("script on {:?}.{property}: {e}", c.name);
+        for (config, entries) in view.objects.iter().zip(scripts) {
+            let Some(id) = config.get("id").and_then(Value::as_i64) else {
+                continue;
+            };
+            for s in entries {
+                if let Err(e) = runtime.add_property_script(
+                    &mut host,
+                    id as i32,
+                    &s.path,
+                    s.source,
+                    s.properties,
+                    s.initial,
+                ) {
+                    tracing::warn!("script on layer {id} {}: {e}", s.path);
                 }
             }
         }
@@ -346,6 +344,26 @@ impl Scripts {
                     renderer.set_model(step, model);
                 }
             }
+            if l.dirty_constants {
+                for ((effect, pass, name), values) in &l.constants {
+                    let passes = l
+                        .steps
+                        .passes
+                        .iter()
+                        .filter(|p| p.effect == *effect && pass.is_none_or(|j| p.pass == j));
+                    for p in passes {
+                        let Some(uniform) = p.info.uniform_for_constant(name) else {
+                            continue;
+                        };
+                        let mut v = values.clone();
+                        if let Some(default) = p.info.defaults.get(&uniform) {
+                            let last = v.last().copied().unwrap_or(0.0);
+                            v.resize(default.len().max(1), last);
+                        }
+                        renderer.set_uniform(p.step, &uniform, v);
+                    }
+                }
+            }
             if l.dirty_color {
                 let (c, a) = (l.color, l.alpha);
                 for &(step, neutral) in &l.steps.color {
@@ -357,6 +375,7 @@ impl Scripts {
                     renderer.set_uniform(step, "g_Alpha", vec![a]);
                 }
             }
+            l.dirty_constants = false;
             l.dirty_visible = false;
             l.dirty_transform = false;
             l.dirty_color = false;

@@ -50,10 +50,24 @@ pub struct SystemSlot {
     pub fallback: Arc<GpuTexture>,
 }
 
+/// A material pass of a layer: its own material (`effect` `None`) or a pass
+/// of one of its effects.
+#[derive(Debug, Clone)]
+pub struct PassStep {
+    /// Index in the scene object's `effects`.
+    pub effect: Option<usize>,
+    /// Index among the effect's material passes.
+    pub pass: usize,
+    pub step: usize,
+    pub info: Arc<wpe_shader::ShaderInfo>,
+}
+
 /// The draws an on-screen layer produced.
 #[derive(Debug, Clone, Default)]
 pub struct LayerSteps {
     pub all: Vec<usize>,
+    /// Material passes, for scripts setting their constants.
+    pub passes: Vec<PassStep>,
     /// Draws placed with the layer's transform.
     pub model: Vec<usize>,
     /// Draws carrying the layer's colour uniforms, and whether `g_Color4`
@@ -99,6 +113,8 @@ struct Resolved {
     animated: Vec<(String, Vec<f32>, Animation)>,
     /// Slots showing engine textures (step filled in when drawn).
     system: Vec<SystemSlot>,
+    /// The shader's annotations, for naming material constants.
+    info: Arc<wpe_shader::ShaderInfo>,
 }
 
 /// A simulated particle object and the draws its subsystems feed.
@@ -438,6 +454,9 @@ impl Binding {
     }
 }
 
+/// An effect of a layer: definition, pass overrides, index in the object.
+type LayerEffect = (Effect, Vec<PassOverride>, Option<usize>);
+
 /// Shader programs by shader name and final combos; `None` caches a failure.
 type ProgramCache = HashMap<String, Option<Arc<ShaderProgram>>>;
 
@@ -460,6 +479,8 @@ pub struct FrameBuilder<'a> {
     building: Option<i32>,
     /// Layers drawn but initially hidden.
     hidden: Vec<i32>,
+    /// Which material pass the next draw is (effect index, pass index).
+    current_pass: Option<(Option<usize>, usize)>,
     system_slots: Vec<SystemSlot>,
     sprite_steps: Vec<(i32, usize)>,
     bindings: Vec<Binding>,
@@ -516,6 +537,7 @@ impl<'a> FrameBuilder<'a> {
             layer_videos: HashMap::new(),
             building: None,
             hidden: Vec::new(),
+            current_pass: None,
             system_slots: Vec::new(),
             sprite_steps: Vec::new(),
             bindings: Vec::new(),
@@ -705,6 +727,7 @@ impl<'a> FrameBuilder<'a> {
             sprites,
             animated: prepared.animated,
             system,
+            info: Arc::new(prepared.shader.info.clone()),
         })
     }
 
@@ -769,6 +792,18 @@ impl<'a> FrameBuilder<'a> {
         if resolved.reads_frame {
             let copy = self.frame_copy();
             self.push_copy(TargetId::DEFAULT, copy);
+        }
+        if let Some((effect, pass)) = self.current_pass.take() {
+            let step = self.steps.len();
+            let info = resolved.info.clone();
+            if let Some(steps) = self.current_steps() {
+                steps.passes.push(PassStep {
+                    effect,
+                    pass,
+                    step,
+                    info,
+                });
+            }
         }
         self.stats.0 += 1;
         self.stats.1 += 1;
@@ -979,15 +1014,18 @@ impl<'a> FrameBuilder<'a> {
     }
 
     /// Visible effects, plus the synthetic one implementing `colorBlendMode`.
-    fn effects(&self, layer: &ImageLayer) -> Vec<(Effect, Vec<PassOverride>)> {
-        let mut effects: Vec<(Effect, Vec<PassOverride>)> = layer
+    /// The layer's effects with their pass overrides and index in the scene
+    /// object (`None` for the synthetic blend-mode effect).
+    fn effects(&self, layer: &ImageLayer) -> Vec<LayerEffect> {
+        let mut effects: Vec<LayerEffect> = layer
             .effects
             .iter()
-            .filter_map(|fx| {
+            .zip(&layer.effect_indices)
+            .filter_map(|(fx, &index)| {
                 wpe_assets::load_json::<Effect>(self.vfs, &fx.file)
                     .inspect_err(|e| tracing::warn!("layer {:?} effect: {e}", layer.name))
                     .ok()
-                    .map(|e| (e, fx.passes.clone()))
+                    .map(|e| (e, fx.passes.clone(), Some(index)))
             })
             .collect();
         if !matches!(layer.color_blend_mode, 0 | 7 | 9) {
@@ -1009,7 +1047,7 @@ impl<'a> FrameBuilder<'a> {
                 )],
                 ..Default::default()
             };
-            effects.push((effect, Vec::new()));
+            effects.push((effect, Vec::new(), None));
         }
         effects
     }
@@ -1149,6 +1187,7 @@ impl<'a> FrameBuilder<'a> {
                     }
                     .into(),
                 };
+                self.current_pass = Some((None, 0));
                 match offscreen {
                     Some(target) => self.push_draw(
                         target,
@@ -1201,7 +1240,7 @@ impl<'a> FrameBuilder<'a> {
     fn effect_chain(
         &mut self,
         layer: &ImageLayer,
-        effects: &[(Effect, Vec<PassOverride>)],
+        effects: &[LayerEffect],
         offscreen: Option<TargetId>,
     ) {
         let id = layer.id;
@@ -1253,12 +1292,14 @@ impl<'a> FrameBuilder<'a> {
             (Camera::Fixed(ortho), Mat4::IDENTITY, mesh)
         };
         let base_blend = blend_mode(&layer.material.blending);
+        self.current_pass = Some((None, 0));
         self.push_draw(prev, base, model, mesh, base_blend, camera);
         self.bind_puppet(puppet);
         self.bind_layer(layer, layer.compose && !layer.fullscreen, false);
 
         let mut last_output: Option<usize> = None;
-        for (effect, overrides) in effects {
+        for (effect, overrides, scene_effect) in effects {
+            let scene_effect = *scene_effect;
             let mut names: HashMap<String, TargetId> = HashMap::new();
             names.insert(PREVIOUS.to_owned(), prev);
             for fbo in &effect.fbos {
@@ -1353,6 +1394,7 @@ impl<'a> FrameBuilder<'a> {
                         let neutral = pass.combos.contains_key("BLENDMODE");
                         Self::layer_constants(layer, &mut r.constants, neutral);
                         let is_output = target.is_none();
+                        self.current_pass = Some((scene_effect, material_index - 1));
                         self.push_draw(
                             target.unwrap_or(out),
                             r,

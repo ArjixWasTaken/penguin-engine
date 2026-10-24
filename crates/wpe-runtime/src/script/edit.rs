@@ -67,6 +67,36 @@ pub fn resolve_paths(edits: &mut [SceneEdit], exists: impl Fn(&str) -> bool) {
     }
 }
 
+/// Set `path` (`alignment`, `effects/2/visible`, ...) inside `obj`; a
+/// `{"value": ...}` wrapper at the end keeps its other keys.
+fn set_path(obj: &mut Value, path: &str, value: Value) {
+    let mut node = obj;
+    let mut keys = path.split('/').peekable();
+    while let Some(key) = keys.next() {
+        let last = keys.peek().is_none();
+        let next = match node {
+            Value::Object(map) if last => {
+                match map.get_mut(key) {
+                    Some(Value::Object(inner)) if inner.contains_key("value") => {
+                        inner.insert("value".to_owned(), value);
+                    }
+                    _ => {
+                        map.insert(key.to_owned(), value);
+                    }
+                }
+                return;
+            }
+            Value::Object(map) => map.get_mut(key),
+            Value::Array(items) => key.parse::<usize>().ok().and_then(|i| items.get_mut(i)),
+            _ => None,
+        };
+        let Some(next) = next else {
+            return;
+        };
+        node = next;
+    }
+}
+
 /// Apply `edits` in order to the `objects` of scene JSON `doc`.
 pub fn apply(doc: &mut Value, edits: &[SceneEdit]) {
     let Some(objects) = doc.get_mut("objects").and_then(Value::as_array_mut) else {
@@ -103,9 +133,8 @@ pub fn apply(doc: &mut Value, edits: &[SceneEdit]) {
                 };
             }
             SceneEdit::Set { id, key, value } => {
-                if let Some(obj) = position(objects, *id).and_then(|at| objects[at].as_object_mut())
-                {
-                    obj.insert(key.clone(), value.clone());
+                if let Some(at) = position(objects, *id) {
+                    set_path(&mut objects[at], key, value.clone());
                 }
             }
         }
@@ -147,7 +176,11 @@ mod tests {
 
     #[test]
     fn edits_reshape_the_object_list() {
-        let mut doc = json!({"objects": [{"id": 1}, {"id": 2}, {"id": 3}]});
+        let mut doc = json!({"objects": [
+            {"id": 1},
+            {"id": 2, "effects": [{"visible": {"user": "p", "value": true}}]},
+            {"id": 3},
+        ]});
         apply(
             &mut doc,
             &[
@@ -168,13 +201,18 @@ mod tests {
                     key: "alignment".into(),
                     value: json!("bottom"),
                 },
+                SceneEdit::Set {
+                    id: 2,
+                    key: "effects/0/visible".into(),
+                    value: json!(false),
+                },
             ],
         );
         assert_eq!(
             doc,
             json!({"objects": [
                 {"id": 4, "image": "models/bar.json", "alignment": "bottom"},
-                {"id": 2},
+                {"id": 2, "effects": [{"visible": {"user": "p", "value": false}}]},
                 {"id": 3, "parent": 2},
             ]})
         );
