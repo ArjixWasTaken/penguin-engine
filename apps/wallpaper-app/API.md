@@ -1,13 +1,14 @@
-# The page's API
+# Penguin Engine: the page's API
 
-The frontend in `ui/` is a static page (no bundler; `index.html` is the
-entry). Tauri's API is on `window.__TAURI__` (`withGlobalTauri`):
+The frontend in `ui/` is Preact + zustand, built with Vite (pnpm).
+`ui/src/api.ts` wraps everything below with types; `ui/src/store.ts`
+holds the app state.
 
-```js
-const { invoke } = window.__TAURI__.core;
-const { listen } = window.__TAURI__.event;
-const { open } = window.__TAURI__.dialog;   // file/folder pickers
-```
+- Develop: `pnpm -C apps/wallpaper-app/ui install`, then
+  `pnpm -C apps/wallpaper-app/ui dev` and `cargo run -p wallpaper-app`
+  (debug builds load the dev server at `localhost:1420` and reload on edit).
+- Release: `pnpm -C apps/wallpaper-app/ui build`, then
+  `cargo build --release -p wallpaper-app` (embeds `ui/dist`).
 
 ## Commands (`await invoke(name, args)`)
 
