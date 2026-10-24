@@ -6,6 +6,7 @@
 
 mod commands;
 mod control;
+mod desktop_click;
 mod events;
 mod loading;
 mod preset;
@@ -269,6 +270,8 @@ struct Screen {
     timer_pending: bool,
     next_frame: Instant,
     paused: bool,
+    /// A right press went to the desktop; its release replays the click.
+    right_held: bool,
     /// Needs a frame even while paused (resized, changed).
     dirty: bool,
     fill: Fill,
@@ -318,6 +321,7 @@ impl Screen {
             timer_pending: false,
             next_frame: Instant::now(),
             paused: false,
+            right_held: false,
             dirty: true,
             fill,
             stats: Stats::new(),
@@ -393,6 +397,13 @@ impl Screen {
         self.paused = paused;
         self.wallpaper.set_paused(paused);
         self.dirty = true;
+    }
+
+    /// Take no input until [`Self::set_passthrough`] (a right click goes
+    /// to the desktop meanwhile). Applied now.
+    fn hide_input(&self, compositor: &CompositorState) {
+        self.set_passthrough(compositor, true);
+        self.layer.wl_surface().commit();
     }
 
     /// The input region for `passthrough`, committed with the next frame.
@@ -475,6 +486,8 @@ struct App {
     layer_shell: LayerShell,
     viewporter: Option<SimpleGlobal<WpViewporter, 1>>,
     fractional_manager: Option<SimpleGlobal<WpFractionalScaleManagerV1, 1>>,
+    /// Hands right clicks to the desktop (KWin); None elsewhere.
+    desktop_clicks: Option<desktop_click::DesktopClicks>,
     pointers: Vec<WlPointer>,
     outputs: Vec<KnownOutput>,
     screens: Vec<Screen>,
@@ -926,6 +939,10 @@ fn main() -> Result<()> {
         .context("the compositor does not support wlr-layer-shell")?;
     let viewporter = SimpleGlobal::bind(&globals, &qh).ok();
     let fractional_manager = SimpleGlobal::bind(&globals, &qh).ok();
+    let desktop_clicks = desktop_click::DesktopClicks::bind(&globals, &qh);
+    if desktop_clicks.is_none() {
+        tracing::debug!("no org_kde_kwin_fake_input: right clicks stay with the wallpaper");
+    }
     let mut app = App {
         args,
         assets,
@@ -939,6 +956,7 @@ fn main() -> Result<()> {
         layer_shell,
         viewporter,
         fractional_manager,
+        desktop_clicks,
         pointers: Vec::new(),
         outputs: Vec::new(),
         screens: Vec::new(),
@@ -1177,6 +1195,34 @@ impl PointerHandler for App {
                         event.position.0 as f32 / w.max(1) as f32,
                         event.position.1 as f32 / h.max(1) as f32,
                     ));
+                }
+                // Right clicks are the desktop's (desktop_click.rs).
+                PointerEventKind::Press {
+                    button: BTN_RIGHT, ..
+                } if self.desktop_clicks.is_some() => {
+                    screen.right_held = true;
+                    screen.hide_input(&self.compositor);
+                }
+                PointerEventKind::Release {
+                    button: BTN_RIGHT, ..
+                } if screen.right_held => {
+                    screen.right_held = false;
+                    if let Some(clicks) = &self.desktop_clicks {
+                        clicks.right_click();
+                    }
+                    let name = screen.name.clone();
+                    let restore = Timer::from_duration(Duration::from_millis(250));
+                    let restored = self.loop_handle.insert_source(restore, move |_, _, app| {
+                        if let Some(s) = app.screens.iter().find(|s| s.name == name) {
+                            s.set_passthrough(&app.compositor, app.settings.passthrough);
+                            s.layer.wl_surface().commit();
+                        }
+                        TimeoutAction::Drop
+                    });
+                    if let Err(e) = restored {
+                        tracing::warn!("cannot arm a timer: {e}");
+                        screen.set_passthrough(&self.compositor, self.settings.passthrough);
+                    }
                 }
                 PointerEventKind::Press { button, .. }
                 | PointerEventKind::Release { button, .. } => {

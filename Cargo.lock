@@ -12589,6 +12589,7 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "wayland-client",
+ "wayland-protocols-plasma",
  "wpe-ipc",
  "wpe-render",
  "wpe-runtime",

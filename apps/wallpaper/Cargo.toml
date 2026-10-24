@@ -21,6 +21,8 @@ tracing = "0.1.44"
 tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
 # The system libwayland backend, whose display and surface pointers wgpu needs.
 wayland-client = { version = "0.31.15", features = ["system"] }
+# KWin's fake input, for handing right clicks to the desktop.
+wayland-protocols-plasma = { version = "0.3.12", features = ["client"] }
 wpe-ipc = { version = "0.1.0", path = "../../crates/wpe-ipc" }
 wpe-render = { version = "0.1.0", path = "../../crates/wpe-render" }
 wpe-runtime = { version = "0.1.0", path = "../../crates/wpe-runtime" }
