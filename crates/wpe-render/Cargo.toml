@@ -7,7 +7,10 @@ license.workspace = true
 [dependencies]
 bytemuck = { version = "1.25.2", features = ["derive"] }
 glam = { version = "0.34.1", features = ["bytemuck"] }
+naga = { version = "30.0.1", features = ["spv-in"] }
+pollster = "1.0.1"
 thiserror = "2.0.21"
 tracing = "0.1.44"
-wgpu = "30.0.1"
+wgpu = { version = "30.0.1", features = ["naga-ir"] }
 wpe-assets = { version = "0.1.0", path = "../wpe-assets" }
+wpe-shader = { version = "0.1.0", path = "../wpe-shader" }

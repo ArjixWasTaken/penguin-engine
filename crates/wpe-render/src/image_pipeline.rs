@@ -14,7 +14,7 @@ pub enum BlendMode {
 }
 
 impl BlendMode {
-    fn state(self) -> Option<wgpu::BlendState> {
+    pub(crate) fn state(self) -> Option<wgpu::BlendState> {
         use wgpu::{BlendComponent as C, BlendFactor as F, BlendOperation as Op};
         let comp = |src_factor, dst_factor| C {
             src_factor,

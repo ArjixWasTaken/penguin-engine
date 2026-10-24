@@ -3,13 +3,11 @@ use std::sync::Arc;
 use glam::{Mat4, Vec2, Vec4};
 
 use crate::image_pipeline::{ImagePipelines, ImageUniforms};
+use crate::material::{FrameGlobals, MaterialDraw, Placeholders, PreparedMaterialDraw};
+use crate::targets::{DEFAULT_FORMAT, TargetDesc, TargetId, Targets};
 use crate::{BlendMode, Gpu, GpuTexture};
 
-/// Format of `_rt_default`. Wallpaper Engine composites in non-linear
-/// 8-bit space, so no sRGB conversion happens anywhere in the chain.
-const RT_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba8Unorm;
-
-/// One textured card drawn into `_rt_default`.
+/// One textured card drawn with the built-in stand-in shader.
 #[derive(Clone)]
 pub struct ImageDraw {
     /// World transform of the card's centre.
@@ -22,28 +20,59 @@ pub struct ImageDraw {
     pub texture: Arc<GpuTexture>,
 }
 
-struct PreparedDraw {
+pub enum Draw {
+    /// The built-in stand-in image shader (scene camera).
+    Image(ImageDraw),
+    /// A compiled Wallpaper Engine material.
+    Material(MaterialDraw),
+}
+
+/// One step of a frame, executed in order.
+#[allow(clippy::large_enum_variant)]
+pub enum Step {
+    Draw {
+        target: TargetId,
+        draw: Draw,
+    },
+    /// Copy one target into another (the overlapping region).
+    Copy {
+        from: TargetId,
+        to: TargetId,
+    },
+}
+
+struct PreparedImageDraw {
     draw: ImageDraw,
     uniforms: wgpu::Buffer,
     bind_group: wgpu::BindGroup,
 }
 
-struct RenderTarget {
-    size: (u32, u32),
-    texture: wgpu::Texture,
-    view: wgpu::TextureView,
-    blit_bind_group: wgpu::BindGroup,
+#[allow(clippy::large_enum_variant)]
+enum PreparedStep {
+    Image(TargetId, PreparedImageDraw),
+    Material(TargetId, PreparedMaterialDraw),
+    Copy { from: TargetId, to: TargetId },
 }
 
-/// Draws a list of image cards into an offscreen `_rt_default` and presents
-/// it to an output view.
+impl PreparedStep {
+    fn draw_target(&self) -> Option<TargetId> {
+        match self {
+            Self::Image(t, _) | Self::Material(t, _) => Some(*t),
+            Self::Copy { .. } => None,
+        }
+    }
+}
+
+/// Executes a scene's frame steps over its render targets and presents
+/// `_rt_default` to an output view.
 pub struct SceneRenderer {
     images: ImagePipelines,
     blit_pipeline: wgpu::RenderPipeline,
     blit_layout: wgpu::BindGroupLayout,
-    blit_sampler: wgpu::Sampler,
-    rt: Option<RenderTarget>,
-    draws: Vec<PreparedDraw>,
+    blit_bind_group: Option<(u64, wgpu::BindGroup)>,
+    targets: Targets,
+    steps: Vec<PreparedStep>,
+    placeholders: Placeholders,
     pub clear_color: wgpu::Color,
 }
 
@@ -98,116 +127,104 @@ impl SceneRenderer {
             multiview_mask: None,
             cache: None,
         });
-        let blit_sampler = device.create_sampler(&wgpu::SamplerDescriptor {
-            label: Some("blit"),
-            mag_filter: wgpu::FilterMode::Linear,
-            min_filter: wgpu::FilterMode::Linear,
-            ..Default::default()
-        });
         Self {
-            images: ImagePipelines::new(device, RT_FORMAT),
+            images: ImagePipelines::new(device, DEFAULT_FORMAT),
             blit_pipeline,
             blit_layout,
-            blit_sampler,
-            rt: None,
-            draws: Vec::new(),
+            blit_bind_group: None,
+            targets: Targets::new(gpu),
+            steps: Vec::new(),
+            placeholders: Placeholders::new(gpu),
             clear_color: wgpu::Color::BLACK,
         }
     }
 
-    /// Replace the draw list, in back-to-front order.
-    pub fn set_draws(&mut self, gpu: &Gpu, draws: Vec<ImageDraw>) {
-        self.draws = draws
+    /// Replace the frame: extra render targets (ids from 1, in order; 0 is
+    /// `_rt_default`) and the steps that draw into them.
+    pub fn set_frame(&mut self, gpu: &Gpu, targets: Vec<TargetDesc>, steps: Vec<Step>) {
+        self.targets.set(targets);
+        self.steps = steps
             .into_iter()
-            .map(|draw| {
-                let uniforms = gpu.device.create_buffer(&wgpu::BufferDescriptor {
-                    label: Some("image uniforms"),
-                    size: size_of::<ImageUniforms>() as u64,
-                    usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
-                    mapped_at_creation: false,
-                });
-                let bind_group = gpu.device.create_bind_group(&wgpu::BindGroupDescriptor {
-                    label: Some("image"),
-                    layout: &self.images.layout,
-                    entries: &[
-                        wgpu::BindGroupEntry {
-                            binding: 0,
-                            resource: uniforms.as_entire_binding(),
-                        },
-                        wgpu::BindGroupEntry {
-                            binding: 1,
-                            resource: wgpu::BindingResource::TextureView(&draw.texture.view),
-                        },
-                        wgpu::BindGroupEntry {
-                            binding: 2,
-                            resource: wgpu::BindingResource::Sampler(&draw.texture.sampler),
-                        },
-                    ],
-                });
-                PreparedDraw {
-                    draw,
-                    uniforms,
-                    bind_group,
-                }
+            .map(|step| match step {
+                Step::Draw {
+                    target,
+                    draw: Draw::Image(draw),
+                } => PreparedStep::Image(target, self.prepare_image(gpu, draw)),
+                Step::Draw {
+                    target,
+                    draw: Draw::Material(draw),
+                } => PreparedStep::Material(target, PreparedMaterialDraw::new(gpu, draw)),
+                Step::Copy { from, to } => PreparedStep::Copy { from, to },
             })
             .collect();
     }
 
-    fn ensure_rt(&mut self, gpu: &Gpu, size: (u32, u32)) -> &RenderTarget {
-        if self.rt.as_ref().is_none_or(|rt| rt.size != size) {
-            let texture = gpu.device.create_texture(&wgpu::TextureDescriptor {
-                label: Some("_rt_default"),
-                size: wgpu::Extent3d {
-                    width: size.0.max(1),
-                    height: size.1.max(1),
-                    depth_or_array_layers: 1,
+    fn prepare_image(&self, gpu: &Gpu, draw: ImageDraw) -> PreparedImageDraw {
+        let uniforms = gpu.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("image uniforms"),
+            size: size_of::<ImageUniforms>() as u64,
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        let bind_group = gpu.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("image"),
+            layout: &self.images.layout,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: uniforms.as_entire_binding(),
                 },
-                mip_level_count: 1,
-                sample_count: 1,
-                dimension: wgpu::TextureDimension::D2,
-                format: RT_FORMAT,
-                usage: wgpu::TextureUsages::RENDER_ATTACHMENT
-                    | wgpu::TextureUsages::TEXTURE_BINDING
-                    | wgpu::TextureUsages::COPY_SRC,
-                view_formats: &[],
-            });
-            let view = texture.create_view(&Default::default());
-            let blit_bind_group = gpu.device.create_bind_group(&wgpu::BindGroupDescriptor {
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: wgpu::BindingResource::TextureView(&draw.texture.view),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 2,
+                    resource: wgpu::BindingResource::Sampler(&draw.texture.sampler),
+                },
+            ],
+        });
+        PreparedImageDraw {
+            draw,
+            uniforms,
+            bind_group,
+        }
+    }
+
+    /// Record the frame at `size`, then present `_rt_default` onto `output`.
+    pub fn render(
+        &mut self,
+        gpu: &Gpu,
+        encoder: &mut wgpu::CommandEncoder,
+        globals: FrameGlobals,
+        output: &wgpu::TextureView,
+        size: (u32, u32),
+    ) {
+        self.draw_scene(gpu, encoder, globals, size);
+        let generation = self.targets.generation;
+        if self
+            .blit_bind_group
+            .as_ref()
+            .is_none_or(|(g, _)| *g != generation)
+        {
+            let group = gpu.device.create_bind_group(&wgpu::BindGroupDescriptor {
                 label: Some("blit"),
                 layout: &self.blit_layout,
                 entries: &[
                     wgpu::BindGroupEntry {
                         binding: 0,
-                        resource: wgpu::BindingResource::TextureView(&view),
+                        resource: wgpu::BindingResource::TextureView(
+                            &self.targets.get(TargetId::DEFAULT).view,
+                        ),
                     },
                     wgpu::BindGroupEntry {
                         binding: 1,
-                        resource: wgpu::BindingResource::Sampler(&self.blit_sampler),
+                        resource: wgpu::BindingResource::Sampler(&self.targets.sampler),
                     },
                 ],
             });
-            self.rt = Some(RenderTarget {
-                size,
-                texture,
-                view,
-                blit_bind_group,
-            });
+            self.blit_bind_group = Some((generation, group));
         }
-        self.rt.as_ref().expect("render target just created")
-    }
-
-    /// Record the frame: draws into `_rt_default` at `size`, then presents
-    /// it onto `output`.
-    pub fn render(
-        &mut self,
-        gpu: &Gpu,
-        encoder: &mut wgpu::CommandEncoder,
-        view_proj: Mat4,
-        output: &wgpu::TextureView,
-        size: (u32, u32),
-    ) {
-        self.draw_scene(gpu, encoder, view_proj, size);
-        let rt = self.rt.as_ref().expect("render target exists");
         let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
             label: Some("present"),
             color_attachments: &[Some(wgpu::RenderPassColorAttachment {
@@ -222,15 +239,17 @@ impl SceneRenderer {
             ..Default::default()
         });
         pass.set_pipeline(&self.blit_pipeline);
-        pass.set_bind_group(0, &rt.blit_bind_group, &[]);
+        if let Some((_, group)) = &self.blit_bind_group {
+            pass.set_bind_group(0, group, &[]);
+        }
         pass.draw(0..3, 0..1);
     }
 
     /// Render one frame offscreen and read `_rt_default` back as opaque RGBA8.
-    pub fn capture(&mut self, gpu: &Gpu, view_proj: Mat4, size: (u32, u32)) -> Vec<u8> {
+    pub fn capture(&mut self, gpu: &Gpu, globals: FrameGlobals, size: (u32, u32)) -> Vec<u8> {
         let mut encoder = gpu.device.create_command_encoder(&Default::default());
-        self.draw_scene(gpu, &mut encoder, view_proj, size);
-        let rt = self.rt.as_ref().expect("render target exists");
+        self.draw_scene(gpu, &mut encoder, globals, size);
+        let rt = self.targets.get(TargetId::DEFAULT);
 
         let row = size.0 * 4;
         let padded_row = row.next_multiple_of(wgpu::COPY_BYTES_PER_ROW_ALIGNMENT);
@@ -278,46 +297,108 @@ impl SceneRenderer {
         &mut self,
         gpu: &Gpu,
         encoder: &mut wgpu::CommandEncoder,
-        view_proj: Mat4,
+        mut globals: FrameGlobals,
         size: (u32, u32),
     ) {
-        for d in &self.draws {
-            let uv = d.draw.texture.uv_scale();
-            let uniforms = ImageUniforms {
-                mvp: (view_proj * d.draw.model).to_cols_array_2d(),
-                color: d.draw.color.to_array(),
-                size_uv: [d.draw.size.x, d.draw.size.y, uv[0], uv[1]],
-            };
-            gpu.queue
-                .write_buffer(&d.uniforms, 0, bytemuck::bytes_of(&uniforms));
-        }
-        for d in &self.draws {
-            self.images.get(&gpu.device, d.draw.blend);
-        }
-        self.ensure_rt(gpu, size);
-        let rt = self.rt.as_ref().expect("render target exists");
+        let size = (size.0.max(1), size.1.max(1));
+        globals.screen = Vec2::new(size.0 as f32, size.1 as f32);
+        self.targets.prepare(gpu, size);
 
-        let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-            label: Some("_rt_default"),
-            color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                view: &rt.view,
-                depth_slice: None,
-                resolve_target: None,
-                ops: wgpu::Operations {
-                    load: wgpu::LoadOp::Clear(self.clear_color),
-                    store: wgpu::StoreOp::Store,
-                },
-            })],
-            ..Default::default()
-        });
-        for d in &self.draws {
-            pass.set_pipeline(
-                self.images
-                    .cached(d.draw.blend)
-                    .expect("pipelines created above"),
-            );
-            pass.set_bind_group(0, &d.bind_group, &[]);
-            pass.draw(0..4, 0..1);
+        for step in &mut self.steps {
+            match step {
+                PreparedStep::Image(_, d) => {
+                    let uv = d.draw.texture.uv_scale();
+                    let uniforms = ImageUniforms {
+                        mvp: (globals.view_proj * d.draw.model).to_cols_array_2d(),
+                        color: d.draw.color.to_array(),
+                        size_uv: [d.draw.size.x, d.draw.size.y, uv[0], uv[1]],
+                    };
+                    gpu.queue
+                        .write_buffer(&d.uniforms, 0, bytemuck::bytes_of(&uniforms));
+                    self.images.get(&gpu.device, d.draw.blend);
+                }
+                PreparedStep::Material(_, d) => {
+                    d.update(gpu, &globals, &self.placeholders, &self.targets)
+                }
+                PreparedStep::Copy { .. } => {}
+            }
+        }
+
+        let mut written = vec![false; self.targets.len()];
+        let mut i = 0;
+        while i < self.steps.len() {
+            if let PreparedStep::Copy { from, to } = self.steps[i] {
+                let (src, dst) = (self.targets.get(from), self.targets.get(to));
+                encoder.copy_texture_to_texture(
+                    src.texture.as_image_copy(),
+                    dst.texture.as_image_copy(),
+                    wgpu::Extent3d {
+                        width: src.size.0.min(dst.size.0),
+                        height: src.size.1.min(dst.size.1),
+                        depth_or_array_layers: 1,
+                    },
+                );
+                written[to.0] = true;
+                i += 1;
+                continue;
+            }
+            let target = self.steps[i].draw_target().expect("not a copy");
+            let end = (i..self.steps.len())
+                .find(|&j| self.steps[j].draw_target() != Some(target))
+                .unwrap_or(self.steps.len());
+            let load = if written[target.0] {
+                wgpu::LoadOp::Load
+            } else if target == TargetId::DEFAULT {
+                wgpu::LoadOp::Clear(self.clear_color)
+            } else {
+                wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT)
+            };
+            written[target.0] = true;
+            let format = self.targets.format(target);
+            let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: Some("scene"),
+                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                    view: &self.targets.get(target).view,
+                    depth_slice: None,
+                    resolve_target: None,
+                    ops: wgpu::Operations {
+                        load,
+                        store: wgpu::StoreOp::Store,
+                    },
+                })],
+                ..Default::default()
+            });
+            for step in &self.steps[i..end] {
+                match step {
+                    PreparedStep::Image(_, d) if format == DEFAULT_FORMAT => {
+                        pass.set_pipeline(
+                            self.images
+                                .cached(d.draw.blend)
+                                .expect("pipelines created above"),
+                        );
+                        pass.set_bind_group(0, &d.bind_group, &[]);
+                        pass.draw(0..4, 0..1);
+                    }
+                    PreparedStep::Material(_, d) => d.record(&gpu.device, &mut pass, format),
+                    _ => {}
+                }
+            }
+            i = end;
+        }
+        if !written[TargetId::DEFAULT.0] {
+            encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: Some("clear"),
+                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                    view: &self.targets.get(TargetId::DEFAULT).view,
+                    depth_slice: None,
+                    resolve_target: None,
+                    ops: wgpu::Operations {
+                        load: wgpu::LoadOp::Clear(self.clear_color),
+                        store: wgpu::StoreOp::Store,
+                    },
+                })],
+                ..Default::default()
+            });
         }
     }
 }

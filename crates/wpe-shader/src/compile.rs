@@ -107,6 +107,7 @@ pub fn compile(vfs: &Vfs, req: ShaderRequest) -> Result<CompiledShader, ShaderEr
     let frag_io = rewrite::scan_io(&frag);
     let vert = rewrite::fill_placeholder(&vert, &vert_io, None, Some(&frag_io));
     let frag = rewrite::fill_placeholder(&frag, &frag_io, Some(&vert_io), None);
+    let (vert, frag) = hlsl::reconcile(&vert, &frag, &vert_io, &frag_io);
 
     let vert = rewrite::split_samplers(&rewrite::split_varying_arrays(&hlsl::fix(
         Stage::Vertex,
@@ -124,6 +125,16 @@ pub fn compile(vfs: &Vfs, req: ShaderRequest) -> Result<CompiledShader, ShaderEr
         sha.update(frag.as_bytes());
         sha.digest().to_string()
     };
+    if let Some(dir) = std::env::var_os("WPE_DUMP_SHADERS") {
+        let stem = format!("{}_{}", req.name.replace('/', "_"), &key[..8]);
+        let dir = std::path::Path::new(&dir);
+        for (ext, src) in [("vert", &vert), ("frag", &frag)] {
+            let path = dir.join(format!("{stem}.{ext}"));
+            if let Err(e) = std::fs::write(&path, src) {
+                tracing::warn!("dumping {}: {e}", path.display());
+            }
+        }
+    }
     let cached = MEMO
         .lock()
         .unwrap_or_else(|e| e.into_inner())
@@ -149,9 +160,36 @@ pub fn compile(vfs: &Vfs, req: ShaderRequest) -> Result<CompiledShader, ShaderEr
     })
 }
 
+/// glslang errors [`hlsl::repair`] may fix before a program is given up on.
+const MAX_REPAIRS: usize = 32;
+
 fn build(vert: &str, frag: &str) -> Result<(Vec<u32>, Vec<u32>, Reflection), String> {
-    let mut spirv =
-        glslang::compile(&[(Stage::Vertex, vert), (Stage::Fragment, frag)])?.into_iter();
+    let (mut vert, mut frag) = (vert.to_owned(), frag.to_owned());
+    let mut attempt = 0;
+    let mut spirv = loop {
+        // Repairs work on unqualified declarations; locations go on a copy.
+        let (located_vert, located_frag) = rewrite::assign_varying_locations(&vert, &frag);
+        match glslang::compile(&[
+            (Stage::Vertex, &located_vert),
+            (Stage::Fragment, &located_frag),
+        ]) {
+            Ok(spirv) => break spirv.into_iter(),
+            Err(e) => {
+                attempt += 1;
+                let diag = hlsl::diagnostic(&e).filter(|_| attempt <= MAX_REPAIRS);
+                let src = match diag.as_ref().map(|d| d.stage) {
+                    Some(Stage::Vertex) => &mut vert,
+                    Some(Stage::Fragment) => &mut frag,
+                    _ => return Err(e),
+                };
+                let fixed = diag.and_then(|d| hlsl::repair(src, &d));
+                match fixed {
+                    Some(fixed) => *src = fixed,
+                    None => return Err(e),
+                }
+            }
+        }
+    };
     let (vertex, fragment) = (
         spirv.next().unwrap_or_default(),
         spirv.next().unwrap_or_default(),

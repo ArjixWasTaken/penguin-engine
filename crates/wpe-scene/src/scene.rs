@@ -35,6 +35,12 @@ pub struct ImageLayer {
     pub material: MaterialPass,
     /// The model is a solid colour layer with no texture.
     pub solid: bool,
+    /// A passthrough compose layer: its image is what is already on screen.
+    pub compose: bool,
+    /// Covers the whole output rather than a card.
+    pub fullscreen: bool,
+    /// `colorBlendMode`; 0 is plain alpha blending.
+    pub color_blend_mode: i32,
     pub effects: Vec<ImageEffect>,
 }
 
@@ -157,6 +163,9 @@ impl Scene {
                     brightness: img.brightness.value,
                     material: loaded.material,
                     solid: loaded.solid,
+                    compose: loaded.passthrough,
+                    fullscreen: loaded.fullscreen,
+                    color_blend_mode: img.color_blend_mode,
                     effects: img.effects.clone(),
                 }
             })
@@ -178,6 +187,7 @@ struct LoadedImage {
     size: Option<Vec2>,
     fullscreen: bool,
     solid: bool,
+    passthrough: bool,
 }
 
 fn load_image(
@@ -216,6 +226,7 @@ fn load_image(
         size,
         fullscreen: model.fullscreen,
         solid: model.solidlayer,
+        passthrough: model.passthrough,
     }))
 }
 

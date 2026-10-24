@@ -28,6 +28,9 @@ struct Args {
     size: (u32, u32),
     #[arg(long, value_enum, default_value_t = Fill::Crop)]
     fill: Fill,
+    /// Scene time in seconds for --screenshot.
+    #[arg(long, default_value_t = 0.0)]
+    time: f32,
 }
 
 #[derive(Clone, Copy, clap::ValueEnum)]
@@ -69,7 +72,7 @@ fn main() -> Result<()> {
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| "info,wgpu_core=warn,wgpu_hal=warn".into()),
+                .unwrap_or_else(|_| "info,wgpu_core=warn,wgpu_hal=warn,naga=error".into()),
         )
         .init();
     let args = Args::parse();
@@ -105,6 +108,7 @@ fn screenshot(args: &Args, assets: &std::path::Path, out: &std::path::Path) -> R
         &args.wallpaper,
     )?;
     wallpaper.fill = args.fill.into();
+    wallpaper.time_override = Some(args.time);
     let pixels = wallpaper.capture(&gpu, args.size);
     image::RgbaImage::from_raw(args.size.0, args.size.1, pixels)
         .context("capture size mismatch")?
@@ -232,6 +236,13 @@ impl ApplicationHandler for App {
                 state.config.height = size.height.max(1);
                 state.surface.configure(&state.gpu.device, &state.config);
                 state.window.request_redraw();
+            }
+            WindowEvent::CursorMoved { position, .. } => {
+                let size = state.window.inner_size();
+                state.wallpaper.set_pointer(glam::Vec2::new(
+                    position.x as f32 / size.width.max(1) as f32,
+                    position.y as f32 / size.height.max(1) as f32,
+                ));
             }
             WindowEvent::RedrawRequested => {
                 state.redraw();

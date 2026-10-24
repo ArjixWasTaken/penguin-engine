@@ -199,6 +199,61 @@ pub fn split_varying_arrays(src: &str) -> String {
     format!("{renamed}\nvoid main() {{\n{copies_in}    _we_main();\n{copies_out}}}\n")
 }
 
+static VARYING_DECL: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"(?m)^([ \t]*)((?:(?:flat|smooth|noperspective|centroid|highp|mediump|lowp)\s+)*)(in|out)\s+(\w+)\s+(\w+)\s*;")
+        .expect("valid regex")
+});
+
+/// Locations a varying of `ty` occupies.
+fn location_span(ty: &str) -> u32 {
+    match ty {
+        "mat2" | "mat2x2" | "mat2x3" | "mat2x4" => 2,
+        "mat3" | "mat3x2" | "mat3x3" | "mat3x4" => 3,
+        "mat4" | "mat4x2" | "mat4x3" | "mat4x4" => 4,
+        _ => 1,
+    }
+}
+
+/// glslang numbers each stage's varyings in declaration order, so stages
+/// declaring them in different orders disagree. Give every vertex output
+/// and fragment input an explicit location assigned by name. Location
+/// qualifiers rely on the preamble enabling `GL_ARB_separate_shader_objects`.
+pub fn assign_varying_locations(vert: &str, frag: &str) -> (String, String) {
+    let mut names: BTreeMap<String, String> = BTreeMap::new();
+    for (src, dir) in [(vert, "out"), (frag, "in")] {
+        for c in VARYING_DECL.captures_iter(src) {
+            if &c[3] == dir && &c[5] != "glOutColor" {
+                names
+                    .entry(c[5].to_owned())
+                    .or_insert_with(|| c[4].to_owned());
+            }
+        }
+    }
+    let mut locations = BTreeMap::new();
+    let mut next = 0;
+    for (name, ty) in &names {
+        locations.insert(name.clone(), next);
+        next += location_span(ty);
+    }
+    let apply = |src: &str, dir: &str| {
+        VARYING_DECL
+            .replace_all(src, |c: &regex::Captures| {
+                let whole = c.get(0).expect("whole match").as_str().to_owned();
+                if &c[3] != dir {
+                    return whole;
+                }
+                match locations.get(&c[5]) {
+                    Some(loc) => {
+                        format!("{}layout(location = {loc}) {}", &c[1], whole.trim_start())
+                    }
+                    None => whole,
+                }
+            })
+            .into_owned()
+    };
+    (apply(vert, "out"), apply(frag, "in"))
+}
+
 static DEFINES_LOG10: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(r"\b(?:float|half|double|vec[234]|half[234])\s+log10\s*\(").expect("valid regex")
 });
@@ -263,6 +318,20 @@ mod tests {
         assert!(vs.contains("_we_main();\n    v_T_we0 = v_T[0];"));
         let fs = split_varying_arrays("in vec2 v_T[2];\nvoid main() {}\n");
         assert!(fs.contains("v_T[1] = v_T_we1;\n    _we_main();"));
+    }
+
+    #[test]
+    fn varying_locations_match_by_name() {
+        let (v, f) = assign_varying_locations(
+            "#version 330\nout vec4 v_B;\nout vec2 v_A;\nin vec3 a_Position;\n",
+            "#version 330\nin vec2 v_A;\nin vec4 v_B;\nout vec4 glOutColor;\n",
+        );
+        assert!(v.contains("layout(location = 1) out vec4 v_B;"));
+        assert!(v.contains("layout(location = 0) out vec2 v_A;"));
+        assert!(v.contains("\nin vec3 a_Position;"));
+        assert!(f.contains("layout(location = 0) in vec2 v_A;"));
+        assert!(f.contains("layout(location = 1) in vec4 v_B;"));
+        assert!(f.contains("\nout vec4 glOutColor;"));
     }
 
     #[test]

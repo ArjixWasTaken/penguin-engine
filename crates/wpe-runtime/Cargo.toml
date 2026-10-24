@@ -5,6 +5,7 @@ edition.workspace = true
 license.workspace = true
 
 [dependencies]
+chrono = { version = "0.4.45", default-features = false, features = ["clock"] }
 glam = "0.34.1"
 thiserror = "2.0.21"
 tracing = "0.1.44"

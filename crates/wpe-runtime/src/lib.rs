@@ -1,20 +1,22 @@
 //! Embeddable wallpaper runtime: load a wallpaper and drive its render loop.
 
 mod files;
+mod frame;
 pub mod material;
 
-use std::collections::HashMap;
 use std::path::Path;
-use std::sync::Arc;
+use std::time::Instant;
 
-use glam::{Mat4, Vec4};
-use wpe_assets::material::Blending;
+use chrono::Timelike;
+use glam::Vec2;
 use wpe_assets::tex::{Mip, TexFormat, TexImage, Texture};
-use wpe_render::{BlendMode, Gpu, GpuTexture, ImageDraw, SceneRenderer, upload_texture, wgpu};
-use wpe_scene::{ImageLayer, OrthoCamera, Scene};
+use wpe_render::{FrameGlobals, Gpu, SceneRenderer, wgpu};
+use wpe_scene::{OrthoCamera, Scene};
+
+use frame::FrameBuilder;
 
 pub use files::{LoadError, WallpaperFiles};
-pub use material::TextureStore;
+pub use material::{SlotTexture, TextureStore};
 pub use wpe_scene::FillMode;
 
 fn white_texture() -> Texture {
@@ -41,21 +43,19 @@ fn white_texture() -> Texture {
     }
 }
 
-fn blend_mode(b: &Blending) -> BlendMode {
-    match b {
-        Blending::Normal | Blending::Disabled => BlendMode::Normal,
-        Blending::Additive => BlendMode::Additive,
-        Blending::TranslucentPa => BlendMode::TranslucentPremultiplied,
-        _ => BlendMode::Translucent,
-    }
-}
-
 /// A loaded wallpaper ready to render.
 pub struct Wallpaper {
     pub title: String,
     pub fill: FillMode,
     camera: OrthoCamera,
     renderer: SceneRenderer,
+    start: Instant,
+    /// Cursor over the output, 0..1 with Y down.
+    pointer: Vec2,
+    /// `general.cameraparallaxmouseinfluence`.
+    parallax_influence: f32,
+    /// Fixed scene time in seconds instead of the wall clock.
+    pub time_override: Option<f32>,
 }
 
 impl Wallpaper {
@@ -79,37 +79,13 @@ impl Wallpaper {
             scene.layers.len()
         );
 
-        let mut uploaded: HashMap<String, Arc<GpuTexture>> = HashMap::new();
-        let mut upload = |name: &str| -> Option<Arc<GpuTexture>> {
-            if let Some(t) = uploaded.get(name) {
-                return Some(t.clone());
-            }
-            let tex = store.get(vfs, name)?;
-            let gpu_tex = Arc::new(upload_texture(gpu, &tex, name));
-            uploaded.insert(name.to_owned(), gpu_tex.clone());
-            Some(gpu_tex)
-        };
-        let white = Arc::new(upload_texture(gpu, &white_texture(), "white"));
-
-        let draws = scene
-            .layers
-            .iter()
-            .filter_map(|layer| {
-                let texture = match layer.texture(0) {
-                    Some(name) if name.starts_with("_rt_") => {
-                        tracing::debug!(
-                            "layer {:?}: render target inputs not supported yet",
-                            layer.name
-                        );
-                        return None;
-                    }
-                    Some(name) => upload(name)?,
-                    None if layer.solid => white.clone(),
-                    None => return None,
-                };
-                Some(image_draw(layer, texture))
-            })
-            .collect();
+        let mut builder = FrameBuilder::new(gpu, vfs, store, white_texture());
+        for layer in &scene.layers {
+            builder.layer(layer);
+        }
+        let (real, total) = builder.stats;
+        tracing::info!("{real} of {total} draws use their real shader");
+        let (targets, steps) = builder.finish();
 
         let mut renderer = SceneRenderer::new(gpu, output_format);
         let c = scene.clear_color;
@@ -119,7 +95,7 @@ impl Wallpaper {
             b: c.z as f64,
             a: 1.0,
         };
-        renderer.set_draws(gpu, draws);
+        renderer.set_frame(gpu, targets, steps);
 
         Ok(Self {
             title: files
@@ -130,11 +106,32 @@ impl Wallpaper {
             fill: FillMode::default(),
             camera: scene.camera,
             renderer,
+            start: Instant::now(),
+            pointer: Vec2::splat(0.5),
+            parallax_influence: files.scene.general.cameraparallaxmouseinfluence.value,
+            time_override: None,
         })
     }
 
-    fn view_proj(&self, size: (u32, u32)) -> Mat4 {
-        self.camera.view_proj(size, self.fill)
+    /// Cursor position over the output, 0..1 with Y down.
+    pub fn set_pointer(&mut self, pointer: Vec2) {
+        self.pointer = pointer;
+    }
+
+    fn globals(&self, size: (u32, u32)) -> FrameGlobals {
+        let now = chrono::Local::now().time();
+        let centred = Vec2::new(self.pointer.x - 0.5, 0.5 - self.pointer.y);
+        FrameGlobals {
+            time: self
+                .time_override
+                .unwrap_or_else(|| self.start.elapsed().as_secs_f32()),
+            daytime: now.num_seconds_from_midnight() as f32 / 86_400.0,
+            pointer: self.pointer,
+            parallax: Vec2::splat(0.5) + centred * self.parallax_influence,
+            view_proj: self.camera.view_proj(size, self.fill),
+            screen: Vec2::new(size.0 as f32, size.1 as f32),
+            eye: (self.camera.scene_size / 2.0).extend(1000.0),
+        }
     }
 
     /// Record one frame into `output`, which is `size` pixels.
@@ -145,23 +142,13 @@ impl Wallpaper {
         output: &wgpu::TextureView,
         size: (u32, u32),
     ) {
-        let vp = self.view_proj(size);
-        self.renderer.render(gpu, encoder, vp, output, size);
+        let globals = self.globals(size);
+        self.renderer.render(gpu, encoder, globals, output, size);
     }
 
     /// Render one frame offscreen and return it as RGBA8 pixels.
     pub fn capture(&mut self, gpu: &Gpu, size: (u32, u32)) -> Vec<u8> {
-        let vp = self.view_proj(size);
-        self.renderer.capture(gpu, vp, size)
-    }
-}
-
-fn image_draw(layer: &ImageLayer, texture: Arc<GpuTexture>) -> ImageDraw {
-    ImageDraw {
-        model: layer.transform,
-        size: layer.size,
-        color: Vec4::from((layer.color * layer.brightness, layer.alpha)),
-        blend: blend_mode(&layer.material.blending),
-        texture,
+        let globals = self.globals(size);
+        self.renderer.capture(gpu, globals, size)
     }
 }

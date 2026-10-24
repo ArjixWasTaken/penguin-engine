@@ -168,6 +168,13 @@ pub fn compile(units: &[(Stage, &str)]) -> Result<Vec<Vec<u32>>, String> {
                 0,
                 0,
             );
+            // Binding 0 belongs to the default uniform block.
+            for ty in [
+                sys::glslang_resource_type_t::Texture,
+                sys::glslang_resource_type_t::Sampler,
+            ] {
+                sys::glslang_shader_shift_binding(shader.raw.as_ptr(), ty, 1);
+            }
         }
         shader
             .preprocess()

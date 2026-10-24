@@ -35,7 +35,12 @@ impl TextureStore {
                     .map_err(|e| e.to_string())
                     .and_then(|b| Texture::parse(&b).map_err(|e| e.to_string()));
                 parsed
-                    .inspect_err(|e| tracing::warn!("texture {name}: {e}"))
+                    .inspect_err(|e| {
+                        // `_alias_*` names are placeholders WE resolves to white.
+                        if !name.starts_with("_alias_") {
+                            tracing::warn!("texture {name}: {e}");
+                        }
+                    })
                     .ok()
                     .map(Arc::new)
             })

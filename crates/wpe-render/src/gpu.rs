@@ -44,7 +44,12 @@ impl Gpu {
             .request_device(&wgpu::DeviceDescriptor {
                 label: Some("wpe device"),
                 required_features,
-                required_limits: wgpu::Limits::default().using_resolution(adapter.limits()),
+                required_limits: wgpu::Limits {
+                    max_inter_stage_shader_variables: adapter
+                        .limits()
+                        .max_inter_stage_shader_variables,
+                    ..wgpu::Limits::default().using_resolution(adapter.limits())
+                },
                 ..Default::default()
             })
             .await?;

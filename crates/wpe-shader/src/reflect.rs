@@ -160,12 +160,21 @@ impl Reflection {
             .update(module.to_ctx())
             .expect("layout of a validated module");
 
+        let info = validate(module)?;
+        let used = |handle: naga::Handle<naga::GlobalVariable>| {
+            (0..module.entry_points.len()).any(|i| !info.get_entry_point(i)[handle].is_empty())
+        };
+
         let mut textures = BTreeMap::new();
         let mut samplers = BTreeMap::new();
-        for (_, var) in module.global_variables.iter() {
+        for (handle, var) in module.global_variables.iter() {
             let Some(binding) = &var.binding else {
                 continue;
             };
+            // Declared-but-unused resources keep glslang's default binding 0.
+            if !used(handle) {
+                continue;
+            }
             let name = var.name.clone().unwrap_or_default();
             match (&module.types[var.ty].inner, var.space) {
                 (TypeInner::Struct { members, span }, AddressSpace::Uniform) => {

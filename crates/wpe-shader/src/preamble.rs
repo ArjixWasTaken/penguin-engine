@@ -9,6 +9,7 @@ pub const PLACEHOLDER: &str = "__SHADER_PLACEHOLD__";
 
 pub const COMMON: &str = r#"#version 330
 #extension GL_EXT_spec_constant_composites : enable
+#extension GL_ARB_separate_shader_objects : enable
 #define GLSL 1
 #define HLSL 0
 #define highp
