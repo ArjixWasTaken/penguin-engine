@@ -112,6 +112,7 @@ fn objects(doc: &serde_json::Value) -> Vec<serde_json::Value> {
 struct Built {
     doc: wpe_assets::Scene,
     layers: Vec<wpe_scene::ImageLayer>,
+    groups: std::collections::HashMap<i32, bool>,
     steps: std::collections::HashMap<i32, frame::LayerSteps>,
     videos: std::collections::HashMap<i32, Arc<video::VideoStream>>,
 }
@@ -128,6 +129,7 @@ impl Built {
             objects,
             general,
             layers: &self.layers,
+            groups: &self.groups,
             steps: &self.steps,
             videos: &self.videos,
             sounds,
@@ -203,6 +205,8 @@ pub struct Wallpaper {
     sprite_steps: Vec<(i32, usize)>,
     /// Scripts' `localStorage` between runs.
     storage: storage::Storage,
+    /// Where scripts last saw the pointer.
+    script_pointer: Option<Vec2>,
 }
 
 impl Wallpaper {
@@ -255,6 +259,7 @@ impl Wallpaper {
             bones: Default::default(),
             sprite_steps: Vec::new(),
             storage: storage::Storage::for_wallpaper(path),
+            script_pointer: None,
             props,
             vfs: files.vfs,
         };
@@ -366,6 +371,7 @@ impl Wallpaper {
         self.shake = scene.shake;
         Built {
             doc,
+            groups: scene.groups,
             layers: scene.layers,
             steps: frame.layer_steps,
             videos: frame.layer_videos,
@@ -473,7 +479,7 @@ impl Wallpaper {
         }
     }
 
-    fn run_scripts(&mut self, gpu: &Gpu, time: f32) {
+    fn run_scripts(&mut self, gpu: &Gpu, time: f32, size: (u32, u32)) {
         if let Some(media) = &mut self.media {
             let events = media.poll();
             if let Some(scripts) = &mut self.scripts {
@@ -492,8 +498,13 @@ impl Wallpaper {
             }
         }
         if let Some(scripts) = &mut self.scripts {
+            if self.script_pointer != Some(self.pointer_target) {
+                self.script_pointer = Some(self.pointer_target);
+                scripts.cursor_moved(self.pointer_target);
+            }
             let ended = self.clocks.borrow_mut().take_ended();
-            scripts.update(time, self.pointer, self.spectrum, &ended);
+            let screen = [size.0 as f32, size.1 as f32];
+            scripts.update(time, self.pointer, screen, self.spectrum, &ended);
         }
         self.sync_scripts(gpu, time);
     }
@@ -596,7 +607,7 @@ impl Wallpaper {
         let globals = self.globals(size);
         self.animate(globals.time);
         self.update_audio(globals.time);
-        self.run_scripts(gpu, globals.time);
+        self.run_scripts(gpu, globals.time, size);
         self.renderer.render(gpu, encoder, globals, output, size);
     }
 
@@ -609,7 +620,7 @@ impl Wallpaper {
         let globals = self.globals(size);
         self.animate(globals.time);
         self.update_audio(globals.time);
-        self.run_scripts(gpu, globals.time);
+        self.run_scripts(gpu, globals.time, size);
         self.renderer.capture(gpu, globals, size)
     }
 }

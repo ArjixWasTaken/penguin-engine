@@ -12,7 +12,9 @@ use glam::Vec2;
 use serde_json::Value;
 use wpe_render::{CardMesh, Gpu, GpuTexture, SceneRenderer};
 use wpe_scene::ImageLayer;
-use wpe_script::{CursorEvent, CursorEventKind, CursorState, ScriptRuntime, ScriptValue};
+use wpe_script::{
+    CursorEvent, CursorEventKind, CursorState, SceneHost, ScriptRuntime, ScriptValue,
+};
 use wpe_vfs::Vfs;
 
 pub use edit::{SceneEdit, apply as apply_edits, resolve_paths};
@@ -34,6 +36,8 @@ pub struct SceneView<'a> {
     /// The document's `general` settings as JSON.
     pub general: &'a Value,
     pub layers: &'a [ImageLayer],
+    /// Each group's own visibility.
+    pub groups: &'a HashMap<i32, bool>,
     pub steps: &'a HashMap<i32, LayerSteps>,
     pub videos: &'a HashMap<i32, Arc<VideoStream>>,
     pub sounds: &'a HashMap<i32, SoundState>,
@@ -153,7 +157,10 @@ impl Scripts {
             let Some(c) = obj.common() else { continue };
             let steps = view.steps.get(&c.id).cloned().unwrap_or_default();
             let layer = by_layer.get(&c.id).copied();
-            if let Some(state) = LayerState::new(obj, view.config(c.id), layer, steps) {
+            if let Some(mut state) = LayerState::new(obj, view.config(c.id), layer, steps) {
+                if let Some(&visible) = view.groups.get(&c.id) {
+                    state.visible = visible;
+                }
                 host.push(state);
             }
         }
@@ -187,10 +194,10 @@ impl Scripts {
     }
 
     fn cursor_state(&self, pointer: Vec2) -> CursorState {
-        let c = self.host.canvas;
+        let (c, s) = (self.host.canvas, self.host.screen_resolution());
         CursorState {
             world: [pointer.x * c[0], (1.0 - pointer.y) * c[1]],
-            screen: [pointer.x * c[0], pointer.y * c[1]],
+            screen: [pointer.x * s[0], pointer.y * s[1]],
             left_down: self.pressed,
         }
     }
@@ -199,13 +206,23 @@ impl Scripts {
     /// [`Self::apply`].
     /// `ended_animations`: layers whose animations reached their end, for
     /// their `addEndedCallback` callbacks.
+    /// `screen`: the output size in pixels; scripts get `resizeScreen` when
+    /// it changes.
     pub fn update(
         &mut self,
         time: f32,
         pointer: Vec2,
+        screen: [f32; 2],
         spectrum: Option<wpe_audio::AudioSpectrum>,
         ended_animations: &[i32],
     ) {
+        if self.host.screen != Some(screen) {
+            let resized = self.host.screen.is_some();
+            self.host.screen = Some(screen);
+            if resized {
+                self.emit("resizeScreen", &serde_json::json!(screen));
+            }
+        }
         let time = time as f64;
         let dt = (time - self.last_time).clamp(0.0, 0.25);
         self.last_time = time;
@@ -267,7 +284,13 @@ impl Scripts {
             let id = l.info.id;
             let steps = view.steps.get(&id).cloned().unwrap_or_default();
             l.rebind(by_layer.get(&id).copied(), steps);
+            if let Some(&visible) = view.groups.get(&id)
+                && !l.touched.visible
+            {
+                l.visible = visible;
+            }
         }
+        self.host.groups_dirty = true;
         self.host.videos = view.videos.clone();
         // Rebuilt particle systems start from the scene's overrides.
         for (&layer, over) in &self.host.particle_overrides {
@@ -280,6 +303,21 @@ impl Scripts {
     /// Deliver a mouse button press or release at `pointer`.
     pub fn mouse_button(&mut self, pointer: Vec2, down: bool) {
         self.pressed = down;
+        let kind = if down {
+            CursorEventKind::Down
+        } else {
+            CursorEventKind::Up
+        };
+        self.cursor_event(kind, pointer);
+    }
+
+    /// The pointer moved to `pointer` (0..1 over the output, Y down):
+    /// `cursorMove`, `cursorEnter` and `cursorLeave` handlers run.
+    pub fn cursor_moved(&mut self, pointer: Vec2) {
+        self.cursor_event(CursorEventKind::Move, pointer);
+    }
+
+    fn cursor_event(&mut self, kind: CursorEventKind, pointer: Vec2) {
         let state = self.cursor_state(pointer);
         let world = Vec2::from_array(state.world);
         let hits: Vec<i32> = self
@@ -289,11 +327,6 @@ impl Scripts {
             .rev()
             .filter(|id| self.hit(*id, world))
             .collect();
-        let kind = if down {
-            CursorEventKind::Down
-        } else {
-            CursorEventKind::Up
-        };
         self.runtime.cursor_event(
             &mut self.host,
             CursorEvent::new(kind, state.world, state.screen, hits),
@@ -323,6 +356,9 @@ impl Scripts {
         renderer: &mut SceneRenderer,
         mut text: Option<&mut wpe_text::TextRenderer>,
     ) {
+        if std::mem::take(&mut self.host.groups_dirty) {
+            self.host.update_ancestors();
+        }
         let user = |name: &str| self.user.get(name).cloned();
         for l in &mut self.host.layers {
             if l.dirty_text
@@ -412,4 +448,35 @@ fn upload_rgba(gpu: &Gpu, width: u32, height: u32, pixels: Vec<u8>) -> GpuTextur
         &crate::rgba_texture(width, height, pixels),
         "script text",
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use serde_json::json;
+
+    use super::*;
+
+    #[test]
+    fn scripts_are_found_anywhere_in_a_configuration() {
+        let config = json!({
+            "id": 3,
+            "visible": {"script": "a", "value": true},
+            "origin": "1 2 3",
+            "instanceoverride": {"rate": {"script": "b", "value": 2.0}},
+            "effects": [{"passes": [{"constantshadervalues": {"alpha": {"script": "c", "value": 0.5, "scriptproperties": {"x": 1}}}}]}],
+        });
+        let found = scripted(&config);
+        let paths: Vec<&str> = found.iter().map(|s| s.path.as_str()).collect();
+        assert_eq!(
+            paths,
+            [
+                "visible",
+                "instanceoverride/rate",
+                "effects/0/passes/0/constantshadervalues/alpha"
+            ]
+        );
+        assert_eq!(found[0].initial, ScriptValue::Bool(true));
+        assert_eq!(found[1].initial, ScriptValue::Number(2.0));
+        assert_eq!(found[2].properties, Some(&json!({"x": 1})));
+    }
 }

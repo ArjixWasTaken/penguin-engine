@@ -28,6 +28,8 @@ pub struct Scene {
     /// Image layers in draw order (back to front), including hidden ones
     /// other layers may sample.
     pub layers: Vec<ImageLayer>,
+    /// Each group's own visibility (hidden groups hide their descendants).
+    pub groups: HashMap<i32, bool>,
 }
 
 /// Wallpaper Engine's legacy (LDR) bloom settings.
@@ -402,6 +404,11 @@ impl Scene {
                 threshold: props.value(&general.bloomthreshold),
                 tint: vec3(*props.value(&general.bloomtint)),
             }),
+            groups: nodes
+                .iter()
+                .filter(|(_, n)| n.group)
+                .map(|(&id, n)| (id, props.flag(&n.common.visible)))
+                .collect(),
             layers,
         }
     }

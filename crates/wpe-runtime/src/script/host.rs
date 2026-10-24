@@ -372,6 +372,8 @@ pub struct ScriptHost {
     pub layers: Vec<LayerState>,
     pub by_id: HashMap<i32, usize>,
     pub canvas: [f32; 2],
+    /// Output size in pixels, once known.
+    pub screen: Option<[f32; 2]>,
     pub spectrum: Option<wpe_audio::AudioSpectrum>,
     /// Each layer's video, for `getVideoTexture()`.
     pub videos: HashMap<i32, Arc<VideoStream>>,
@@ -383,6 +385,8 @@ pub struct ScriptHost {
     pub storage: Option<Value>,
     /// Id for the next created layer.
     pub next_id: i32,
+    /// A group's visibility changed: descendants must be re-evaluated.
+    pub groups_dirty: bool,
     /// Sound layers' play state, and what scripts did to them.
     pub sounds: HashMap<i32, SoundState>,
     pub sound_commands: Vec<(i32, SoundCommand)>,
@@ -402,10 +406,12 @@ impl ScriptHost {
             layers: Vec::new(),
             by_id: HashMap::new(),
             canvas: canvas.to_array(),
+            screen: None,
             spectrum: None,
             videos,
             edits: Vec::new(),
             general: Value::Null,
+            groups_dirty: false,
             storage: None,
             next_id: 1,
             sounds: HashMap::new(),
@@ -733,6 +739,32 @@ impl ScriptHost {
         None
     }
 
+    /// Re-evaluate every layer's `ancestors_visible` from its groups'
+    /// current visibility (hidden groups hide everything under them).
+    pub fn update_ancestors(&mut self) {
+        let visible: Vec<bool> = (0..self.layers.len())
+            .map(|i| {
+                let mut parent = self.layers[i].info.parent;
+                for _ in 0..64 {
+                    let Some(p) = parent.and_then(|p| self.layer(p)) else {
+                        return true;
+                    };
+                    if p.info.kind == LayerKind::Group && !p.visible {
+                        return false;
+                    }
+                    parent = p.info.parent;
+                }
+                true
+            })
+            .collect();
+        for (l, visible) in self.layers.iter_mut().zip(visible) {
+            if l.ancestors_visible != visible {
+                l.ancestors_visible = visible;
+                l.dirty_visible = true;
+            }
+        }
+    }
+
     pub fn unhandled(&self, kind: &str, what: &str) {
         if let Some(audit) = &self.audit {
             audit.count(kind, what);
@@ -888,9 +920,13 @@ impl SceneHost for ScriptHost {
         match property {
             "visible" => {
                 if let Some(v) = value.as_bool() {
-                    l.dirty_visible |= v != l.visible;
+                    let changed = v != l.visible;
+                    l.dirty_visible |= changed;
                     l.touched.visible = true;
                     l.visible = v;
+                    if changed && l.info.kind == LayerKind::Group {
+                        self.groups_dirty = true;
+                    }
                 }
             }
             "origin" | "scale" | "angles" => {
@@ -1079,6 +1115,10 @@ impl SceneHost for ScriptHost {
         self.canvas
     }
 
+    fn screen_resolution(&self) -> [f32; 2] {
+        self.screen.unwrap_or(self.canvas)
+    }
+
     fn audio_spectrum(&self, left: &mut [f32], right: &mut [f32]) {
         let Some(s) = &self.spectrum else { return };
         let (l, r): (&[f32], &[f32]) = match left.len() {
@@ -1108,5 +1148,74 @@ impl SceneHost for ScriptHost {
             LogLevel::Warn => tracing::info!("script: {message}"),
             LogLevel::Info => tracing::debug!("script: {message}"),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use serde_json::json;
+
+    use super::*;
+
+    #[test]
+    fn material_paths_parse() {
+        assert_eq!(
+            material_path("effects/2/visible"),
+            Some(MaterialPath::EffectVisible(2))
+        );
+        assert_eq!(
+            material_path("effects/1/passes/0/constantshadervalues/alpha"),
+            Some(MaterialPath::Constant {
+                effect: Some(1),
+                pass: Some(0),
+                name: "alpha".into()
+            })
+        );
+        assert_eq!(
+            material_path("material/Brightness"),
+            Some(MaterialPath::Constant {
+                effect: None,
+                pass: None,
+                name: "Brightness".into()
+            })
+        );
+        assert_eq!(material_path("origin"), None);
+    }
+
+    #[test]
+    fn layout_values_read_from_configuration() {
+        let config =
+            json!({"alignment": "bottom", "parallaxDepth": {"user": "p", "value": "0.5 0.25"}});
+        assert_eq!(
+            layout_get(&config, "alignment"),
+            Some(ScriptValue::String("bottom".into()))
+        );
+        assert_eq!(
+            layout_get(&config, "parallaxDepth"),
+            Some(ScriptValue::Vec2([0.5, 0.25]))
+        );
+        assert_eq!(
+            layout_get(&config, "perspective"),
+            Some(ScriptValue::Bool(false))
+        );
+        assert_eq!(layout_get(&config, "origin"), None);
+    }
+
+    #[test]
+    fn created_layer_configs() {
+        assert_eq!(
+            new_layer_config(&json!("models/bar.json")),
+            Some(json!({"image": "models/bar.json", "name": "models/bar.json"}))
+        );
+        assert_eq!(
+            new_layer_config(&json!({"__path": "particles/rain.json", "__workshop": "7"})),
+            Some(
+                json!({"particle": "particles/rain.json", "name": "particles/rain.json", "__workshop": "7"})
+            )
+        );
+        assert_eq!(
+            new_layer_config(&json!({"id": 5, "image": "models/a.json"})),
+            Some(json!({"image": "models/a.json"}))
+        );
     }
 }
