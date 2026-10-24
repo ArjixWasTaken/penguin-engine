@@ -18,10 +18,12 @@ ExecStart=%h/.cargo/bin/wallpaper
 ExecReload=kill -HUP $MAINPID
 Restart=on-failure
 RestartSec=2
-# Loading a heavy scene compiles its shaders before the first frame.
+# Readiness waits for the first frame, after the wallpapers load (a heavy
+# scene compiles its shaders first).
 TimeoutStartSec=120
-# The loop pings at half this; loading a wallpaper blocks it for a while.
-WatchdogSec=60
+# The loop pings at half this. Wallpapers load on worker threads, so it is
+# never blocked for long.
+WatchdogSec=15
 Slice=app-graphical.slice
 
 [Install]

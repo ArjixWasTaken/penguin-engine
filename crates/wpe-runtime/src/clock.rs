@@ -179,6 +179,18 @@ impl Clocks {
             .min()
     }
 
+    /// Every clock key of `layer`, sorted.
+    pub fn layer_keys(&self, layer: i32) -> Vec<String> {
+        let mut keys: Vec<String> = self
+            .clocks
+            .keys()
+            .filter(|(l, _)| *l == layer)
+            .map(|(_, k)| k.clone())
+            .collect();
+        keys.sort();
+        keys
+    }
+
     /// The key of `layer`'s first keyframe animation (`getAnimation()`).
     pub fn first_animation(&self, layer: i32) -> Option<String> {
         let mut keys: Vec<&String> = self

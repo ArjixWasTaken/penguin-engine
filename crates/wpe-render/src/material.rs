@@ -1184,6 +1184,23 @@ impl PreparedMaterialDraw {
         self.record_with(device, pass, format, depth_attached, group);
     }
 
+    /// Create the pipeline [`Self::record`] would use with these arguments.
+    pub fn warm(&self, device: &wgpu::Device, format: wgpu::TextureFormat, depth_attached: bool) {
+        self.draw
+            .program
+            .pipeline(device, self.pipeline_key(format, depth_attached));
+    }
+
+    fn pipeline_key(&self, format: wgpu::TextureFormat, depth_attached: bool) -> PipelineKey {
+        PipelineKey {
+            blend: self.draw.blend,
+            format,
+            topology: self.draw.mesh.topology(),
+            cull: self.draw.raster.cull,
+            depth: PassDepth::new(self.draw.raster, depth_attached),
+        }
+    }
+
     fn record_with(
         &self,
         device: &wgpu::Device,
@@ -1198,13 +1215,7 @@ impl PreparedMaterialDraw {
         let Some(geometry) = &self.geometry else {
             return;
         };
-        let key = PipelineKey {
-            blend: self.draw.blend,
-            format,
-            topology: self.draw.mesh.topology(),
-            cull: self.draw.raster.cull,
-            depth: PassDepth::new(self.draw.raster, depth_attached),
-        };
+        let key = self.pipeline_key(format, depth_attached);
         let Some(pipeline) = self.draw.program.pipeline(device, key) else {
             return;
         };

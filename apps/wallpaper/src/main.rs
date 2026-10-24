@@ -6,13 +6,15 @@
 
 mod commands;
 mod control;
+mod loading;
 mod state;
 mod systemd;
 
 use std::io::Read;
 use std::os::unix::net::UnixStream;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::ptr::NonNull;
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
@@ -23,6 +25,7 @@ use raw_window_handle::{
 };
 use smithay_client_toolkit::compositor::{CompositorHandler, CompositorState, Region};
 use smithay_client_toolkit::output::{OutputHandler, OutputState};
+use smithay_client_toolkit::reexports::calloop::channel;
 use smithay_client_toolkit::reexports::calloop::generic::Generic;
 use smithay_client_toolkit::reexports::calloop::timer::{TimeoutAction, Timer};
 use smithay_client_toolkit::reexports::calloop::{
@@ -60,6 +63,7 @@ use wpe_ipc::{Fill, Settings};
 use wpe_render::{Gpu, wgpu};
 use wpe_runtime::{FillMode, Wallpaper};
 
+use loading::{LoadSpec, Loads, NewSurface, SurfaceParts};
 use state::{Overrides, SavedOutput, State};
 use systemd::NotifyState;
 
@@ -169,6 +173,11 @@ struct Stats {
     frames: u32,
     /// Over the last full window.
     fps: f32,
+    /// When the last frame was drawn, and the longest wait between two
+    /// frames in this window and the last full one.
+    last: Option<Instant>,
+    longest: Duration,
+    longest_in_window: Duration,
 }
 
 impl Stats {
@@ -179,11 +188,18 @@ impl Stats {
             since: Instant::now(),
             frames: 0,
             fps: 0.0,
+            last: None,
+            longest: Duration::ZERO,
+            longest_in_window: Duration::ZERO,
         }
     }
 
     /// Count a frame; true when a window completed.
     fn frame(&mut self) -> bool {
+        let now = Instant::now();
+        if let Some(last) = self.last.replace(now) {
+            self.longest_in_window = self.longest_in_window.max(now - last);
+        }
         self.frames += 1;
         let elapsed = self.since.elapsed();
         if elapsed < Self::WINDOW {
@@ -192,6 +208,7 @@ impl Stats {
         self.fps = self.frames as f32 / elapsed.as_secs_f32();
         self.since = Instant::now();
         self.frames = 0;
+        self.longest = std::mem::take(&mut self.longest_in_window);
         true
     }
 
@@ -251,6 +268,39 @@ impl Drop for Screen {
 }
 
 impl Screen {
+    /// A screen showing `wallpaper` (from `path`) on a surface made for it.
+    fn new(
+        parts: SurfaceParts,
+        wallpaper: Wallpaper,
+        path: PathBuf,
+        output: WlOutput,
+        name: String,
+        fill: Fill,
+    ) -> Self {
+        Self {
+            surface: parts.surface,
+            config: parts.config,
+            wallpaper,
+            path,
+            fractional: parts.fractional,
+            viewport: parts.viewport,
+            layer: parts.layer,
+            output,
+            name,
+            logical: (0, 0),
+            scale120: parts.scale120,
+            buffer_scale: parts.buffer_scale,
+            configured: false,
+            frame_pending: false,
+            timer_pending: false,
+            next_frame: Instant::now(),
+            paused: false,
+            dirty: true,
+            fill,
+            stats: Stats::new(),
+        }
+    }
+
     fn buffer_size(&self) -> (u32, u32) {
         let (w, h) = self.logical;
         if self.viewport.is_some() {
@@ -296,7 +346,13 @@ impl Screen {
     fn replace_wallpaper(&mut self, mut wallpaper: Wallpaper, path: PathBuf) {
         wallpaper.fill = fill_mode(self.fill);
         wallpaper.set_paused(self.paused);
-        self.wallpaper = wallpaper;
+        let started = Instant::now();
+        drop(std::mem::replace(&mut self.wallpaper, wallpaper));
+        tracing::debug!(
+            "{}: old wallpaper dropped in {:.1?}",
+            self.name,
+            started.elapsed()
+        );
         self.path = path;
         self.dirty = true;
     }
@@ -360,7 +416,12 @@ impl Screen {
 
         self.dirty = false;
         if self.stats.frame() && log_stats {
-            tracing::info!("{}: {:.1} fps", self.name, self.stats.fps);
+            tracing::info!(
+                "{}: {:.1} fps, longest frame gap {:.1?}",
+                self.name,
+                self.stats.fps,
+                self.stats.longest
+            );
         }
         true
     }
@@ -389,8 +450,11 @@ struct App {
     pointers: Vec<WlPointer>,
     outputs: Vec<KnownOutput>,
     screens: Vec<Screen>,
-    /// Created with the first surface, shared by every output.
-    gpu: Option<Gpu>,
+    /// Created with the first surface, shared by every output and the
+    /// threads loading wallpapers.
+    gpu: Option<Arc<Gpu>>,
+    /// Wallpapers loading.
+    loads: Loads,
     /// The settings in effect.
     settings: Settings,
     /// Settings from the command line.
@@ -423,30 +487,6 @@ impl App {
         }
     }
 
-    /// Load the wallpaper at `path` for a surface of `format`.
-    fn load_wallpaper(
-        &self,
-        format: wgpu::TextureFormat,
-        path: &Path,
-        properties: &[(String, serde_json::Value)],
-    ) -> Result<Wallpaper> {
-        let gpu = self.gpu.as_ref().context("no GPU yet")?;
-        systemd::notify(&[NotifyState::Watchdog]);
-        let started = Instant::now();
-        let mut wallpaper =
-            Wallpaper::load_with_properties(gpu, format, &self.assets, path, properties)
-                .with_context(|| format!("loading {}", path.display()))?;
-        wallpaper.set_volume(self.settings.volume as f32 / 100.0);
-        systemd::notify(&[NotifyState::Watchdog]);
-        tracing::info!(
-            "loaded \"{}\" ({}) in {:.1?}",
-            wallpaper.title,
-            path.display(),
-            started.elapsed()
-        );
-        Ok(wallpaper)
-    }
-
     /// Sound plays from the first screen only.
     fn apply_audio(&mut self) {
         let audio = self.settings.audio;
@@ -455,8 +495,23 @@ impl App {
         }
     }
 
-    /// Put a layer surface showing `saved` on `output`.
+    /// Put a layer surface showing `saved` on `output`, once it has loaded.
     fn create_screen(&mut self, output: &WlOutput, name: &str, saved: &SavedOutput) -> Result<()> {
+        let surface = self.new_surface(output, name)?;
+        let spec = LoadSpec {
+            output: output.clone(),
+            name: name.to_owned(),
+            path: saved.wallpaper.clone(),
+            properties: saved.property_list(),
+            fill: saved.fill.unwrap_or(self.settings.fill),
+            request: None,
+        };
+        self.start_load(spec, Some(surface));
+        Ok(())
+    }
+
+    /// A layer surface for `output`, not committed yet.
+    fn new_surface(&mut self, output: &WlOutput, name: &str) -> Result<NewSurface> {
         let qh = self.qh.clone();
         let info = self
             .output_state
@@ -525,7 +580,8 @@ impl App {
                 })?
             };
             if self.gpu.is_none() {
-                self.gpu = Some(pollster::block_on(Gpu::new(instance, Some(&surface)))?);
+                let gpu = pollster::block_on(Gpu::new(instance, Some(&surface)))?;
+                self.gpu = Some(Arc::new(gpu));
             }
             Ok(surface)
         })();
@@ -566,47 +622,15 @@ impl App {
             config.alpha_mode = wgpu::CompositeAlphaMode::Opaque;
         }
 
-        let mut wallpaper =
-            match self.load_wallpaper(config.format, &saved.wallpaper, &saved.property_list()) {
-                Ok(w) => w,
-                Err(e) => {
-                    cleanup(viewport, fractional);
-                    return Err(e);
-                }
-            };
-        let fill = saved.fill.unwrap_or(self.settings.fill);
-        wallpaper.fill = fill_mode(fill);
-        tracing::info!("{name}: playing \"{}\"", wallpaper.title);
-
-        let screen = Screen {
+        Ok(NewSurface::new(SurfaceParts {
             surface,
             config,
-            wallpaper,
-            path: saved.wallpaper.clone(),
             fractional,
             viewport,
             layer,
-            output: output.clone(),
-            name: name.to_owned(),
-            logical: (0, 0),
             scale120: info.scale_factor.max(1) as u32 * 120,
             buffer_scale: info.scale_factor.max(1),
-            configured: false,
-            frame_pending: false,
-            timer_pending: false,
-            next_frame: Instant::now(),
-            paused: false,
-            dirty: true,
-            fill,
-            stats: Stats::new(),
-        };
-        screen.set_passthrough(&self.compositor, self.settings.passthrough);
-        // The initial commit, without a buffer; the configure follows.
-        screen.layer.commit();
-        self.screens.push(screen);
-        self.apply_audio();
-        self.update_status();
-        Ok(())
+        }))
     }
 
     /// A new output appeared: show its saved wallpaper (or the last one set).
@@ -827,7 +851,7 @@ fn main() -> Result<()> {
     event_loop
         .handle()
         .insert_source(Timer::from_duration(Duration::from_secs(2)), |_, _, app| {
-            if !app.ready && app.screens.is_empty() {
+            if !app.ready && app.screens.is_empty() && app.loads.is_empty() {
                 app.ready = true;
                 app.update_status();
                 systemd::notify(&[NotifyState::Ready]);
@@ -836,6 +860,17 @@ fn main() -> Result<()> {
             TimeoutAction::Drop
         })
         .map_err(|e| anyhow::anyhow!("cannot arm a timer: {e}"))?;
+
+    // Wallpapers prepared on worker threads come back here.
+    let (load_tx, load_rx) = channel::channel();
+    event_loop
+        .handle()
+        .insert_source(load_rx, |event, _, app| {
+            if let channel::Event::Msg(done) = event {
+                app.load_done(done);
+            }
+        })
+        .map_err(|e| anyhow::anyhow!("cannot watch the loading threads: {}", e.error))?;
 
     let compositor = CompositorState::bind(&globals, &qh).context("wl_compositor missing")?;
     let layer_shell = LayerShell::bind(&globals, &qh)
@@ -859,6 +894,7 @@ fn main() -> Result<()> {
         outputs: Vec::new(),
         screens: Vec::new(),
         gpu: None,
+        loads: Loads::new(load_tx),
         settings,
         cli,
         config_path,
@@ -869,8 +905,9 @@ fn main() -> Result<()> {
         error: None,
     };
 
-    // Learn the outputs and load their wallpapers before answering anyone,
-    // so the first request (the one that socket-activated us) sees them.
+    // Learn the outputs (and start loading their wallpapers) before
+    // answering anyone, so the first request (the one that socket-activated
+    // us) sees them.
     for _ in 0..2 {
         wayland.queue().roundtrip(&mut app)?;
     }
@@ -884,6 +921,8 @@ fn main() -> Result<()> {
     }
     systemd::notify(&[NotifyState::Stopping]);
     app.screens.clear();
+    // Dropped video streams finish shutting down in the background.
+    wpe_runtime::shutdown();
     let _ = conn.flush();
     app.error.map_or(Ok(()), Err)
 }
@@ -968,6 +1007,7 @@ impl OutputHandler for App {
             keep
         });
         self.screens.retain(|s| s.output != output);
+        self.cancel_loads(&output);
         // Sound moves to the new first screen.
         self.apply_audio();
         self.update_status();

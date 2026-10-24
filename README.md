@@ -60,7 +60,8 @@ wallpaper picker UI and X11 desktops.
 
 Debugging aids: `WPE_SCRIPT_AUDIT=<file>` records script requests the runtime doesn't
 handle, `WPE_FAKE_AUDIO=1` feeds a synthetic spectrum, `scene-viewer --frames N` runs N
-frames (with clicks) before a `--screenshot`.
+frames (with clicks) before a `--screenshot`, `RUST_LOG=wpe_runtime=debug` logs where a
+wallpaper's load time went (texture decoding, shaders, uploads, pipelines, scripts).
 
 ## Layout
 
@@ -149,6 +150,15 @@ wallpaperctl --json status                 # the raw response
 The protocol (`crates/wpe-ipc`) is line-delimited JSON: one request object per line, tagged
 by `cmd`, and one response per line, in order. Any number of clients can be connected.
 
+Wallpapers load on worker threads while the current one keeps playing (only starting the
+scripts runs on the render thread). A `set` is answered once the new wallpaper has loaded and
+shows (`{"ok":true}`) or failed to load (an error, and the old wallpaper stays); meanwhile the
+daemon goes on serving other clients, and that client's next requests wait their turn. A `set`
+covering several outputs changes all of them or, if one fails, none. A newer `set` for an output
+still loading supersedes the older request, which is answered with `"superseded by a later set
+request"`. Wallpapers restored at startup load the same way, so a `status` right after starting
+can show an output without a wallpaper yet.
+
 ```text
 > {"cmd":"status"}
 < {"ok":true,"status":{"settings":{"fps":0,"audio":false,"volume":100,"fill":"crop","layer":"background","passthrough":true},"outputs":[{"name":"DP-3","width":1920,"height":1080,"scale":1.0,"wallpaper":{"path":".../431960/3566329932","workshop_id":"3566329932","title":"Frieren ...","type":"scene"},"paused":false,"fps":106.2,"fill":"crop"}]}}
@@ -165,8 +175,7 @@ by `cmd`, and one response per line, in order. Any number of clients can be conn
 Requests: `status`, `set` {`output`?, `wallpaper`}, `properties` {`output`?}, `property`
 {`output`?, `name`, `value`}, `pause` / `resume` {`output`?}, `audio` {`enabled`}, `volume`
 {`volume`}, `fps` {`fps`}, `fill` {`output`?, `fill`}, `reload-settings`, `quit`. Without
-`output` a request applies to every output. A wallpaper that fails to load is reported and the
-old one stays.
+`output` a request applies to every output.
 
 ### State and settings
 

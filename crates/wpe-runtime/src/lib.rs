@@ -28,6 +28,12 @@ use wpe_scene::{OrthoCamera, Scene};
 use frame::{FrameBuilder, FrameCache};
 
 pub use files::{LoadError, WallpaperFiles};
+
+/// Wait for background shutdown work (dropped video streams) to finish.
+/// Apps call this before exiting, after dropping their wallpapers.
+pub fn shutdown() {
+    video::finish_teardowns();
+}
 pub use material::{SlotTexture, TextureStore};
 pub use wpe_assets::project::{Project, PropertyOption, UserProperty};
 pub use wpe_scene::FillMode;
@@ -242,6 +248,327 @@ pub struct Wallpaper {
     script_pointer: Option<Vec2>,
 }
 
+/// What a frame build made, before it is installed in a [`Wallpaper`]: the
+/// renderer already has the frame; these are the parts the wallpaper keeps.
+/// Unlike the wallpaper, it may cross threads.
+struct FrameBuild {
+    built: Built,
+    light_fx: shadow::LightEffects,
+    system_slots: Vec<frame::SystemSlot>,
+    sprite_steps: Vec<(i32, usize)>,
+    bindings: Vec<frame::Binding>,
+    particles: Vec<frame::ParticleInstance>,
+    camera: OrthoCamera,
+    perspective: wpe_scene::PerspectiveCamera,
+    moving_lights: Option<(Vec<wpe_scene::SceneLight>, Vec3, Vec3)>,
+    is_3d: bool,
+    parallax_delay: f32,
+    shake: Option<wpe_scene::Shake>,
+}
+
+/// What a frame build reads and updates: the parts of a wallpaper that
+/// don't belong to its scripts.
+struct BuildContext<'a> {
+    gpu: &'a Gpu,
+    vfs: &'a wpe_vfs::Vfs,
+    props: &'a wpe_scene::UserProperties,
+    scene_json: &'a serde_json::Value,
+    model_data: &'a model_data::ModelDatas,
+    cache: &'a mut Option<FrameCache>,
+    text: &'a mut Option<wpe_text::TextRenderer>,
+    camera_paths: &'a mut Option<wpe_scene::CameraPathPlayer>,
+    renderer: &'a mut SceneRenderer,
+}
+
+/// Where a load's time went, for the logs.
+#[derive(Debug, Default, Clone, Copy)]
+struct LoadTimings {
+    files: std::time::Duration,
+    scene: std::time::Duration,
+    text: std::time::Duration,
+    frame: std::time::Duration,
+    renderer: std::time::Duration,
+    pipelines: std::time::Duration,
+    build: frame::BuildTimings,
+    textures: std::time::Duration,
+}
+
+/// Build the frame for `doc` (the parsed scene JSON) and give it to the
+/// renderer, creating its pipelines.
+fn build_frame(
+    cx: BuildContext<'_>,
+    doc: wpe_assets::Scene,
+    timings: &mut LoadTimings,
+) -> FrameBuild {
+    let vfs = cx.vfs;
+    let mut cache = cx.cache.take().expect("the cache returns after each build");
+    let decoded = cache.store.decode_time;
+    let started = Instant::now();
+    let mut scene = Scene::build(vfs, &doc, cx.props, |name| cache.store.size(vfs, name));
+    timings.scene += started.elapsed();
+    let started = Instant::now();
+    render_text_layers(vfs, cx.props, &mut scene, &mut cache.store, cx.text);
+    timings.text += started.elapsed();
+
+    let started = Instant::now();
+    // The lit shaders' cookie sampler shows the cookie light's texture.
+    cache.store.alias(
+        vfs,
+        wpe_scene::COOKIE_ALIAS,
+        wpe_scene::cookie_light(&scene.lights).and_then(|l| l.cookie.as_deref()),
+    );
+
+    let mut builder = FrameBuilder::new(cx.gpu, vfs, cache);
+    builder.set_hdr(scene.hdr);
+    builder.set_scene_combos(
+        scene
+            .fog
+            .combos()
+            .into_iter()
+            .map(|(k, v)| (k, v.to_string()))
+            .collect(),
+    );
+    builder.set_parallax(scene.parallax, scene.camera.scene_size);
+    let lights = scene.light_uniforms();
+    builder.set_models(
+        lights
+            .combos
+            .iter()
+            .map(|(k, v)| (k.clone(), v.to_string()))
+            .collect(),
+        cx.model_data,
+        scene.is_3d,
+    );
+    if scene.is_3d && cx.camera_paths.is_none() {
+        let fade = cx.props.flag(&doc.general.camerafade);
+        let paths = wpe_scene::CameraPath::load_scene(vfs, &doc);
+        *cx.camera_paths = wpe_scene::CameraPathPlayer::new(paths, fade);
+    }
+    // Like Wallpaper Engine, only 3D scenes with camera paths render
+    // planar reflections.
+    if scene.is_3d && cx.camera_paths.is_some() {
+        builder.enable_reflection();
+    }
+    builder.objects(&scene.layers, &scene.models, &scene.draw_order);
+    let postprocessing = doc
+        .general
+        .orthogonalprojection
+        .as_ref()
+        .and_then(|p| p.postprocessing.as_deref());
+    let volumetrics = builder.volumetrics(&scene.lights, postprocessing);
+    if let Some(bloom) = scene.bloom {
+        builder.bloom(bloom);
+    }
+    builder.reflection_passes();
+    let (real, total) = builder.stats;
+    tracing::debug!("{real} of {total} draws use their real shader");
+    let build_timings = builder.timings;
+    let (frame, cache) = builder.finish();
+    timings.textures += cache.store.decode_time - decoded;
+    *cx.cache = Some(cache);
+    timings.frame += started.elapsed();
+    timings.build.shaders += build_timings.shaders;
+    timings.build.programs += build_timings.programs;
+    timings.build.uploads += build_timings.uploads;
+
+    let started = Instant::now();
+    let renderer = cx.renderer;
+    let c = scene.clear_color;
+    renderer.clear_color = wgpu::Color {
+        r: c.x as f64,
+        g: c.y as f64,
+        b: c.z as f64,
+        a: 1.0,
+    };
+    renderer.set_scene_format(if scene.hdr {
+        wpe_render::HDR_FORMAT
+    } else {
+        wpe_render::DEFAULT_FORMAT
+    });
+    renderer.set_frame(cx.gpu, frame.targets, frame.steps);
+    for (step, name, scale) in &frame.texel_uniforms {
+        renderer.set_texel_uniform(*step, name, *scale);
+    }
+    for (name, values) in lights.uniforms.iter().chain(&scene.fog.uniforms()) {
+        renderer.set_global_uniform(name, values);
+    }
+    let casters = shadow::casters(&objects(cx.scene_json), cx.props, &frame.layer_steps);
+    tracing::debug!("{} draws cast shadows", casters.len());
+    renderer.set_shadow_casters(casters);
+    let mut light_fx = shadow::LightEffects::new(volumetrics, scene.is_3d);
+    light_fx.update(renderer, &scene.lights);
+    for id in &frame.hidden {
+        for &step in frame.layer_steps.get(id).map_or(&[][..], |s| &s.all) {
+            renderer.set_visible(step, false);
+        }
+    }
+    timings.renderer += started.elapsed();
+    let started = Instant::now();
+    renderer.warm_pipelines(cx.gpu);
+    timings.pipelines += started.elapsed();
+    let moving_lights = scene
+        .lights
+        .iter()
+        .any(|l| l.motion.is_transform_animated())
+        .then(|| {
+            (
+                scene.lights.clone(),
+                scene.ambient_color,
+                scene.skylight_color,
+            )
+        });
+    FrameBuild {
+        light_fx,
+        system_slots: frame.system_slots,
+        sprite_steps: frame.sprite_steps,
+        bindings: frame.bindings,
+        particles: frame.particles,
+        camera: scene.camera,
+        perspective: scene.perspective,
+        moving_lights,
+        is_3d: scene.is_3d,
+        parallax_delay: scene.parallax.map_or(0.0, |p| p.delay),
+        shake: scene.shake,
+        built: Built {
+            doc,
+            groups: scene.groups,
+            layers: scene.layers,
+            steps: frame.layer_steps,
+            videos: frame.layer_videos,
+        },
+    }
+}
+
+/// A wallpaper loaded up to its scripts: files read, scene built, textures
+/// decoded and uploaded, shaders compiled and their pipelines created.
+/// Made by [`Wallpaper::prepare`], which may run on any thread; it becomes
+/// a [`Wallpaper`] with [`Self::finish`] on the thread that renders it.
+pub struct PreparedWallpaper {
+    title: String,
+    scene_file: String,
+    project: wpe_assets::Project,
+    props: wpe_scene::UserProperties,
+    scene_json: serde_json::Value,
+    vfs: wpe_vfs::Vfs,
+    renderer: SceneRenderer,
+    cache: Option<FrameCache>,
+    text: Option<wpe_text::TextRenderer>,
+    camera_paths: Option<wpe_scene::CameraPathPlayer>,
+    video_wallpaper: bool,
+    parallax_influence: f32,
+    sounds: sound::Sounds,
+    storage: storage::Storage,
+    /// What scripts stored last time.
+    stored: Option<serde_json::Value>,
+    frame: FrameBuild,
+    /// How long preparing took.
+    pub elapsed: std::time::Duration,
+}
+
+// The point of preparing: the result moves to the render thread.
+const _: () = {
+    const fn send<T: Send>() {}
+    send::<PreparedWallpaper>()
+};
+
+impl PreparedWallpaper {
+    /// The wallpaper's title.
+    pub fn title(&self) -> &str {
+        &self.title
+    }
+
+    /// Make the wallpaper: start its scripts (running their `init`) and
+    /// hook its animations up to them. Runs on the thread that renders it.
+    pub fn finish(self, gpu: &Gpu) -> Wallpaper {
+        let started = Instant::now();
+        let parallax_influence = self.parallax_influence;
+        let mut wallpaper = Wallpaper {
+            title: self.title,
+            fill: FillMode::default(),
+            camera: OrthoCamera {
+                scene_size: Vec2::ONE,
+                zoom: 1.0,
+            },
+            perspective: None,
+            is_3d: false,
+            camera_paths: self.camera_paths,
+            camera_path_time: None,
+            moving_lights: None,
+            light_fx: Default::default(),
+            script_view: None,
+            model_data: Default::default(),
+            renderer: self.renderer,
+            scene_json: self.scene_json,
+            cache: self.cache,
+            video_wallpaper: self.video_wallpaper,
+            audio_enabled: false,
+            text: self.text,
+            bindings: Vec::new(),
+            particles: Vec::new(),
+            scripts: None,
+            spectrum: None,
+            start: Instant::now(),
+            paused_at: None,
+            paused_videos: Vec::new(),
+            volume: 1.0,
+            project: self.project,
+            pointer: Vec2::splat(0.5),
+            pointer_target: Vec2::splat(0.5),
+            last_frame: None,
+            parallax_delay: 0.0,
+            shake: None,
+            parallax_influence,
+            time_override: None,
+            audio: None,
+            sounds: self.sounds,
+            media: None,
+            system_slots: Vec::new(),
+            clocks: Default::default(),
+            bones: Default::default(),
+            sprite_steps: Vec::new(),
+            storage: self.storage,
+            script_pointer: None,
+            props: self.props,
+            vfs: self.vfs,
+        };
+        let built = wallpaper.install(gpu, self.frame);
+        tracing::info!(
+            "scene {}: {}x{}, {} image layers",
+            self.scene_file,
+            wallpaper.camera.scene_size.x,
+            wallpaper.camera.scene_size.y,
+            built.layers.len()
+        );
+        let objects = objects(&wallpaper.scene_json);
+        let sounds = wallpaper.sounds.states();
+        let scripts_started = Instant::now();
+        wallpaper.scripts = script::Scripts::load(
+            &wallpaper.vfs,
+            &wallpaper.project,
+            &built.view(&objects, &wallpaper.scene_json["general"], &sounds),
+            wallpaper.camera.scene_size,
+            wallpaper.clocks.clone(),
+            wallpaper.bones.clone(),
+            wallpaper.model_data.clone(),
+            self.stored,
+        );
+        let scripts = scripts_started.elapsed();
+        if wallpaper.scripts.is_some() || !wallpaper.system_slots.is_empty() {
+            wallpaper.media = media::Media::start();
+        }
+        let sync_started = Instant::now();
+        wallpaper.sync_scripts(gpu, 0.0);
+        tracing::debug!(
+            "finished \"{}\" in {:.1?} (scripts {:.1?}, their first edits {:.1?})",
+            wallpaper.title,
+            started.elapsed(),
+            scripts,
+            sync_started.elapsed()
+        );
+        wallpaper
+    }
+}
+
 impl Wallpaper {
     /// Load the wallpaper at `path` (a directory with `project.json`, a
     /// `.pkg`, or a scene `.json`) against the stock `assets` directory.
@@ -263,6 +590,21 @@ impl Wallpaper {
         path: &Path,
         properties: &[(String, serde_json::Value)],
     ) -> Result<Self, LoadError> {
+        Ok(Self::prepare(gpu, output_format, assets, path, properties)?.finish(gpu))
+    }
+
+    /// The part of [`Self::load_with_properties`] that may run on another
+    /// thread than the one rendering: everything but the scripts. Finish it
+    /// with [`PreparedWallpaper::finish`].
+    pub fn prepare(
+        gpu: &Gpu,
+        output_format: wgpu::TextureFormat,
+        assets: &Path,
+        path: &Path,
+        properties: &[(String, serde_json::Value)],
+    ) -> Result<PreparedWallpaper, LoadError> {
+        let started = Instant::now();
+        let mut timings = LoadTimings::default();
         let mut files = WallpaperFiles::open_with_assets_dir(assets, path)?;
         for (name, value) in properties {
             if let Some(p) = files.project.general.properties.get_mut(name) {
@@ -278,193 +620,110 @@ impl Wallpaper {
                 video_wallpaper::texture(mp4, width, height),
             );
         }
-        let mut wallpaper = Self {
-            title: files
-                .project
-                .title
-                .clone()
-                .unwrap_or(files.scene_file.clone()),
-            fill: FillMode::default(),
-            camera: OrthoCamera {
-                scene_size: Vec2::ONE,
-                zoom: 1.0,
+        let sounds = sound::Sounds::load(&files, &props);
+        let storage = storage::Storage::for_wallpaper(path);
+        let stored = storage.load();
+        timings.files = started.elapsed();
+
+        let mut renderer = SceneRenderer::new(gpu, output_format);
+        let mut cache = Some(FrameCache::new(gpu, store, white_texture()));
+        let mut text = None;
+        let mut camera_paths = None;
+        let model_data = model_data::ModelDatas::default();
+        let frame = build_frame(
+            BuildContext {
+                gpu,
+                vfs: &files.vfs,
+                props: &props,
+                scene_json: &files.scene_json,
+                model_data: &model_data,
+                cache: &mut cache,
+                text: &mut text,
+                camera_paths: &mut camera_paths,
+                renderer: &mut renderer,
             },
-            perspective: None,
-            is_3d: false,
-            camera_paths: None,
-            camera_path_time: None,
-            moving_lights: None,
-            light_fx: Default::default(),
-            script_view: None,
-            model_data: Default::default(),
-            renderer: SceneRenderer::new(gpu, output_format),
-            scene_json: files.scene_json.clone(),
-            cache: Some(FrameCache::new(gpu, store, white_texture())),
-            video_wallpaper,
-            audio_enabled: false,
-            text: None,
-            bindings: Vec::new(),
-            particles: Vec::new(),
-            scripts: None,
-            spectrum: None,
-            start: Instant::now(),
-            paused_at: None,
-            paused_videos: Vec::new(),
-            volume: 1.0,
-            project: files.project.clone(),
-            pointer: Vec2::splat(0.5),
-            pointer_target: Vec2::splat(0.5),
-            last_frame: None,
-            parallax_delay: 0.0,
-            shake: None,
-            parallax_influence: files.scene.general.cameraparallaxmouseinfluence.value,
-            time_override: None,
-            audio: None,
-            sounds: sound::Sounds::load(&files, &props),
-            media: None,
-            system_slots: Vec::new(),
-            clocks: Default::default(),
-            bones: Default::default(),
-            sprite_steps: Vec::new(),
-            storage: storage::Storage::for_wallpaper(path),
-            script_pointer: None,
-            props,
-            vfs: files.vfs,
-        };
-        let built = wallpaper.build_frame(gpu, files.scene);
-        tracing::info!(
-            "scene {}: {}x{}, {} image layers",
-            files.scene_file,
-            wallpaper.camera.scene_size.x,
-            wallpaper.camera.scene_size.y,
-            built.layers.len()
+            files.scene,
+            &mut timings,
         );
-        let objects = objects(&wallpaper.scene_json);
+        let objects = objects(&files.scene_json);
         if objects.iter().any(|o| o.to_string().contains("\"script\"")) {
             // Scripts ask videos' length and seek them from `init`; open the
             // files now so those calls don't wait.
-            for stream in built.videos.values() {
+            for stream in frame.built.videos.values() {
                 stream.duration();
             }
         }
-        let sounds = wallpaper.sounds.states();
-        wallpaper.scripts = script::Scripts::load(
-            &wallpaper.vfs,
-            &files.project,
-            &built.view(&objects, &wallpaper.scene_json["general"], &sounds),
-            wallpaper.camera.scene_size,
-            wallpaper.clocks.clone(),
-            wallpaper.bones.clone(),
-            wallpaper.model_data.clone(),
-            wallpaper.storage.load(),
+        let title = files
+            .project
+            .title
+            .clone()
+            .unwrap_or(files.scene_file.clone());
+        let elapsed = started.elapsed();
+        let t = timings;
+        tracing::debug!(
+            "prepared \"{title}\" in {elapsed:.1?}: files {:.1?}, scene {:.1?}, text {:.1?}, \
+             frame {:.1?} (texture decoding {:.1?}, shaders {:.1?}, programs {:.1?}, \
+             uploads {:.1?}), renderer {:.1?}, pipelines {:.1?}",
+            t.files,
+            t.scene,
+            t.text,
+            t.frame,
+            t.textures,
+            t.build.shaders,
+            t.build.programs,
+            t.build.uploads,
+            t.renderer,
+            t.pipelines,
         );
-        if wallpaper.scripts.is_some() || !wallpaper.system_slots.is_empty() {
-            wallpaper.media = media::Media::start();
-        }
-        wallpaper.sync_scripts(gpu, 0.0);
-        Ok(wallpaper)
+        Ok(PreparedWallpaper {
+            title,
+            scene_file: files.scene_file,
+            parallax_influence: frame.built.doc.general.cameraparallaxmouseinfluence.value,
+            project: files.project,
+            props,
+            scene_json: files.scene_json,
+            vfs: files.vfs,
+            renderer,
+            cache,
+            text,
+            camera_paths,
+            video_wallpaper,
+            sounds,
+            storage,
+            stored,
+            frame,
+            elapsed,
+        })
     }
 
     /// Build the frame for `doc` (the parsed scene JSON) and make it current.
     fn build_frame(&mut self, gpu: &Gpu, doc: wpe_assets::Scene) -> Built {
-        let vfs = &self.vfs;
-        let mut cache = self
-            .cache
-            .take()
-            .expect("the cache returns after each build");
-        let mut scene = Scene::build(vfs, &doc, &self.props, |name| cache.store.size(vfs, name));
-        render_text_layers(
-            vfs,
-            &self.props,
-            &mut scene,
-            &mut cache.store,
-            &mut self.text,
+        let model_data = self.model_data.clone();
+        let model_data = model_data.borrow();
+        let build = build_frame(
+            BuildContext {
+                gpu,
+                vfs: &self.vfs,
+                props: &self.props,
+                scene_json: &self.scene_json,
+                model_data: &model_data,
+                cache: &mut self.cache,
+                text: &mut self.text,
+                camera_paths: &mut self.camera_paths,
+                renderer: &mut self.renderer,
+            },
+            doc,
+            &mut LoadTimings::default(),
         );
+        drop(model_data);
+        self.install(gpu, build)
+    }
 
-        // The lit shaders' cookie sampler shows the cookie light's texture.
-        cache.store.alias(
-            vfs,
-            wpe_scene::COOKIE_ALIAS,
-            wpe_scene::cookie_light(&scene.lights).and_then(|l| l.cookie.as_deref()),
-        );
-
-        let mut builder = FrameBuilder::new(gpu, vfs, cache);
-        builder.set_hdr(scene.hdr);
-        builder.set_scene_combos(
-            scene
-                .fog
-                .combos()
-                .into_iter()
-                .map(|(k, v)| (k, v.to_string()))
-                .collect(),
-        );
-        builder.set_parallax(scene.parallax, scene.camera.scene_size);
-        let lights = scene.light_uniforms();
-        builder.set_models(
-            lights
-                .combos
-                .iter()
-                .map(|(k, v)| (k.clone(), v.to_string()))
-                .collect(),
-            self.model_data.clone(),
-            scene.is_3d,
-        );
-        if scene.is_3d && self.camera_paths.is_none() {
-            let fade = self.props.flag(&doc.general.camerafade);
-            let paths = wpe_scene::CameraPath::load_scene(vfs, &doc);
-            self.camera_paths = wpe_scene::CameraPathPlayer::new(paths, fade);
-        }
-        // Like Wallpaper Engine, only 3D scenes with camera paths render
-        // planar reflections.
-        if scene.is_3d && self.camera_paths.is_some() {
-            builder.enable_reflection();
-        }
-        builder.objects(&scene.layers, &scene.models, &scene.draw_order);
-        let postprocessing = doc
-            .general
-            .orthogonalprojection
-            .as_ref()
-            .and_then(|p| p.postprocessing.as_deref());
-        let volumetrics = builder.volumetrics(&scene.lights, postprocessing);
-        if let Some(bloom) = scene.bloom {
-            builder.bloom(bloom);
-        }
-        builder.reflection_passes();
-        let (real, total) = builder.stats;
-        tracing::debug!("{real} of {total} draws use their real shader");
-        let (frame, cache) = builder.finish();
-        self.cache = Some(cache);
-
-        let c = scene.clear_color;
-        self.renderer.clear_color = wgpu::Color {
-            r: c.x as f64,
-            g: c.y as f64,
-            b: c.z as f64,
-            a: 1.0,
-        };
-        self.renderer.set_scene_format(if scene.hdr {
-            wpe_render::HDR_FORMAT
-        } else {
-            wpe_render::DEFAULT_FORMAT
-        });
-        self.renderer.set_frame(gpu, frame.targets, frame.steps);
-        for (step, name, scale) in &frame.texel_uniforms {
-            self.renderer.set_texel_uniform(*step, name, *scale);
-        }
-        for (name, values) in lights.uniforms.iter().chain(&scene.fog.uniforms()) {
-            self.renderer.set_global_uniform(name, values);
-        }
-        let casters = shadow::casters(&objects(&self.scene_json), &self.props, &frame.layer_steps);
-        tracing::debug!("{} draws cast shadows", casters.len());
-        self.renderer.set_shadow_casters(casters);
-        self.light_fx = shadow::LightEffects::new(volumetrics, scene.is_3d);
-        self.light_fx.update(&mut self.renderer, &scene.lights);
-        for id in &frame.hidden {
-            for &step in frame.layer_steps.get(id).map_or(&[][..], |s| &s.all) {
-                self.renderer.set_visible(step, false);
-            }
-        }
-        self.system_slots = frame.system_slots;
+    /// Make a built frame current: hook its animations up to the clocks and
+    /// bones scripts share, and bind engine textures.
+    fn install(&mut self, gpu: &Gpu, build: FrameBuild) -> Built {
+        self.light_fx = build.light_fx;
+        self.system_slots = build.system_slots;
         if let Some(media) = &mut self.media {
             let (texture, _) = media.thumbnail(gpu);
             bind_system(
@@ -477,11 +736,11 @@ impl Wallpaper {
         {
             let mut clocks = self.clocks.borrow_mut();
             let mut bones = self.bones.borrow_mut();
-            for binding in &frame.bindings {
+            for binding in &build.bindings {
                 binding.register_clocks(&mut clocks);
                 binding.register_bones(&mut bones);
             }
-            for &(layer, step) in &frame.sprite_steps {
+            for &(layer, step) in &build.sprite_steps {
                 if let Some((frames, duration)) = self.renderer.sprite_timing(step)
                     && duration > 0.0
                 {
@@ -491,32 +750,16 @@ impl Wallpaper {
                 }
             }
         }
-        self.sprite_steps = frame.sprite_steps;
-        self.camera = scene.camera;
-        self.perspective = Some(scene.perspective);
-        self.moving_lights = scene
-            .lights
-            .iter()
-            .any(|l| l.motion.is_transform_animated())
-            .then(|| {
-                (
-                    scene.lights.clone(),
-                    scene.ambient_color,
-                    scene.skylight_color,
-                )
-            });
-        self.is_3d = scene.is_3d;
-        self.bindings = frame.bindings;
-        self.particles = frame.particles;
-        self.parallax_delay = scene.parallax.map_or(0.0, |p| p.delay);
-        self.shake = scene.shake;
-        Built {
-            doc,
-            groups: scene.groups,
-            layers: scene.layers,
-            steps: frame.layer_steps,
-            videos: frame.layer_videos,
-        }
+        self.sprite_steps = build.sprite_steps;
+        self.camera = build.camera;
+        self.perspective = Some(build.perspective);
+        self.moving_lights = build.moving_lights;
+        self.is_3d = build.is_3d;
+        self.bindings = build.bindings;
+        self.particles = build.particles;
+        self.parallax_delay = build.parallax_delay;
+        self.shake = build.shake;
+        build.built
     }
 
     /// Apply the scene changes scripts queued (rebuilding the frame when the
@@ -782,9 +1025,11 @@ impl Wallpaper {
                 self.renderer.set_global_uniform(&name, &values);
             }
         }
+        let model_data = self.model_data.borrow();
         for binding in &self.bindings {
-            binding.apply(&mut self.renderer, frame, &clocks, &mut bones);
+            binding.apply(&mut self.renderer, frame, &clocks, &mut bones, &model_data);
         }
+        drop(model_data);
         drop(bones);
         for &(layer, step) in &self.sprite_steps {
             let time = clocks

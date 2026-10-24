@@ -13,6 +13,7 @@ use wpe_ipc::{
 };
 use wpe_runtime::{Project, Wallpaper};
 
+use crate::loading::{LoadSpec, SetRequest};
 use crate::state::SavedOutput;
 use crate::{App, control, shell_layer, state};
 
@@ -112,13 +113,19 @@ fn check_settings(settings: &Settings) -> Result<(), String> {
 }
 
 impl control::Handler for App {
-    fn handle_request(&mut self, request: Request) -> Response {
+    fn handle_request(&mut self, request: Request, responder: control::Responder) {
         let result = match request {
             Request::Status => Ok(Response {
                 status: Some(self.status()),
                 ..Response::ok()
             }),
-            Request::Set { output, wallpaper } => self.set_wallpaper(output.as_deref(), &wallpaper),
+            // Answered once the wallpaper has loaded.
+            Request::Set { output, wallpaper } => {
+                if let Err(e) = self.set_wallpaper(output.as_deref(), &wallpaper, responder) {
+                    tracing::warn!("control request failed: {e}");
+                }
+                return;
+            }
             Request::Properties { output } => self.properties(output.as_deref()),
             Request::Property {
                 output,
@@ -141,7 +148,7 @@ impl control::Handler for App {
         if let Err(e) = &result {
             tracing::warn!("control request failed: {e}");
         }
-        Response::from_result(result)
+        responder.send(Response::from_result(result));
     }
 }
 
@@ -206,53 +213,67 @@ impl App {
         select(self.screens.iter().map(|s| s.name.as_str()), wanted)
     }
 
-    fn set_wallpaper(&mut self, output: Option<&str>, spec: &str) -> Result<Response, String> {
-        let path = wpe_runtime::steam::resolve_wallpaper(spec)?;
-        let path = path.canonicalize().unwrap_or(path);
-        let targets = select(self.outputs.iter().map(|o| o.name.as_str()), output)?;
-
-        // Load for every output first: if one fails, nothing changes.
-        let mut loaded = Vec::new();
-        for &t in &targets {
-            if let Some(i) = self.screen_for(&self.outputs[t].output) {
-                let format = self.screens[i].config.format;
-                let wallpaper = self
-                    .load_wallpaper(format, &path, &[])
-                    .map_err(|e| format!("{e:#}"))?;
-                loaded.push((i, wallpaper));
+    /// Start loading `spec` for the outputs `output` means; `responder`
+    /// answers once every one has loaded (and shows it), or one failed (and
+    /// none changes). Errors found before loading are answered at once and
+    /// returned.
+    fn set_wallpaper(
+        &mut self,
+        output: Option<&str>,
+        spec: &str,
+        responder: control::Responder,
+    ) -> Result<(), String> {
+        let checked = (|| {
+            let path = wpe_runtime::steam::resolve_wallpaper(spec)?;
+            let path = path.canonicalize().unwrap_or(path);
+            let targets = select(self.outputs.iter().map(|o| o.name.as_str()), output)?;
+            Ok::<_, String>((path, targets))
+        })();
+        let (path, targets) = match checked {
+            Ok(v) => v,
+            Err(e) => {
+                responder.send(Response::error(e.clone()));
+                return Err(e);
             }
-        }
-        for (i, wallpaper) in loaded {
-            let screen = &mut self.screens[i];
-            tracing::info!("{}: playing \"{}\"", screen.name, wallpaper.title);
-            screen.replace_wallpaper(wallpaper, path.clone());
-            self.state.set_wallpaper(&screen.name, &path);
-        }
-        // Outputs without a wallpaper get a surface now.
-        let mut errors = Vec::new();
+        };
+        // Outputs without a wallpaper (nor one loading) get a surface first.
+        let mut surfaces = Vec::new();
         for &t in &targets {
             let (output, name) = (self.outputs[t].output.clone(), self.outputs[t].name.clone());
-            if self.screen_for(&output).is_some() {
+            if self.screen_for(&output).is_some() || self.loads.has_surface_for(&output) {
+                surfaces.push(None);
                 continue;
             }
-            let saved = SavedOutput {
-                fill: self.state.outputs.get(&name).and_then(|o| o.fill),
-                ..SavedOutput::new(path.clone())
-            };
-            match self.create_screen(&output, &name, &saved) {
-                Ok(()) => self.state.set_wallpaper(&name, &path),
-                Err(e) => errors.push(format!("{name}: {e:#}")),
+            match self.new_surface(&output, &name) {
+                Ok(surface) => surfaces.push(Some(surface)),
+                Err(e) => {
+                    let e = format!("{name}: {e:#}");
+                    responder.send(Response::error(e.clone()));
+                    return Err(e);
+                }
             }
         }
-        self.apply_audio();
-        self.save_state();
-        self.update_status();
-        self.schedule_all();
-        if errors.is_empty() {
-            Ok(Response::ok())
-        } else {
-            Err(errors.join("; "))
+        tracing::info!("loading {}", path.display());
+        let request = SetRequest::new(responder);
+        for (&t, surface) in targets.iter().zip(surfaces) {
+            let (output, name) = (self.outputs[t].output.clone(), self.outputs[t].name.clone());
+            let fill = self
+                .state
+                .outputs
+                .get(&name)
+                .and_then(|o| o.fill)
+                .unwrap_or(self.settings.fill);
+            let spec = LoadSpec {
+                output,
+                name,
+                path: path.clone(),
+                properties: Vec::new(),
+                fill,
+                request: Some(request.clone()),
+            };
+            self.start_load(spec, surface);
         }
+        Ok(())
     }
 
     fn properties(&self, output: Option<&str>) -> Result<Response, String> {
@@ -306,11 +327,13 @@ impl App {
                 return Err(format!("no wallpaper has a property {name}"));
             }
         }
-        let gpu = self.gpu.as_ref().ok_or("no GPU")?;
+        let gpu = self.gpu.clone().ok_or("no GPU")?;
         for i in targets {
             let screen = &mut self.screens[i];
             let started = Instant::now();
-            screen.wallpaper.set_user_property(gpu, name, value.clone());
+            screen
+                .wallpaper
+                .set_user_property(&gpu, name, value.clone());
             screen.dirty = true;
             tracing::info!(
                 "{}: property {name} = {value} ({:.1?})",

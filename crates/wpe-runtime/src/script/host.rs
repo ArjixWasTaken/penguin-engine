@@ -292,6 +292,25 @@ pub fn rotation_of(angles: Vec3) -> Quat {
     Quat::from_euler(EulerRot::ZYX, a.z, a.y, a.x)
 }
 
+/// The first keyframe animation named `name` (any, when empty) anywhere
+/// in `value`: a scene value's `"animation"` binding.
+fn find_animation(value: &Value, name: &str) -> Option<wpe_scene::Animation> {
+    match value {
+        Value::Object(map) => {
+            if let Some(animation) = map
+                .get("animation")
+                .and_then(wpe_scene::Animation::parse)
+                .filter(|a| name.is_empty() || a.name == name)
+            {
+                return Some(animation);
+            }
+            map.values().find_map(|v| find_animation(v, name))
+        }
+        Value::Array(items) => items.iter().find_map(|v| find_animation(v, name)),
+        _ => None,
+    }
+}
+
 /// A script value as it's written in scene JSON (vectors as `"x y z"`).
 fn scene_json(v: &ScriptValue) -> Value {
     match v {
@@ -1029,6 +1048,45 @@ impl ScriptHost {
             .position(|l| l.get("name").and_then(Value::as_str) == Some(key))
     }
 
+    /// Make sure `layer` has a clock for its animation `name` defined under
+    /// `scope` of its configuration (`effects/<i>/...`, `material/...`, or the
+    /// whole object). Animations of parts that aren't drawn yet (an effect
+    /// that starts hidden and a script is about to show) get their clock here;
+    /// the rebuild keeps it. Returns the clock's key: without a `name`, the
+    /// key of the animation found (named or not).
+    fn ensure_clock(&mut self, layer: i32, scope: &str, name: &str) -> String {
+        let key = clock::animation_key(name);
+        if self.clocks.borrow().get(layer, &key).is_some() {
+            return key;
+        }
+        let Some(config) = self.layer(layer).map(|l| &l.config) else {
+            return key;
+        };
+        let mut root = config;
+        let mut parts = scope.split('/').filter(|p| !p.is_empty()).peekable();
+        // `effects/<i>` narrows to that effect; deeper parts are searched.
+        if parts.peek() == Some(&"effects")
+            && let (Some(_), Some(index)) = (parts.next(), parts.next())
+            && let Some(effect) = index
+                .parse::<usize>()
+                .ok()
+                .and_then(|i| config.get("effects")?.get(i))
+        {
+            root = effect;
+        }
+        let Some(animation) = find_animation(root, name) else {
+            return key;
+        };
+        // The key the frame's binding uses for this animation.
+        let key = clock::animation_key(&animation.name);
+        self.clocks.borrow_mut().register(
+            layer,
+            key.clone(),
+            clock::Clock::for_animation(&animation),
+        );
+        key
+    }
+
     /// An animation's playback members (`play`, `getFrame`, `rate`, ...) on
     /// the clock `key` of `layer`.
     fn clock_call(
@@ -1046,7 +1104,11 @@ impl ScriptHost {
             _ => layer,
         };
         let time = self.time as f32;
-        let Some(clock) = key.and_then(|k| clocks.get_mut(layer, &k)) else {
+        let Some(clock) = key.as_deref().and_then(|k| clocks.get_mut(layer, k)) else {
+            tracing::debug!(
+                "layer {layer}: no clock {key:?}; it has {:?}",
+                clocks.layer_keys(layer)
+            );
             drop(clocks);
             self.unhandled("invoke", &format!("{target}.{method} (no such animation)"));
             return None;
@@ -1382,14 +1444,10 @@ impl SceneHost for ScriptHost {
             }
             _ if target.contains("animation:") => {
                 // `animation:<name>`, also under `material/` or `effects/<i>/`.
-                let name = &target[target.find("animation:").unwrap() + "animation:".len()..];
-                self.clock_call(
-                    layer,
-                    Some(clock::animation_key(name)),
-                    target,
-                    method,
-                    args,
-                )
+                let at = target.find("animation:").unwrap();
+                let name = &target[at + "animation:".len()..];
+                let key = self.ensure_clock(layer, &target[..at], name);
+                self.clock_call(layer, Some(key), target, method, args)
             }
             _ if target.starts_with("animationLayer:") => {
                 let key = self.animation_layer_index(layer, &target["animationLayer:".len()..]);
@@ -1708,6 +1766,21 @@ mod tests {
             })
         );
         assert_eq!(material_path("origin"), None);
+    }
+
+    #[test]
+    fn animations_of_unbuilt_parts_are_found_in_the_configuration() {
+        let anim = |name: &str| {
+            json!({"c0": [{"frame": 0, "value": 1}, {"frame": 15, "value": 0}],
+                   "options": {"fps": 15, "length": 15, "mode": "single", "name": name}})
+        };
+        let effect = json!({"passes": [{"constantshadervalues": {
+            "multiply": {"value": 0, "animation": anim("")},
+            "fade": {"value": 1, "animation": anim("fade")},
+        }}]});
+        assert!(find_animation(&effect, "").is_some());
+        assert_eq!(find_animation(&effect, "fade").unwrap().name, "fade");
+        assert!(find_animation(&effect, "missing").is_none());
     }
 
     #[test]

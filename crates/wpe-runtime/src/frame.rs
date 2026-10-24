@@ -22,7 +22,7 @@ use wpe_vfs::Vfs;
 use crate::bones::{Bones, PuppetBones};
 use crate::clock::{self, Clock, Clocks};
 use crate::material::{self, SlotTexture, TextureStore};
-use crate::model_data::SharedModelDatas;
+use crate::model_data::ModelDatas;
 use crate::video::VideoStream;
 
 #[path = "volumetric.rs"]
@@ -356,7 +356,6 @@ pub enum Binding {
     /// changes it.
     ModelData {
         step: usize,
-        data: SharedModelDatas,
         id: i32,
         shape: usize,
         /// The data's generation the draw has.
@@ -489,6 +488,7 @@ impl Binding {
         frame: FrameState,
         clocks: &Clocks,
         bones: &mut Bones,
+        model_data: &ModelDatas,
     ) {
         let scene_time = frame.time;
         match self {
@@ -538,13 +538,11 @@ impl Binding {
             }
             Self::ModelData {
                 step,
-                data,
                 id,
                 shape,
                 generation,
             } => {
-                let data = data.borrow();
-                let Some(model) = data.data.get(id) else {
+                let Some(model) = model_data.data.get(id) else {
                     return;
                 };
                 if model.generation != generation.get() {
@@ -657,6 +655,15 @@ impl Binding {
 /// An effect of a layer: definition, pass overrides, index in the object.
 type LayerEffect = (Effect, Vec<PassOverride>, Option<usize>);
 
+/// Time a frame build spent compiling shaders (preprocessing and SPIR-V),
+/// creating GPU programs, and uploading textures (video streams included).
+#[derive(Debug, Default, Clone, Copy)]
+pub struct BuildTimings {
+    pub shaders: std::time::Duration,
+    pub programs: std::time::Duration,
+    pub uploads: std::time::Duration,
+}
+
 /// Shader programs by shader name and final combos; `None` caches a failure.
 type ProgramCache = HashMap<String, Option<Arc<ShaderProgram>>>;
 
@@ -690,13 +697,15 @@ pub struct FrameBuilder<'a> {
     light_combos: BTreeMap<String, String>,
     /// Combos every material gets: the scene's fog (`FOG_DIST`, ...).
     scene_combos: BTreeMap<String, String>,
-    model_data: SharedModelDatas,
+    model_data: Option<&'a ModelDatas>,
     is_3d: bool,
     /// `_rt_Reflection` and its blur buffer, when the scene renders planar
     /// reflections ([`Self::enable_reflection`]).
     reflection: Option<(TargetId, TargetId)>,
     /// Draws using their compiled material, and all draws.
     pub stats: (usize, usize),
+    /// Where the build's time went.
+    pub timings: BuildTimings,
     /// Format of `_rt_default` and every target holding scene colour.
     scene_format: wgpu::TextureFormat,
     /// Uniforms in output texels: step, uniform, scale.
@@ -708,6 +717,7 @@ pub struct FrameBuilder<'a> {
 /// scripts change the scene's structure is cheap.
 pub struct FrameCache {
     pub store: TextureStore,
+    shaders: material::ShaderCache,
     /// Uploads by source texture address; the source is kept alive so the
     /// address can't be reused by another texture.
     uploaded: HashMap<usize, (Arc<Texture>, Arc<GpuTexture>)>,
@@ -727,6 +737,7 @@ impl FrameCache {
     pub fn new(gpu: &Gpu, store: TextureStore, white: Texture) -> Self {
         Self {
             store,
+            shaders: Default::default(),
             uploaded: HashMap::new(),
             programs: HashMap::new(),
             white: Arc::new(upload_texture(gpu, &white, "white")),
@@ -758,13 +769,14 @@ impl<'a> FrameBuilder<'a> {
             parallax: None,
             light_combos: BTreeMap::new(),
             scene_combos: BTreeMap::new(),
-            model_data: Default::default(),
+            model_data: None,
             is_3d: false,
             reflection: None,
             particles: Vec::new(),
             current_layer: None,
             layer_steps: HashMap::new(),
             stats: (0, 0),
+            timings: BuildTimings::default(),
             scene_format: DEFAULT_FORMAT,
             texel_uniforms: Vec::new(),
         }
@@ -828,6 +840,7 @@ impl<'a> FrameBuilder<'a> {
         if let Some((_, t)) = self.cache.uploaded.get(&key) {
             return t.clone();
         }
+        let started = std::time::Instant::now();
         let gpu_tex = match &tex.video {
             Some(mp4) => {
                 // Only the first mip is refreshed per frame, so drop the rest.
@@ -851,6 +864,7 @@ impl<'a> FrameBuilder<'a> {
         self.cache
             .uploaded
             .insert(key, (tex.clone(), gpu_tex.clone()));
+        self.timings.uploads += started.elapsed();
         gpu_tex
     }
 
@@ -860,14 +874,18 @@ impl<'a> FrameBuilder<'a> {
         name: &str,
     ) -> Option<Arc<ShaderProgram>> {
         let key = format!("{name}{:?}", shader.combos);
+        let (gpu, timings) = (self.gpu, &mut self.timings);
         self.cache
             .programs
             .entry(key)
             .or_insert_with(|| {
-                ShaderProgram::new(self.gpu, name, shader)
+                let started = std::time::Instant::now();
+                let program = ShaderProgram::new(gpu, name, shader)
                     .inspect_err(|e| tracing::warn!("shader {name}: {e}"))
                     .ok()
-                    .map(Arc::new)
+                    .map(Arc::new);
+                timings.programs += started.elapsed();
+                program
             })
             .clone()
     }
@@ -911,9 +929,21 @@ impl<'a> FrameBuilder<'a> {
         } else {
             combos
         };
-        let prepared = material::prepare(self.vfs, &mut self.cache.store, pass, combos)
-            .inspect_err(|e| tracing::warn!("{label} ({}): {e}", pass.shader))
-            .ok()?;
+        let started = std::time::Instant::now();
+        let decoding = self.cache.store.decode_time;
+        let prepared = material::prepare(
+            self.vfs,
+            &mut self.cache.store,
+            &mut self.cache.shaders,
+            pass,
+            combos,
+        )
+        .inspect_err(|e| tracing::warn!("{label} ({}): {e}", pass.shader));
+        // Texture decoding is counted by the store.
+        self.timings.shaders += started
+            .elapsed()
+            .saturating_sub(self.cache.store.decode_time - decoding);
+        let prepared = prepared.ok()?;
         let program = self.program(&prepared.shader, &pass.shader)?;
         let mut reads_frame = false;
         let mut system = Vec::new();
@@ -1133,11 +1163,11 @@ impl<'a> FrameBuilder<'a> {
     pub fn set_models(
         &mut self,
         light_combos: BTreeMap<String, String>,
-        model_data: SharedModelDatas,
+        model_data: &'a ModelDatas,
         is_3d: bool,
     ) {
         self.light_combos = light_combos;
-        self.model_data = model_data;
+        self.model_data = Some(model_data);
         self.is_3d = is_3d;
     }
 
@@ -1528,9 +1558,7 @@ impl<'a> FrameBuilder<'a> {
         if let Some(id) = crate::model_data::id_of(&m.model) {
             let shapes = self
                 .model_data
-                .borrow()
-                .data
-                .get(&id)
+                .and_then(|d| d.data.get(&id))
                 .map(|d| d.shapes.clone())
                 .unwrap_or_default();
             for (i, shape) in shapes.iter().enumerate() {
@@ -1610,13 +1638,10 @@ impl<'a> FrameBuilder<'a> {
             if let Some(id) = crate::model_data::id_of(&m.model) {
                 let generation = self
                     .model_data
-                    .borrow()
-                    .data
-                    .get(&id)
+                    .and_then(|d| d.data.get(&id))
                     .map_or(0, |d| d.generation);
                 self.bindings.push(Binding::ModelData {
                     step,
-                    data: self.model_data.clone(),
                     id,
                     shape: index,
                     generation: generation.into(),

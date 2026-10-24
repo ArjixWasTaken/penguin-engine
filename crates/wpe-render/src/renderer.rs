@@ -594,6 +594,46 @@ impl SceneRenderer {
         }
     }
 
+    /// Create the pipelines the current frame's draws use, so the first
+    /// frame doesn't stall on them (scene loading calls this off the render
+    /// thread). Draws are grouped into passes as [`Self::render`] does.
+    pub fn warm_pipelines(&mut self, gpu: &Gpu) {
+        let scene_format = self.scene_format();
+        let len = self.steps.len().min(self.hidden.len());
+        let mut i = 0;
+        while i < len {
+            let Some(target) = self.steps[i].draw_target() else {
+                i += 1;
+                continue;
+            };
+            let end = (i..len)
+                .find(|&j| self.steps[j].draw_target() != Some(target))
+                .unwrap_or(len);
+            if target.0 >= self.targets.len() {
+                i = end;
+                continue;
+            }
+            let format = self.targets.format(target);
+            let depth_attached = needs_depth(&self.steps[i..end], &self.hidden[i..end]);
+            for step in &self.steps[i..end] {
+                match step {
+                    PreparedStep::Image(_, d) if format == scene_format => {
+                        let depth = PassDepth::new(RasterState::default(), depth_attached);
+                        self.images.get(&gpu.device, d.draw.blend, depth, format);
+                    }
+                    PreparedStep::Material(_, d) => d.warm(&gpu.device, format, depth_attached),
+                    PreparedStep::Mirror { source, .. } => {
+                        if let Some(PreparedStep::Material(_, d)) = self.steps.get(*source) {
+                            d.warm(&gpu.device, format, depth_attached);
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            i = end;
+        }
+    }
+
     fn draw_scene(
         &mut self,
         gpu: &Gpu,

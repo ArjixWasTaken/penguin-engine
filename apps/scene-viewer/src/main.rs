@@ -100,7 +100,9 @@ fn main() -> Result<()> {
         .context("Wallpaper Engine assets directory not found; pass --assets")?;
 
     if let Some(out) = &args.screenshot {
-        return screenshot(&args, &assets, out);
+        let result = screenshot(&args, &assets, out);
+        wpe_runtime::shutdown();
+        return result;
     }
 
     let event_loop = EventLoop::new()?;
@@ -111,7 +113,10 @@ fn main() -> Result<()> {
         error: None,
     };
     event_loop.run_app(&mut app)?;
-    app.error.map_or(Ok(()), Err)
+    let error = app.error.take();
+    drop(app);
+    wpe_runtime::shutdown();
+    error.map_or(Ok(()), Err)
 }
 
 fn screenshot(args: &Args, assets: &std::path::Path, out: &std::path::Path) -> Result<()> {

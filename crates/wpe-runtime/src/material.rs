@@ -13,6 +13,8 @@ use wpe_vfs::Vfs;
 #[derive(Default)]
 pub struct TextureStore {
     textures: HashMap<String, Option<Arc<Texture>>>,
+    /// Time spent reading and decoding textures so far.
+    pub decode_time: std::time::Duration,
 }
 
 /// Path of the `.tex` a material texture name refers to.
@@ -26,15 +28,17 @@ fn texture_path(vfs: &Vfs, name: &str) -> String {
 
 impl TextureStore {
     pub fn get(&mut self, vfs: &Vfs, name: &str) -> Option<Arc<Texture>> {
+        let decode_time = &mut self.decode_time;
         self.textures
             .entry(name.to_owned())
             .or_insert_with(|| {
+                let started = std::time::Instant::now();
                 let path = texture_path(vfs, name);
                 let parsed = vfs
                     .read(&path)
                     .map_err(|e| e.to_string())
                     .and_then(|b| Texture::parse(&b).map_err(|e| e.to_string()));
-                parsed
+                let parsed = parsed
                     .inspect_err(|e| {
                         // `_alias_*` names are placeholders WE resolves to white.
                         if !name.starts_with("_alias_") {
@@ -42,7 +46,9 @@ impl TextureStore {
                         }
                     })
                     .ok()
-                    .map(Arc::new)
+                    .map(Arc::new);
+                *decode_time += started.elapsed();
+                parsed
             })
             .clone()
     }
@@ -69,6 +75,16 @@ impl TextureStore {
     }
 }
 
+/// Shader annotations and compiled shaders of one wallpaper, by what they
+/// were asked for, so rebuilding a frame (scripts editing the scene, user
+/// properties) doesn't preprocess the same shaders again. Failures are not
+/// kept.
+#[derive(Default)]
+pub struct ShaderCache {
+    annotations: HashMap<String, wpe_shader::ShaderInfo>,
+    compiled: HashMap<String, Arc<CompiledShader>>,
+}
+
 /// What a texture slot is bound to.
 #[derive(Debug, Clone)]
 pub enum SlotTexture {
@@ -84,7 +100,7 @@ pub enum SlotTexture {
 /// A material pass ready to draw: compiled program, slot textures and
 /// constant values keyed by uniform name.
 pub struct PreparedMaterial {
-    pub shader: CompiledShader,
+    pub shader: Arc<CompiledShader>,
     pub textures: Vec<Option<SlotTexture>>,
     /// Shader defaults overlaid with the material's constants.
     pub constants: HashMap<String, Vec<f32>>,
@@ -136,6 +152,7 @@ fn resolve(vfs: &Vfs, store: &mut TextureStore, name: &str) -> Option<SlotTextur
 pub fn prepare(
     vfs: &Vfs,
     store: &mut TextureStore,
+    shaders: &mut ShaderCache,
     pass: &MaterialPass,
     extra_combos: &BTreeMap<String, String>,
 ) -> Result<PreparedMaterial, ShaderError> {
@@ -165,7 +182,15 @@ pub fn prepare(
     }
 
     let slots: Vec<TexSlot> = textures.iter().map(|t| slot_info(t.as_ref())).collect();
-    let info = wpe_shader::annotations(vfs, &pass.shader, &slots)?;
+    let key = format!("{}{slots:?}", pass.shader);
+    let info = match shaders.annotations.get(&key) {
+        Some(info) => info.clone(),
+        None => {
+            let info = wpe_shader::annotations(vfs, &pass.shader, &slots)?;
+            shaders.annotations.insert(key, info.clone());
+            info
+        }
+    };
     for (&slot, name) in &info.default_textures {
         if textures.len() <= slot {
             textures.resize(slot + 1, None);
@@ -197,15 +222,23 @@ pub fn prepare(
         }
     }
 
-    let shader = wpe_shader::compile(
-        vfs,
-        ShaderRequest {
-            name: &pass.shader,
-            combos: &combos,
-            slots: &slots,
-            formats: &formats,
-        },
-    )?;
+    let key = format!("{}{combos:?}{slots:?}{formats:?}", pass.shader);
+    let shader = match shaders.compiled.get(&key) {
+        Some(shader) => shader.clone(),
+        None => {
+            let shader = Arc::new(wpe_shader::compile(
+                vfs,
+                ShaderRequest {
+                    name: &pass.shader,
+                    combos: &combos,
+                    slots: &slots,
+                    formats: &formats,
+                },
+            )?);
+            shaders.compiled.insert(key, shader.clone());
+            shader
+        }
+    };
 
     let mut constants = shader.info.defaults.clone();
     let mut animated = Vec::new();

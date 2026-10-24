@@ -1,14 +1,19 @@
 //! The control socket: line-delimited JSON requests ([`wpe_ipc::Request`])
-//! from any number of clients, served from the event loop.
+//! from any number of clients, served from the event loop. Each client's
+//! responses come in the order of its requests; a request answered later
+//! (a wallpaper loading) holds back that client's next ones, not others'.
 
+use std::cell::{Cell, RefCell};
 use std::io::{self, Read, Write};
 use std::os::fd::{FromRawFd, RawFd};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
+use std::rc::Rc;
 use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
 use smithay_client_toolkit::reexports::calloop::generic::Generic;
+use smithay_client_toolkit::reexports::calloop::ping::{Ping, make_ping};
 use smithay_client_toolkit::reexports::calloop::{Interest, LoopHandle, Mode, PostAction};
 use wpe_ipc::{Request, Response};
 
@@ -17,9 +22,64 @@ const MAX_LINE: usize = 1 << 20;
 /// A client that doesn't read its responses for this long is dropped.
 const WRITE_TIMEOUT: Duration = Duration::from_secs(2);
 
-/// Whoever answers requests: the daemon.
+/// Whoever answers requests: the daemon. Each request comes with the
+/// [`Responder`] that answers it, at once or later (loading a wallpaper);
+/// until it has, the client's further requests wait, so responses stay in
+/// request order.
 pub trait Handler {
-    fn handle_request(&mut self, request: Request) -> Response;
+    fn handle_request(&mut self, request: Request, responder: Responder);
+}
+
+/// One connected client: the response side of its stream, and the request
+/// bytes not handled yet.
+struct ClientState {
+    stream: UnixStream,
+    pending: Vec<u8>,
+    /// A request's response is outstanding.
+    busy: bool,
+    /// The stream failed.
+    closed: bool,
+    /// The client sent all it will.
+    eof: bool,
+    /// Wakes the loop to handle requests that waited on a response.
+    wake: Ping,
+}
+
+impl ClientState {
+    fn write(&mut self, response: &Response) {
+        if self.closed {
+            return;
+        }
+        let line = wpe_ipc::encode_line(response);
+        if (&self.stream).write_all(line.as_bytes()).is_err() {
+            self.closed = true;
+        }
+    }
+}
+
+/// Answers one request. Dropping it unused answers with an error.
+pub struct Responder(Option<Rc<RefCell<ClientState>>>);
+
+impl Responder {
+    pub fn send(mut self, response: Response) {
+        if let Some(client) = self.0.take() {
+            let mut client = client.borrow_mut();
+            client.write(&response);
+            client.busy = false;
+            if client.eof || client.pending.contains(&b'\n') {
+                client.wake.ping();
+            }
+        }
+    }
+}
+
+impl Drop for Responder {
+    fn drop(&mut self) {
+        if self.0.is_some() {
+            let responder = Responder(self.0.take());
+            responder.send(Response::error("the request was dropped"));
+        }
+    }
 }
 
 /// The listening socket, and the path to remove when we bound it ourselves.
@@ -149,56 +209,113 @@ fn add_client<D: Handler + 'static>(
     // block for at most the timeout.
     stream.set_nonblocking(false)?;
     stream.set_write_timeout(Some(WRITE_TIMEOUT))?;
-    let mut pending = Vec::new();
-    handle
-        .insert_source(
-            Generic::new(stream, Interest::READ, Mode::Level),
-            move |_, stream, handler| {
-                let mut chunk = [0u8; 8192];
-                let n = match (&**stream).read(&mut chunk) {
-                    Ok(0) => return Ok(PostAction::Remove),
-                    Ok(n) => n,
-                    Err(e) if e.kind() == io::ErrorKind::Interrupted => {
-                        return Ok(PostAction::Continue);
-                    }
-                    Err(_) => return Ok(PostAction::Remove),
-                };
-                pending.extend_from_slice(&chunk[..n]);
-                let mut out = String::new();
-                while let Some(end) = pending.iter().position(|&b| b == b'\n') {
-                    let line: Vec<u8> = pending.drain(..=end).collect();
-                    if let Some(response) = respond(handler, &line[..end]) {
-                        out.push_str(&wpe_ipc::encode_line(&response));
-                    }
-                }
-                if pending.len() > MAX_LINE {
-                    out.push_str(&wpe_ipc::encode_line(&Response::error("request too long")));
-                    let _ = (&**stream).write_all(out.as_bytes());
-                    return Ok(PostAction::Remove);
-                }
-                if !out.is_empty() && (&**stream).write_all(out.as_bytes()).is_err() {
-                    return Ok(PostAction::Remove);
-                }
-                Ok(PostAction::Continue)
-            },
-        )
+    let (wake, wake_source) = make_ping()?;
+    let client = Rc::new(RefCell::new(ClientState {
+        stream: stream.try_clone()?,
+        pending: Vec::new(),
+        busy: false,
+        closed: false,
+        eof: false,
+        wake,
+    }));
+    // The wake source outlives the stream's when the client stops sending
+    // while a response is outstanding; it goes once that is answered.
+    let woken = client.clone();
+    let token = Rc::new(Cell::new(None));
+    let own_token = token.clone();
+    let loop_handle = handle.clone();
+    let wake_token = handle
+        .insert_source(wake_source, move |_, _, handler| {
+            handle_lines(handler, &woken);
+            let done = {
+                let c = woken.borrow();
+                c.closed || (c.eof && !c.busy)
+            };
+            if done && let Some(token) = own_token.take() {
+                let h = loop_handle.clone();
+                loop_handle.insert_idle(move |_| h.remove(token));
+            }
+        })
         .map_err(|e| anyhow::anyhow!("cannot watch a control client: {}", e.error))?;
+    token.set(Some(wake_token));
+    let inserted = handle.insert_source(
+        Generic::new(stream, Interest::READ, Mode::Level),
+        move |_, stream, handler| {
+            let mut chunk = [0u8; 8192];
+            let n = match (&**stream).read(&mut chunk) {
+                Ok(n) => n,
+                Err(e) if e.kind() == io::ErrorKind::Interrupted => {
+                    return Ok(PostAction::Continue);
+                }
+                Err(_) => 0,
+            };
+            {
+                let mut c = client.borrow_mut();
+                c.pending.extend_from_slice(&chunk[..n]);
+                if c.pending.len() > MAX_LINE {
+                    c.write(&Response::error("request too long"));
+                    c.closed = true;
+                }
+            }
+            handle_lines(handler, &client);
+            let mut c = client.borrow_mut();
+            if n == 0 || c.closed {
+                // Let the wake source finish what is outstanding, then go.
+                c.eof = true;
+                c.wake.ping();
+                return Ok(PostAction::Remove);
+            }
+            Ok(PostAction::Continue)
+        },
+    );
+    if let Err(e) = inserted {
+        if let Some(token) = token.take() {
+            handle.remove(token);
+        }
+        bail!("cannot watch a control client: {}", e.error);
+    }
     Ok(())
 }
 
-/// The response to one request line; none for a blank line.
-fn respond<D: Handler>(handler: &mut D, line: &[u8]) -> Option<Response> {
+/// Handle the client's complete request lines, until one is waiting on its
+/// response.
+fn handle_lines<D: Handler>(handler: &mut D, client: &Rc<RefCell<ClientState>>) {
+    loop {
+        let line = {
+            let mut c = client.borrow_mut();
+            if c.busy || c.closed {
+                return;
+            }
+            let Some(end) = c.pending.iter().position(|&b| b == b'\n') else {
+                return;
+            };
+            let mut line: Vec<u8> = c.pending.drain(..=end).collect();
+            line.pop();
+            line
+        };
+        match parse(&line) {
+            None => {}
+            Some(Err(response)) => client.borrow_mut().write(&response),
+            Some(Ok(request)) => {
+                tracing::debug!("control request: {request:?}");
+                client.borrow_mut().busy = true;
+                handler.handle_request(request, Responder(Some(client.clone())));
+            }
+        }
+    }
+}
+
+/// The request on one line; none for a blank line, or the error response
+/// to a malformed one.
+fn parse(line: &[u8]) -> Option<Result<Request, Response>> {
     let line = std::str::from_utf8(line).ok().map(str::trim);
     match line {
         Some("") => None,
-        Some(line) => Some(match serde_json::from_str::<Request>(line) {
-            Ok(request) => {
-                tracing::debug!("control request: {request:?}");
-                handler.handle_request(request)
-            }
-            Err(e) => Response::error(format!("bad request: {e}")),
-        }),
-        None => Some(Response::error("bad request: not UTF-8")),
+        Some(line) => Some(
+            serde_json::from_str::<Request>(line)
+                .map_err(|e| Response::error(format!("bad request: {e}"))),
+        ),
+        None => Some(Err(Response::error("bad request: not UTF-8"))),
     }
 }
 
@@ -213,18 +330,27 @@ mod tests {
     struct Fake {
         requests: Vec<Request>,
         quit: bool,
+        /// `set` is answered when a `resume` comes, as a load would.
+        deferred: Vec<Responder>,
     }
 
     impl Handler for Fake {
-        fn handle_request(&mut self, request: Request) -> Response {
+        fn handle_request(&mut self, request: Request, responder: Responder) {
             self.requests.push(request.clone());
             match request {
                 Request::Quit => {
                     self.quit = true;
-                    Response::ok()
+                    responder.send(Response::ok());
                 }
-                Request::Fps { fps } if fps > 1000 => Response::error("too fast"),
-                _ => Response::ok(),
+                Request::Fps { fps } if fps > 1000 => responder.send(Response::error("too fast")),
+                Request::Set { .. } => self.deferred.push(responder),
+                Request::Resume { output: None } => {
+                    for r in self.deferred.drain(..) {
+                        r.send(Response::error("loaded later"));
+                    }
+                    responder.send(Response::ok());
+                }
+                _ => responder.send(Response::ok()),
             }
         }
     }
@@ -279,6 +405,25 @@ mod tests {
                     .starts_with("bad request")
             );
             drop(raw);
+
+            // A `set` answered later holds back its client's next request,
+            // but not other clients'.
+            let mut raw = UnixStream::connect(&client_path).unwrap();
+            raw.write_all(b"{\"cmd\":\"set\",\"wallpaper\":\"x\"}\n{\"cmd\":\"status\"}\n")
+                .unwrap();
+            std::thread::sleep(Duration::from_millis(100));
+            assert!(b.request(&Request::Status).unwrap().ok);
+            assert!(b.request(&Request::Resume { output: None }).unwrap().ok);
+            let mut reader = BufReader::new(raw.try_clone().unwrap());
+            let mut lines = Vec::new();
+            for _ in 0..2 {
+                let mut line = String::new();
+                reader.read_line(&mut line).unwrap();
+                lines.push(serde_json::from_str::<Response>(&line).unwrap());
+            }
+            assert_eq!(lines[0].error.as_deref(), Some("loaded later"));
+            assert!(lines[1].ok);
+            drop(raw);
             assert!(a.request(&Request::Quit).unwrap().ok);
         });
 
@@ -289,7 +434,9 @@ mod tests {
                 .unwrap();
         }
         clients.join().unwrap();
-        assert_eq!(fake.requests.len(), 5);
+        assert_eq!(fake.requests.len(), 9);
+        assert_eq!(fake.requests[6], Request::Resume { output: None });
+        assert_eq!(fake.requests[7], Request::Status);
         assert_eq!(
             fake.requests[3],
             Request::Resume {

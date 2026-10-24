@@ -497,11 +497,44 @@ impl VideoStream {
 }
 
 impl Drop for VideoStream {
+    /// Stopping mpv takes a while (a few hundred ms), so it finishes on a
+    /// thread of its own instead of holding up whoever drops the stream (the
+    /// render loop, swapping wallpapers): the playback thread, then the core
+    /// and the frames, as before.
     fn drop(&mut self) {
         self.stop.store(true, Ordering::Relaxed);
         self.wake.notify();
-        if let Some(thread) = self.thread.take() {
-            let _ = thread.join();
+        let thread = self.thread.take();
+        let mpv = self.mpv.clone();
+        let frames = std::mem::replace(&mut self.frames, Frames::Cpu(cpu::Frames::default()));
+        // Should the thread not start, the core and frames drop here.
+        if let Ok(handle) = std::thread::Builder::new()
+            .name("video teardown".to_owned())
+            .spawn(move || {
+                if let Some(thread) = thread {
+                    let _ = thread.join();
+                }
+                drop(mpv);
+                drop(frames);
+            })
+        {
+            let mut pending = TEARDOWNS.lock().unwrap_or_else(|e| e.into_inner());
+            pending.retain(|h| !h.is_finished());
+            pending.push(handle);
         }
+    }
+}
+
+/// Teardowns still running. mpv must be gone before the process exits:
+/// libraries it loaded run exit handlers that crash under a live core.
+static TEARDOWNS: std::sync::Mutex<Vec<std::thread::JoinHandle<()>>> =
+    std::sync::Mutex::new(Vec::new());
+
+/// Wait for every dropped video to finish shutting down. Call before the
+/// process exits.
+pub fn finish_teardowns() {
+    let pending = std::mem::take(&mut *TEARDOWNS.lock().unwrap_or_else(|e| e.into_inner()));
+    for handle in pending {
+        let _ = handle.join();
     }
 }
