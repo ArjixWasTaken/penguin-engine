@@ -15,7 +15,9 @@ use wpe_runtime::{FillMode, Wallpaper};
 #[derive(Parser)]
 #[command(about = "View a Wallpaper Engine scene wallpaper")]
 struct Args {
-    /// Wallpaper directory (with project.json), scene.pkg, or scene JSON file.
+    /// Wallpaper directory (with project.json), scene.pkg, scene JSON file,
+    /// or the workshop id of an installed wallpaper.
+    #[arg(value_parser = parse_wallpaper)]
     wallpaper: PathBuf,
     /// Wallpaper Engine's stock assets directory.
     #[arg(long)]
@@ -73,22 +75,14 @@ impl From<Fill> for FillMode {
     }
 }
 
+fn parse_wallpaper(s: &str) -> Result<PathBuf, String> {
+    wpe_runtime::steam::resolve_wallpaper(s)
+}
+
 fn parse_size(s: &str) -> Result<(u32, u32), String> {
     let (w, h) = s.split_once('x').ok_or("expected WIDTHxHEIGHT")?;
     let parse = |v: &str| v.parse::<u32>().map_err(|e| e.to_string());
     Ok((parse(w)?, parse(h)?))
-}
-
-fn default_assets_dir() -> Option<PathBuf> {
-    let home = std::env::var_os("HOME").map(PathBuf::from)?;
-    [
-        ".local/share/Steam/steamapps/common/wallpaper_engine/assets",
-        ".steam/steam/steamapps/common/wallpaper_engine/assets",
-        ".var/app/com.valvesoftware.Steam/.local/share/Steam/steamapps/common/wallpaper_engine/assets",
-    ]
-    .into_iter()
-    .map(|p| home.join(p))
-    .find(|p| p.is_dir())
 }
 
 fn main() -> Result<()> {
@@ -102,7 +96,7 @@ fn main() -> Result<()> {
     let assets = args
         .assets
         .clone()
-        .or_else(default_assets_dir)
+        .or_else(wpe_runtime::steam::default_assets_dir)
         .context("Wallpaper Engine assets directory not found; pass --assets")?;
 
     if let Some(out) = &args.screenshot {

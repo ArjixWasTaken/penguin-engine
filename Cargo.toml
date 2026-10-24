@@ -15,6 +15,7 @@ wpe-shader = { path = "crates/wpe-shader" }
 wpe-scene = { path = "crates/wpe-scene" }
 wpe-render = { path = "crates/wpe-render" }
 wpe-runtime = { path = "crates/wpe-runtime" }
+wpe-ipc = { path = "crates/wpe-ipc" }
 
 [profile.dev]
 debug = "line-tables-only"

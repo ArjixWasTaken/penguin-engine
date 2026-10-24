@@ -1,9 +1,17 @@
 //! Desktop wallpaper mode: plays a Wallpaper Engine wallpaper on the desktop
 //! background of a Wayland session through wlr-layer-shell, one layer
-//! surface (and one `Wallpaper`) per output.
+//! surface (and one `Wallpaper`) per output. A control socket
+//! ([`wpe_ipc`]) changes wallpapers and settings at runtime; the choices are
+//! saved and restored on the next start.
 
+mod commands;
+mod control;
+mod state;
+mod systemd;
+
+use std::io::Read;
 use std::os::unix::net::UnixStream;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::ptr::NonNull;
 use std::time::{Duration, Instant};
 
@@ -48,8 +56,12 @@ use smithay_client_toolkit::{
     delegate_compositor, delegate_layer, delegate_output, delegate_pointer, delegate_registry,
     delegate_seat, delegate_simple, registry_handlers,
 };
+use wpe_ipc::{Fill, Settings};
 use wpe_render::{Gpu, wgpu};
 use wpe_runtime::{FillMode, Wallpaper};
+
+use state::{Overrides, SavedOutput, State};
+use systemd::NotifyState;
 
 /// `BTN_LEFT` from linux/input-event-codes.h.
 const BTN_LEFT: u32 = 0x110;
@@ -57,18 +69,21 @@ const BTN_LEFT: u32 = 0x110;
 #[derive(Parser)]
 #[command(about = "Play a Wallpaper Engine wallpaper as the desktop background (Wayland)")]
 struct Args {
-    /// Wallpaper directory (with project.json), scene.pkg, or scene JSON file.
-    wallpaper: PathBuf,
+    /// Wallpaper directory (with project.json), scene.pkg, scene JSON file,
+    /// or the workshop id of an installed wallpaper. It is shown on every
+    /// output and saved; without one, the wallpapers saved last time return.
+    wallpaper: Option<String>,
     /// Wallpaper Engine's stock assets directory.
     #[arg(long)]
     assets: Option<PathBuf>,
-    #[arg(long, value_enum, default_value_t = Fill::Crop)]
-    fill: Fill,
-    /// Layer-shell layer. `background` sits under everything; on KDE Plasma
-    /// it is covered by plasmashell's own desktop, so use `bottom` there
-    /// (above the desktop icons, below windows).
-    #[arg(long, value_enum, default_value_t = LayerArg::Background)]
-    layer: LayerArg,
+    /// How the wallpaper fills the output: crop, fit or stretch.
+    #[arg(long)]
+    fill: Option<Fill>,
+    /// Layer-shell layer: background (default) or bottom. On KDE Plasma
+    /// `background` shares the desktop's layer; `bottom` is always above the
+    /// desktop and below windows.
+    #[arg(long)]
+    layer: Option<wpe_ipc::Layer>,
     /// Only show the wallpaper on this output (connector name, e.g. DP-1).
     #[arg(long)]
     output: Option<String>,
@@ -80,16 +95,37 @@ struct Args {
     /// (on the first output only).
     #[arg(long)]
     audio: bool,
+    /// Sound volume in percent.
+    #[arg(long, value_parser = clap::value_parser!(u32).range(0..=100))]
+    volume: Option<u32>,
     /// Frame rate cap (0 = follow the display).
-    #[arg(long, default_value_t = 0)]
-    fps: u32,
+    #[arg(long)]
+    fps: Option<u32>,
     /// Log each output's frame rate every few seconds.
     #[arg(long)]
     stats: bool,
-    /// Set a user property: `name=value`, the value as JSON (`true`, `0.5`,
-    /// `"1 0 0"`) or else a string. Repeatable.
+    /// Set a user property of the wallpaper given: `name=value`, the value
+    /// as JSON (`true`, `0.5`, `"1 0 0"`) or else a string. Repeatable.
     #[arg(long = "property", value_name = "NAME=VALUE", value_parser = parse_property)]
     properties: Vec<(String, serde_json::Value)>,
+    /// Control socket path, instead of $XDG_RUNTIME_DIR/wallpaper-engine-rs.sock
+    /// (ignored when systemd passes the socket in).
+    #[arg(long)]
+    socket: Option<PathBuf>,
+}
+
+impl Args {
+    /// The settings given on the command line.
+    fn overrides(&self) -> Overrides {
+        Overrides {
+            fps: self.fps,
+            audio: self.audio.then_some(true),
+            volume: self.volume,
+            fill: self.fill,
+            layer: self.layer,
+            passthrough: self.passthrough.then_some(true),
+        }
+    }
 }
 
 fn parse_property(s: &str) -> Result<(String, serde_json::Value), String> {
@@ -98,39 +134,19 @@ fn parse_property(s: &str) -> Result<(String, serde_json::Value), String> {
     Ok((name.to_owned(), value))
 }
 
-#[derive(Clone, Copy, clap::ValueEnum)]
-enum Fill {
-    Crop,
-    Fit,
-    Stretch,
-}
-
-impl From<Fill> for FillMode {
-    fn from(f: Fill) -> Self {
-        match f {
-            Fill::Crop => FillMode::Crop,
-            Fill::Fit => FillMode::Fit,
-            Fill::Stretch => FillMode::Stretch,
-        }
+fn fill_mode(fill: Fill) -> FillMode {
+    match fill {
+        Fill::Crop => FillMode::Crop,
+        Fill::Fit => FillMode::Fit,
+        Fill::Stretch => FillMode::Stretch,
     }
 }
 
-#[derive(Clone, Copy, clap::ValueEnum)]
-enum LayerArg {
-    Background,
-    Bottom,
-}
-
-fn default_assets_dir() -> Option<PathBuf> {
-    let home = std::env::var_os("HOME").map(PathBuf::from)?;
-    [
-        ".local/share/Steam/steamapps/common/wallpaper_engine/assets",
-        ".steam/steam/steamapps/common/wallpaper_engine/assets",
-        ".var/app/com.valvesoftware.Steam/.local/share/Steam/steamapps/common/wallpaper_engine/assets",
-    ]
-    .into_iter()
-    .map(|p| home.join(p))
-    .find(|p| p.is_dir())
+fn shell_layer(layer: wpe_ipc::Layer) -> Layer {
+    match layer {
+        wpe_ipc::Layer::Background => Layer::Background,
+        wpe_ipc::Layer::Bottom => Layer::Bottom,
+    }
 }
 
 /// The Wayland display, handed to wgpu's instance.
@@ -147,10 +163,48 @@ impl HasDisplayHandle for Display {
     }
 }
 
-/// Frame counter for `--stats`.
+/// Frame rate counter.
 struct Stats {
     since: Instant,
     frames: u32,
+    /// Over the last full window.
+    fps: f32,
+}
+
+impl Stats {
+    const WINDOW: Duration = Duration::from_secs(3);
+
+    fn new() -> Self {
+        Self {
+            since: Instant::now(),
+            frames: 0,
+            fps: 0.0,
+        }
+    }
+
+    /// Count a frame; true when a window completed.
+    fn frame(&mut self) -> bool {
+        self.frames += 1;
+        let elapsed = self.since.elapsed();
+        if elapsed < Self::WINDOW {
+            return false;
+        }
+        self.fps = self.frames as f32 / elapsed.as_secs_f32();
+        self.since = Instant::now();
+        self.frames = 0;
+        true
+    }
+
+    /// The frame rate now (lower when frames stopped coming).
+    fn current(&self) -> f32 {
+        let elapsed = self.since.elapsed();
+        // Before the first full window, or when frames stopped coming.
+        if self.fps == 0.0 || elapsed > Self::WINDOW * 2 {
+            self.frames as f32 / elapsed.as_secs_f32()
+        } else {
+            self.fps
+        }
+    }
 }
 
 /// The wallpaper on one output.
@@ -159,6 +213,8 @@ struct Screen {
     surface: wgpu::Surface<'static>,
     config: wgpu::SurfaceConfiguration,
     wallpaper: Wallpaper,
+    /// Where `wallpaper` was loaded from.
+    path: PathBuf,
     fractional: Option<WpFractionalScaleV1>,
     viewport: Option<WpViewport>,
     layer: LayerSurface,
@@ -176,7 +232,11 @@ struct Screen {
     /// A `--fps` timer is armed.
     timer_pending: bool,
     next_frame: Instant,
-    stats: Option<Stats>,
+    paused: bool,
+    /// Needs a frame even while paused (resized, changed).
+    dirty: bool,
+    fill: Fill,
+    stats: Stats,
 }
 
 impl Drop for Screen {
@@ -229,11 +289,46 @@ impl Screen {
             );
         }
         self.configured = true;
+        self.dirty = true;
+    }
+
+    /// Show `wallpaper` (from `path`) instead of the current one.
+    fn replace_wallpaper(&mut self, mut wallpaper: Wallpaper, path: PathBuf) {
+        wallpaper.fill = fill_mode(self.fill);
+        wallpaper.set_paused(self.paused);
+        self.wallpaper = wallpaper;
+        self.path = path;
+        self.dirty = true;
+    }
+
+    fn set_fill(&mut self, fill: Fill) {
+        self.fill = fill;
+        self.wallpaper.fill = fill_mode(fill);
+        self.dirty = true;
+    }
+
+    fn set_paused(&mut self, paused: bool) {
+        self.paused = paused;
+        self.wallpaper.set_paused(paused);
+        self.dirty = true;
+    }
+
+    /// The input region for `passthrough`, committed with the next frame.
+    fn set_passthrough(&self, compositor: &CompositorState, passthrough: bool) {
+        let surface = self.layer.wl_surface();
+        if passthrough {
+            match Region::new(compositor) {
+                Ok(region) => surface.set_input_region(Some(region.wl_region())),
+                Err(e) => tracing::warn!("no input region: {e}"),
+            }
+        } else {
+            surface.set_input_region(None);
+        }
     }
 
     /// Render and present a frame, asking for a frame callback. Returns
     /// false when no frame could be presented.
-    fn draw(&mut self, gpu: &Gpu, qh: &QueueHandle<App>) -> bool {
+    fn draw(&mut self, gpu: &Gpu, qh: &QueueHandle<App>, log_stats: bool) -> bool {
         let frame = match self.surface.get_current_texture() {
             wgpu::CurrentSurfaceTexture::Success(f)
             | wgpu::CurrentSurfaceTexture::Suboptimal(f) => f,
@@ -263,25 +358,26 @@ impl Screen {
         gpu.queue.submit([encoder.finish()]);
         gpu.queue.present(frame);
 
-        if let Some(stats) = &mut self.stats {
-            stats.frames += 1;
-            let elapsed = stats.since.elapsed().as_secs_f32();
-            if elapsed >= 3.0 {
-                tracing::info!("{}: {:.1} fps", self.name, stats.frames as f32 / elapsed);
-                *stats = Stats {
-                    since: Instant::now(),
-                    frames: 0,
-                };
-            }
+        self.dirty = false;
+        if self.stats.frame() && log_stats {
+            tracing::info!("{}: {:.1} fps", self.name, self.stats.fps);
         }
         true
     }
+}
+
+/// An output we show wallpapers on (it may have no screen yet, when it has
+/// no wallpaper or its wallpaper failed to load).
+struct KnownOutput {
+    output: WlOutput,
+    name: String,
 }
 
 struct App {
     args: Args,
     assets: PathBuf,
     conn: Connection,
+    qh: QueueHandle<App>,
     loop_handle: LoopHandle<'static, App>,
     registry_state: RegistryState,
     output_state: OutputState,
@@ -291,9 +387,19 @@ struct App {
     viewporter: Option<SimpleGlobal<WpViewporter, 1>>,
     fractional_manager: Option<SimpleGlobal<WpFractionalScaleManagerV1, 1>>,
     pointers: Vec<WlPointer>,
+    outputs: Vec<KnownOutput>,
     screens: Vec<Screen>,
     /// Created with the first surface, shared by every output.
     gpu: Option<Gpu>,
+    /// The settings in effect.
+    settings: Settings,
+    /// Settings from the command line.
+    cli: Overrides,
+    config_path: Option<PathBuf>,
+    state: State,
+    state_path: Option<PathBuf>,
+    /// systemd has been told we're up.
+    ready: bool,
     exit: bool,
     error: Option<anyhow::Error>,
 }
@@ -305,7 +411,206 @@ impl App {
             .position(|s| s.layer.wl_surface() == surface)
     }
 
-    fn add_output(&mut self, qh: &QueueHandle<Self>, output: WlOutput) -> Result<()> {
+    fn screen_for(&self, output: &WlOutput) -> Option<usize> {
+        self.screens.iter().position(|s| s.output == *output)
+    }
+
+    fn save_state(&self) {
+        if let Some(path) = &self.state_path
+            && let Err(e) = self.state.save(path)
+        {
+            tracing::warn!("cannot save the state: {e:#}");
+        }
+    }
+
+    /// Load the wallpaper at `path` for a surface of `format`.
+    fn load_wallpaper(
+        &self,
+        format: wgpu::TextureFormat,
+        path: &Path,
+        properties: &[(String, serde_json::Value)],
+    ) -> Result<Wallpaper> {
+        let gpu = self.gpu.as_ref().context("no GPU yet")?;
+        systemd::notify(&[NotifyState::Watchdog]);
+        let started = Instant::now();
+        let mut wallpaper =
+            Wallpaper::load_with_properties(gpu, format, &self.assets, path, properties)
+                .with_context(|| format!("loading {}", path.display()))?;
+        wallpaper.set_volume(self.settings.volume as f32 / 100.0);
+        systemd::notify(&[NotifyState::Watchdog]);
+        tracing::info!(
+            "loaded \"{}\" ({}) in {:.1?}",
+            wallpaper.title,
+            path.display(),
+            started.elapsed()
+        );
+        Ok(wallpaper)
+    }
+
+    /// Sound plays from the first screen only.
+    fn apply_audio(&mut self) {
+        let audio = self.settings.audio;
+        for (i, screen) in self.screens.iter_mut().enumerate() {
+            screen.wallpaper.set_audio(audio && i == 0);
+        }
+    }
+
+    /// Put a layer surface showing `saved` on `output`.
+    fn create_screen(&mut self, output: &WlOutput, name: &str, saved: &SavedOutput) -> Result<()> {
+        let qh = self.qh.clone();
+        let info = self
+            .output_state
+            .info(output)
+            .context("output without info")?;
+        tracing::info!(
+            "output {name}: {} {} {:?} scale {}",
+            info.make,
+            info.model,
+            info.logical_size,
+            info.scale_factor
+        );
+
+        let wl_surface = self.compositor.create_surface(&qh);
+        let layer = self.layer_shell.create_layer_surface(
+            &qh,
+            wl_surface,
+            shell_layer(self.settings.layer),
+            Some("wallpaper"),
+            Some(output),
+        );
+        layer.set_anchor(Anchor::TOP | Anchor::BOTTOM | Anchor::LEFT | Anchor::RIGHT);
+        layer.set_exclusive_zone(-1);
+        layer.set_keyboard_interactivity(KeyboardInteractivity::None);
+        let scaling = self
+            .viewporter
+            .as_ref()
+            .and_then(|v| v.get().ok())
+            .zip(self.fractional_manager.as_ref().and_then(|f| f.get().ok()));
+        let (viewport, fractional) = match scaling {
+            Some((viewporter, manager)) => (
+                Some(viewporter.get_viewport(layer.wl_surface(), &qh, ())),
+                Some(manager.get_fractional_scale(layer.wl_surface(), &qh, ())),
+            ),
+            None => (None, None),
+        };
+        // Until the screen exists, failures must not leak the objects.
+        let cleanup = |viewport: Option<WpViewport>, fractional: Option<WpFractionalScaleV1>| {
+            if let Some(v) = viewport {
+                v.destroy();
+            }
+            if let Some(f) = fractional {
+                f.destroy();
+            }
+        };
+
+        let surface = (|| -> Result<_> {
+            let raw_window_handle = RawWindowHandle::Wayland(WaylandWindowHandle::new(
+                NonNull::new(layer.wl_surface().id().as_ptr().cast()).context("null wl_surface")?,
+            ));
+            let raw_display_handle = Display(self.conn.clone()).display_handle()?.as_raw();
+            let instance = match &self.gpu {
+                Some(gpu) => gpu.instance.clone(),
+                None => {
+                    wgpu::Instance::new(wgpu::InstanceDescriptor::new_with_display_handle_from_env(
+                        Box::new(Display(self.conn.clone())),
+                    ))
+                }
+            };
+            // SAFETY: the wl_surface (owned by `layer`) outlives the wgpu
+            // surface: `Screen` drops `surface` first.
+            let surface = unsafe {
+                instance.create_surface_unsafe(wgpu::SurfaceTargetUnsafe::RawHandle {
+                    raw_display_handle: Some(raw_display_handle),
+                    raw_window_handle,
+                })?
+            };
+            if self.gpu.is_none() {
+                self.gpu = Some(pollster::block_on(Gpu::new(instance, Some(&surface)))?);
+            }
+            Ok(surface)
+        })();
+        let surface = match surface {
+            Ok(s) => s,
+            Err(e) => {
+                cleanup(viewport, fractional);
+                return Err(e);
+            }
+        };
+        let gpu = self.gpu.as_ref().unwrap();
+
+        let caps = surface.get_capabilities(&gpu.adapter);
+        let (lw, lh) = info.logical_size.unwrap_or((1920, 1080));
+        let config = caps
+            .formats
+            .iter()
+            .copied()
+            .find(|f| !f.is_srgb())
+            .and_then(|format| {
+                let mut config =
+                    surface.get_default_config(&gpu.adapter, lw.max(1) as u32, lh.max(1) as u32)?;
+                config.format = format;
+                Some(config)
+            });
+        let Some(mut config) = config else {
+            cleanup(viewport, fractional);
+            anyhow::bail!("surface is incompatible with the adapter");
+        };
+        // Frame callbacks pace us; a mailbox never blocks in present (FIFO
+        // can stall the whole loop while a surface is hidden).
+        config.present_mode = if caps.present_modes.contains(&wgpu::PresentMode::Mailbox) {
+            wgpu::PresentMode::Mailbox
+        } else {
+            wgpu::PresentMode::Fifo
+        };
+        if caps.alpha_modes.contains(&wgpu::CompositeAlphaMode::Opaque) {
+            config.alpha_mode = wgpu::CompositeAlphaMode::Opaque;
+        }
+
+        let mut wallpaper =
+            match self.load_wallpaper(config.format, &saved.wallpaper, &saved.property_list()) {
+                Ok(w) => w,
+                Err(e) => {
+                    cleanup(viewport, fractional);
+                    return Err(e);
+                }
+            };
+        let fill = saved.fill.unwrap_or(self.settings.fill);
+        wallpaper.fill = fill_mode(fill);
+        tracing::info!("{name}: playing \"{}\"", wallpaper.title);
+
+        let screen = Screen {
+            surface,
+            config,
+            wallpaper,
+            path: saved.wallpaper.clone(),
+            fractional,
+            viewport,
+            layer,
+            output: output.clone(),
+            name: name.to_owned(),
+            logical: (0, 0),
+            scale120: info.scale_factor.max(1) as u32 * 120,
+            buffer_scale: info.scale_factor.max(1),
+            configured: false,
+            frame_pending: false,
+            timer_pending: false,
+            next_frame: Instant::now(),
+            paused: false,
+            dirty: true,
+            fill,
+            stats: Stats::new(),
+        };
+        screen.set_passthrough(&self.compositor, self.settings.passthrough);
+        // The initial commit, without a buffer; the configure follows.
+        screen.layer.commit();
+        self.screens.push(screen);
+        self.apply_audio();
+        self.update_status();
+        Ok(())
+    }
+
+    /// A new output appeared: show its saved wallpaper (or the last one set).
+    fn add_output(&mut self, output: WlOutput) -> Result<()> {
         let info = self
             .output_state
             .info(&output)
@@ -320,149 +625,41 @@ impl App {
             tracing::info!("skipping output {name} (not --output {wanted})");
             return Ok(());
         }
-        tracing::info!(
-            "output {name}: {} {} {:?} scale {}",
-            info.make,
-            info.model,
-            info.logical_size,
-            info.scale_factor
-        );
-
-        let wl_surface = self.compositor.create_surface(qh);
-        let layer = match self.args.layer {
-            LayerArg::Background => Layer::Background,
-            LayerArg::Bottom => Layer::Bottom,
-        };
-        let layer = self.layer_shell.create_layer_surface(
-            qh,
-            wl_surface,
-            layer,
-            Some("wallpaper"),
-            Some(&output),
-        );
-        layer.set_anchor(Anchor::TOP | Anchor::BOTTOM | Anchor::LEFT | Anchor::RIGHT);
-        layer.set_exclusive_zone(-1);
-        layer.set_keyboard_interactivity(KeyboardInteractivity::None);
-        if self.args.passthrough {
-            let region = Region::new(&self.compositor)?;
-            layer
-                .wl_surface()
-                .set_input_region(Some(region.wl_region()));
-        }
-        let scaling = self
-            .viewporter
-            .as_ref()
-            .and_then(|v| v.get().ok())
-            .zip(self.fractional_manager.as_ref().and_then(|f| f.get().ok()));
-        let (viewport, fractional) = match scaling {
-            Some((viewporter, manager)) => (
-                Some(viewporter.get_viewport(layer.wl_surface(), qh, ())),
-                Some(manager.get_fractional_scale(layer.wl_surface(), qh, ())),
-            ),
-            None => (None, None),
-        };
-
-        let raw_window_handle = RawWindowHandle::Wayland(WaylandWindowHandle::new(
-            NonNull::new(layer.wl_surface().id().as_ptr().cast()).context("null wl_surface")?,
-        ));
-        let raw_display_handle = Display(self.conn.clone()).display_handle()?.as_raw();
-        let instance = match &self.gpu {
-            Some(gpu) => gpu.instance.clone(),
-            None => {
-                wgpu::Instance::new(wgpu::InstanceDescriptor::new_with_display_handle_from_env(
-                    Box::new(Display(self.conn.clone())),
-                ))
-            }
-        };
-        // SAFETY: the wl_surface (owned by `layer`) outlives the wgpu surface:
-        // `Screen` drops `surface` first.
-        let surface = unsafe {
-            instance.create_surface_unsafe(wgpu::SurfaceTargetUnsafe::RawHandle {
-                raw_display_handle: Some(raw_display_handle),
-                raw_window_handle,
-            })?
-        };
-        if self.gpu.is_none() {
-            self.gpu = Some(pollster::block_on(Gpu::new(instance, Some(&surface)))?);
-        }
-        let gpu = self.gpu.as_ref().unwrap();
-
-        let caps = surface.get_capabilities(&gpu.adapter);
-        let format = caps
-            .formats
-            .iter()
-            .copied()
-            .find(|f| !f.is_srgb())
-            .context("surface is incompatible with the adapter")?;
-        let (lw, lh) = info.logical_size.unwrap_or((1920, 1080));
-        let mut config = surface
-            .get_default_config(&gpu.adapter, lw.max(1) as u32, lh.max(1) as u32)
-            .context("surface is incompatible with the adapter")?;
-        config.format = format;
-        // Frame callbacks pace us; a mailbox never blocks in present (FIFO
-        // can stall the whole loop while a surface is hidden).
-        config.present_mode = if caps.present_modes.contains(&wgpu::PresentMode::Mailbox) {
-            wgpu::PresentMode::Mailbox
-        } else {
-            wgpu::PresentMode::Fifo
-        };
-        if caps.alpha_modes.contains(&wgpu::CompositeAlphaMode::Opaque) {
-            config.alpha_mode = wgpu::CompositeAlphaMode::Opaque;
-        }
-
-        let mut wallpaper = Wallpaper::load(gpu, format, &self.assets, &self.args.wallpaper)?;
-        for (name, value) in &self.args.properties {
-            wallpaper.set_user_property(gpu, name, value.clone());
-        }
-        wallpaper.fill = self.args.fill.into();
-        // One sound source is enough when the wallpaper spans several outputs.
-        let audio = self.args.audio && self.screens.is_empty();
-        wallpaper.set_audio(audio);
-        tracing::info!("{name}: playing \"{}\"", wallpaper.title);
-
-        // The initial commit, without a buffer; the configure follows.
-        layer.commit();
-        self.screens.push(Screen {
-            surface,
-            config,
-            wallpaper,
-            fractional,
-            viewport,
-            layer,
-            output,
-            name,
-            logical: (0, 0),
-            scale120: info.scale_factor.max(1) as u32 * 120,
-            buffer_scale: info.scale_factor.max(1),
-            configured: false,
-            frame_pending: false,
-            timer_pending: false,
-            next_frame: Instant::now(),
-            stats: self.args.stats.then(|| Stats {
-                since: Instant::now(),
-                frames: 0,
-            }),
+        self.outputs.push(KnownOutput {
+            output: output.clone(),
+            name: name.clone(),
         });
-        Ok(())
+        match self.state.for_output(&name).cloned() {
+            Some(saved) => self.create_screen(&output, &name, &saved),
+            None => {
+                tracing::info!("output {name}: no wallpaper set");
+                Ok(())
+            }
+        }
     }
 
-    /// Draw the screen now, or arm a timer for when `--fps` allows it.
-    fn schedule(&mut self, qh: &QueueHandle<Self>, index: usize) {
+    /// Draw the screen now, or arm a timer for when the frame rate cap
+    /// allows it.
+    fn schedule(&mut self, index: usize) {
         let Some(gpu) = &self.gpu else { return };
+        let qh = &self.qh;
         let screen = &mut self.screens[index];
         if !screen.configured || screen.frame_pending || screen.timer_pending {
             return;
         }
+        if screen.paused && !screen.dirty {
+            return;
+        }
         let now = Instant::now();
-        if self.args.fps > 0 && screen.next_frame > now {
+        let fps = self.settings.fps;
+        if fps > 0 && screen.next_frame > now {
             screen.timer_pending = true;
             let surface = screen.layer.wl_surface().clone();
-            let qh = qh.clone();
             let timer = Timer::from_deadline(screen.next_frame);
             let inserted = self.loop_handle.insert_source(timer, move |_, _, app| {
                 if let Some(i) = app.screen_index(&surface) {
                     app.screens[i].timer_pending = false;
-                    app.schedule(&qh, i);
+                    app.schedule(i);
                 }
                 TimeoutAction::Drop
             });
@@ -472,35 +669,73 @@ impl App {
             }
             return;
         }
-        if self.args.fps > 0 {
-            let interval = Duration::from_secs_f64(1.0 / self.args.fps as f64);
+        if fps > 0 {
+            let interval = Duration::from_secs_f64(1.0 / fps as f64);
             screen.next_frame = screen.next_frame.max(now - interval) + interval;
         }
-        if !screen.draw(gpu, qh) {
+        if !screen.draw(gpu, qh, self.args.stats) {
             // Retry shortly; nothing will call back otherwise.
             screen.timer_pending = true;
             let surface = screen.layer.wl_surface().clone();
-            let qh = qh.clone();
             let timer = Timer::from_duration(Duration::from_millis(100));
             let _ = self.loop_handle.insert_source(timer, move |_, _, app| {
                 if let Some(i) = app.screen_index(&surface) {
                     app.screens[i].timer_pending = false;
-                    app.schedule(&qh, i);
+                    app.schedule(i);
                 }
                 TimeoutAction::Drop
             });
+            return;
+        }
+        if !self.ready {
+            self.ready = true;
+            self.update_status();
+            systemd::notify(&[NotifyState::Ready]);
+            tracing::info!("ready");
         }
     }
 
-    fn rescale(&mut self, qh: &QueueHandle<Self>, index: usize) {
+    fn schedule_all(&mut self) {
+        for i in 0..self.screens.len() {
+            self.schedule(i);
+        }
+    }
+
+    fn rescale(&mut self, index: usize) {
         if let Some(gpu) = &self.gpu {
             let screen = &mut self.screens[index];
             if screen.configured {
                 screen.reconfigure(gpu);
-                self.schedule(qh, index);
+                self.schedule(index);
             }
         }
     }
+
+    /// Tell systemd what is playing where.
+    fn update_status(&self) {
+        let text = if self.screens.is_empty() {
+            "No wallpaper".to_owned()
+        } else {
+            self.screens
+                .iter()
+                .map(|s| {
+                    let paused = if s.paused { " (paused)" } else { "" };
+                    format!("{}: {}{paused}", s.name, s.wallpaper.title)
+                })
+                .collect::<Vec<_>>()
+                .join(", ")
+        };
+        systemd::status(&text);
+    }
+}
+
+/// A pipe that signal handlers write to, watched by the loop.
+fn signal_pipe(signals: &[i32]) -> Result<UnixStream> {
+    let (rx, tx) = UnixStream::pair()?;
+    for &signal in signals {
+        signal_hook::low_level::pipe::register(signal, tx.try_clone()?)?;
+    }
+    Ok(rx)
 }
 
 fn main() -> Result<()> {
@@ -514,27 +749,54 @@ fn main() -> Result<()> {
     let assets = args
         .assets
         .clone()
-        .or_else(default_assets_dir)
+        .or_else(wpe_runtime::steam::default_assets_dir)
         .context("Wallpaper Engine assets directory not found; pass --assets")?;
+
+    let config_path = state::config_path();
+    let config = match &config_path {
+        Some(path) => state::load_config(path).unwrap_or_else(|e| {
+            tracing::warn!("{e:#}; using the default settings");
+            Settings::default()
+        }),
+        None => Settings::default(),
+    };
+    let state_path = state::state_path();
+    let mut state = state_path.as_deref().map(State::load).unwrap_or_default();
+    let cli = args.overrides();
+    let settings = state::startup_settings(&config, &state, &cli);
+    if let Some(spec) = &args.wallpaper {
+        let path = wpe_runtime::steam::resolve_wallpaper(spec).map_err(anyhow::Error::msg)?;
+        let path = path.canonicalize().unwrap_or(path);
+        let mut saved = SavedOutput::new(path);
+        saved.properties = args.properties.iter().cloned().collect();
+        state.set_everywhere(saved);
+        if let Some(path) = &state_path
+            && let Err(e) = state.save(path)
+        {
+            tracing::warn!("cannot save the state: {e:#}");
+        }
+    } else if !args.properties.is_empty() {
+        tracing::warn!("--property only applies to a wallpaper given on the command line");
+    }
+
+    // Before touching the display, so a second daemon stops right here.
+    let socket_path = args.socket.clone().or_else(wpe_ipc::socket_path);
+    let socket = control::listen(socket_path.as_deref())?;
 
     let conn = Connection::connect_to_env().context("cannot connect to a Wayland compositor")?;
     let (globals, queue) = registry_queue_init::<App>(&conn)?;
     let qh = queue.handle();
     let mut event_loop: EventLoop<'static, App> = EventLoop::try_new()?;
-    WaylandSource::new(conn.clone(), queue)
-        .insert(event_loop.handle())
-        .map_err(|e| anyhow::anyhow!("cannot watch the Wayland socket: {}", e.error))?;
+    let mut wayland = WaylandSource::new(conn.clone(), queue);
 
-    // SIGINT/SIGTERM write to a socket the loop watches, so the surfaces
-    // are torn down in order.
-    let (signal_rx, signal_tx) = UnixStream::pair()?;
-    for signal in [signal_hook::consts::SIGINT, signal_hook::consts::SIGTERM] {
-        signal_hook::low_level::pipe::register(signal, signal_tx.try_clone()?)?;
-    }
+    // Signals write to sockets the loop watches, so the surfaces are torn
+    // down in order (SIGINT/SIGTERM) and settings reload between frames
+    // (SIGHUP).
+    let exit_rx = signal_pipe(&[signal_hook::consts::SIGINT, signal_hook::consts::SIGTERM])?;
     event_loop
         .handle()
         .insert_source(
-            Generic::new(signal_rx, Interest::READ, Mode::Level),
+            Generic::new(exit_rx, Interest::READ, Mode::Level),
             |_, _, app| {
                 tracing::info!("signal received, exiting");
                 app.exit = true;
@@ -542,6 +804,38 @@ fn main() -> Result<()> {
             },
         )
         .map_err(|e| anyhow::anyhow!("cannot watch signals: {}", e.error))?;
+    let hup_rx = signal_pipe(&[signal_hook::consts::SIGHUP])?;
+    event_loop
+        .handle()
+        .insert_source(
+            Generic::new(hup_rx, Interest::READ, Mode::Level),
+            |_, rx, app| {
+                let mut buf = [0u8; 64];
+                let _ = (&**rx).read(&mut buf);
+                tracing::info!("SIGHUP: reloading the settings");
+                systemd::notify(&[NotifyState::Reloading]);
+                if let Err(e) = app.reload_settings() {
+                    tracing::error!("{e}");
+                }
+                systemd::notify(&[NotifyState::Ready]);
+                Ok(PostAction::Continue)
+            },
+        )
+        .map_err(|e| anyhow::anyhow!("cannot watch signals: {}", e.error))?;
+    systemd::start_watchdog(&event_loop.handle());
+    // Nothing to render (no wallpaper yet, no outputs): up all the same.
+    event_loop
+        .handle()
+        .insert_source(Timer::from_duration(Duration::from_secs(2)), |_, _, app| {
+            if !app.ready && app.screens.is_empty() {
+                app.ready = true;
+                app.update_status();
+                systemd::notify(&[NotifyState::Ready]);
+                tracing::info!("ready, with no wallpaper showing");
+            }
+            TimeoutAction::Drop
+        })
+        .map_err(|e| anyhow::anyhow!("cannot arm a timer: {e}"))?;
 
     let compositor = CompositorState::bind(&globals, &qh).context("wl_compositor missing")?;
     let layer_shell = LayerShell::bind(&globals, &qh)
@@ -552,6 +846,7 @@ fn main() -> Result<()> {
         args,
         assets,
         conn: conn.clone(),
+        qh: qh.clone(),
         loop_handle: event_loop.handle(),
         registry_state: RegistryState::new(&globals),
         output_state: OutputState::new(&globals, &qh),
@@ -561,15 +856,33 @@ fn main() -> Result<()> {
         viewporter,
         fractional_manager,
         pointers: Vec::new(),
+        outputs: Vec::new(),
         screens: Vec::new(),
         gpu: None,
+        settings,
+        cli,
+        config_path,
+        state,
+        state_path,
+        ready: false,
         exit: false,
         error: None,
     };
 
+    // Learn the outputs and load their wallpapers before answering anyone,
+    // so the first request (the one that socket-activated us) sees them.
+    for _ in 0..2 {
+        wayland.queue().roundtrip(&mut app)?;
+    }
+    wayland
+        .insert(event_loop.handle())
+        .map_err(|e| anyhow::anyhow!("cannot watch the Wayland socket: {}", e.error))?;
+    let _socket = control::serve(socket, &event_loop.handle())?;
+
     while !app.exit {
         event_loop.dispatch(None, &mut app)?;
     }
+    systemd::notify(&[NotifyState::Stopping]);
     app.screens.clear();
     let _ = conn.flush();
     app.error.map_or(Ok(()), Err)
@@ -579,7 +892,7 @@ impl CompositorHandler for App {
     fn scale_factor_changed(
         &mut self,
         _: &Connection,
-        qh: &QueueHandle<Self>,
+        _: &QueueHandle<Self>,
         surface: &WlSurface,
         factor: i32,
     ) {
@@ -587,7 +900,7 @@ impl CompositorHandler for App {
             && self.screens[i].viewport.is_none()
         {
             self.screens[i].buffer_scale = factor;
-            self.rescale(qh, i);
+            self.rescale(i);
         }
     }
 
@@ -600,10 +913,10 @@ impl CompositorHandler for App {
     ) {
     }
 
-    fn frame(&mut self, _: &Connection, qh: &QueueHandle<Self>, surface: &WlSurface, _: u32) {
+    fn frame(&mut self, _: &Connection, _: &QueueHandle<Self>, surface: &WlSurface, _: u32) {
         if let Some(i) = self.screen_index(surface) {
             self.screens[i].frame_pending = false;
-            self.schedule(qh, i);
+            self.schedule(i);
         }
     }
 
@@ -631,23 +944,33 @@ impl OutputHandler for App {
         &mut self.output_state
     }
 
-    fn new_output(&mut self, _: &Connection, qh: &QueueHandle<Self>, output: WlOutput) {
-        if let Err(e) = self.add_output(qh, output) {
-            self.error = Some(e);
-            self.exit = true;
+    fn new_output(&mut self, _: &Connection, _: &QueueHandle<Self>, output: WlOutput) {
+        if let Err(e) = self.add_output(output) {
+            // A wallpaper named on the command line that doesn't load is
+            // fatal at startup, as before; later, the output stays empty.
+            if self.args.wallpaper.is_some() && !self.ready {
+                self.error = Some(e);
+                self.exit = true;
+            } else {
+                tracing::error!("{e:#}");
+            }
         }
     }
 
     fn update_output(&mut self, _: &Connection, _: &QueueHandle<Self>, _: WlOutput) {}
 
     fn output_destroyed(&mut self, _: &Connection, _: &QueueHandle<Self>, output: WlOutput) {
-        self.screens.retain(|s| {
-            let keep = s.output != output;
+        self.outputs.retain(|o| {
+            let keep = o.output != output;
             if !keep {
-                tracing::info!("output {} removed", s.name);
+                tracing::info!("output {} removed", o.name);
             }
             keep
         });
+        self.screens.retain(|s| s.output != output);
+        // Sound moves to the new first screen.
+        self.apply_audio();
+        self.update_status();
     }
 }
 
@@ -655,12 +978,14 @@ impl LayerShellHandler for App {
     fn closed(&mut self, _: &Connection, _: &QueueHandle<Self>, layer: &LayerSurface) {
         self.screens
             .retain(|s| s.layer.wl_surface() != layer.wl_surface());
+        self.apply_audio();
+        self.update_status();
     }
 
     fn configure(
         &mut self,
         _: &Connection,
-        qh: &QueueHandle<Self>,
+        _: &QueueHandle<Self>,
         layer: &LayerSurface,
         configure: LayerSurfaceConfigure,
         _: u32,
@@ -681,7 +1006,7 @@ impl LayerShellHandler for App {
         }
         screen.logical = (w, h);
         screen.reconfigure(gpu);
-        self.schedule(qh, i);
+        self.schedule(i);
     }
 }
 
@@ -770,7 +1095,7 @@ impl Dispatch<WpFractionalScaleV1, ()> for App {
         event: wp_fractional_scale_v1::Event,
         _: &(),
         _: &Connection,
-        qh: &QueueHandle<Self>,
+        _: &QueueHandle<Self>,
     ) {
         if let wp_fractional_scale_v1::Event::PreferredScale { scale } = event
             && let Some(i) = app
@@ -779,7 +1104,7 @@ impl Dispatch<WpFractionalScaleV1, ()> for App {
                 .position(|s| s.fractional.as_ref() == Some(proxy))
         {
             app.screens[i].scale120 = scale;
-            app.rescale(qh, i);
+            app.rescale(i);
         }
     }
 }

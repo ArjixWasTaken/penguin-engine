@@ -1,0 +1,28 @@
+[Unit]
+Description=Wallpaper Engine desktop wallpaper (Wayland layer-shell)
+PartOf=graphical-session.target
+After=graphical-session.target
+# plasmashell, so the wallpaper maps above Plasma's own desktop window.
+After=plasma-plasmashell.service
+Requires=wallpaper-engine-rs.socket
+After=wallpaper-engine-rs.socket
+
+[Service]
+Type=notify
+NotifyAccess=main
+# Without a wallpaper argument the daemon restores the saved wallpapers; it
+# reads ~/.config/wallpaper-engine-rs/config.toml. Adjust the path to where
+# the binary is installed (cargo install --path apps/wallpaper puts it in
+# ~/.cargo/bin).
+ExecStart=%h/.cargo/bin/wallpaper
+ExecReload=kill -HUP $MAINPID
+Restart=on-failure
+RestartSec=2
+# Loading a heavy scene compiles its shaders before the first frame.
+TimeoutStartSec=120
+# The loop pings at half this; loading a wallpaper blocks it for a while.
+WatchdogSec=60
+Slice=app-graphical.slice
+
+[Install]
+WantedBy=graphical-session.target

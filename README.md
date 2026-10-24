@@ -54,7 +54,8 @@ GLSL/HLSL dialect to SPIR-V and run through wgpu:
     changes (`Wallpaper::set_user_property`, `scene-viewer --property name=value`),
     `openUserShortcut` (only shortcuts the user bound), `applyGeneralSettings`
 
-`wallpaper` plays them as the desktop background on Wayland (wlr-layer-shell). Not yet: the
+`wallpaper` plays them as the desktop background on Wayland (wlr-layer-shell), controlled at
+runtime over a Unix socket (`wallpaperctl`) and run as a systemd user service. Not yet: the
 wallpaper picker UI and X11 desktops.
 
 Debugging aids: `WPE_SCRIPT_AUDIT=<file>` records script requests the runtime doesn't
@@ -76,14 +77,18 @@ frames (with clicks) before a `--screenshot`.
 | `crates/wpe-script` | SceneScript runtime (QuickJS) |
 | `crates/wpe-audio` | Sound playback and audio spectrum |
 | `crates/wpe-runtime` | Embeddable API tying loading, animation and rendering together |
+| `crates/wpe-ipc` | The `wallpaper` daemon's control protocol (requests, responses, client) |
 | `apps/scene-viewer` | Windowed scene viewer |
-| `apps/wallpaper` | Desktop background mode (Wayland layer-shell) |
+| `apps/wallpaper` | Desktop background mode (Wayland layer-shell), control socket, systemd |
+| `apps/wallpaperctl` | Command-line client of the `wallpaper` daemon |
+| `systemd/` | systemd user units for `wallpaper` |
 | `tools/wpe-cli` | Debug tooling (pkg/tex/scene/shader corpus scans) |
 
 ## Scene viewer
 
 ```sh
 cargo run --release -p scene-viewer -- ~/.local/share/Steam/steamapps/workshop/content/431960/<id>
+cargo run --release -p scene-viewer -- <workshop id>
 cargo run --release -p scene-viewer -- <wallpaper> --screenshot out.png --size 1920x1080 --time 2.5
 cargo run --release -p scene-viewer -- <wallpaper> --audio --fps 30 --stats
 ```
@@ -121,6 +126,94 @@ linux-wallpaperengine users disable the desktop icons (the "Desktop" layout) and
 rules, and the usual recommendation is a Plasma wallpaper plugin (e.g.
 [wallpaper-engine-kde-plugin](https://github.com/catsout/wallpaper-engine-kde-plugin)),
 which renders inside plasmashell instead.
+
+### Control socket
+
+The daemon listens on `$XDG_RUNTIME_DIR/wallpaper-engine-rs.sock` (`--socket` to change it).
+`wallpaperctl` talks to it:
+
+```sh
+wallpaperctl status                        # outputs, wallpapers, fps, settings
+wallpaperctl set 3566329932                # a workshop id or a path, on every output
+wallpaperctl set --output DP-1 ~/walls/foo # one output
+wallpaperctl properties                    # user properties, with types, ranges, options
+wallpaperctl property sakura false         # value as JSON, or else a string
+wallpaperctl pause | resume                # [--output X]
+wallpaperctl audio on|off ; wallpaperctl volume 40 ; wallpaperctl fps 30
+wallpaperctl fill fit                      # [--output X] crop | fit | stretch
+wallpaperctl reload                        # re-read config.toml (as SIGHUP does)
+wallpaperctl quit
+wallpaperctl --json status                 # the raw response
+```
+
+The protocol (`crates/wpe-ipc`) is line-delimited JSON: one request object per line, tagged
+by `cmd`, and one response per line, in order. Any number of clients can be connected.
+
+```text
+> {"cmd":"status"}
+< {"ok":true,"status":{"settings":{"fps":0,"audio":false,"volume":100,"fill":"crop","layer":"background","passthrough":true},"outputs":[{"name":"DP-3","width":1920,"height":1080,"scale":1.0,"wallpaper":{"path":".../431960/3566329932","workshop_id":"3566329932","title":"Frieren ...","type":"scene"},"paused":false,"fps":106.2,"fill":"crop"}]}}
+> {"cmd":"set","output":"DP-3","wallpaper":"3717623935"}
+< {"ok":true}
+> {"cmd":"property","name":"clock","value":false}
+< {"ok":true}
+> {"cmd":"properties"}
+< {"ok":true,"properties":[{"output":"DP-3","wallpaper":"...","properties":[{"name":"musicvisualizer","type":"slider","text":"Music Visualizer","value":1,"default":1,"min":0.0,"max":1.0,"order":104.0}, ...]}]}
+> {"cmd":"volume","volume":150}
+< {"ok":false,"error":"volume 150 is out of 0..=100"}
+```
+
+Requests: `status`, `set` {`output`?, `wallpaper`}, `properties` {`output`?}, `property`
+{`output`?, `name`, `value`}, `pause` / `resume` {`output`?}, `audio` {`enabled`}, `volume`
+{`volume`}, `fps` {`fps`}, `fill` {`output`?, `fill`}, `reload-settings`, `quit`. Without
+`output` a request applies to every output. A wallpaper that fails to load is reported and the
+old one stays.
+
+### State and settings
+
+What is shown where is saved to `$XDG_STATE_HOME/wallpaper-engine-rs/state.json`
+(`~/.local/state/...`): each output's wallpaper, its changed user properties and fill mode,
+and the wallpaper set last, which new outputs get. Started without a wallpaper argument,
+`wallpaper` restores it (outputs are matched by name); a wallpaper on the command line is shown
+on every output and saved.
+
+Settings live in `$XDG_CONFIG_HOME/wallpaper-engine-rs/config.toml` (all optional):
+
+```toml
+fps = 0              # frame rate cap, 0 = follow the display
+audio = false
+volume = 100         # percent
+fill = "crop"        # crop | fit | stretch
+layer = "background" # background | bottom
+passthrough = false
+```
+
+Command-line flags win over it. Settings changed over the socket are saved in the state and win
+over the file until the next reload (`wallpaperctl reload`, SIGHUP, `systemctl --user reload`),
+which makes the file (and the flags) authoritative again. Everything except the layer on very
+old compositors is applied live.
+
+### systemd
+
+`systemd/` has user units: `wallpaper-engine-rs.socket` (the control socket, so `wallpaperctl`
+starts the daemon on demand) and `wallpaper-engine-rs.service` (`Type=notify`: ready once the
+outputs render, a status line with what plays where, a watchdog, `ExecReload` sends SIGHUP).
+Both are part of `graphical-session.target`, which KDE Plasma, GNOME and systemd-managed
+sway/Hyprland sessions start.
+
+```sh
+cargo install --path apps/wallpaper && cargo install --path apps/wallpaperctl
+wallpaper 3566329932   # once, to pick a wallpaper (Ctrl-C), or later: wallpaperctl set ...
+systemctl --user link $PWD/systemd/wallpaper-engine-rs.socket $PWD/systemd/wallpaper-engine-rs.service
+systemctl --user enable --now wallpaper-engine-rs.socket wallpaper-engine-rs.service
+systemctl --user status wallpaper-engine-rs   # Status: "DP-1: <title>"
+journalctl --user -u wallpaper-engine-rs
+```
+
+`ExecStart` points at `~/.cargo/bin/wallpaper`; edit it (`systemctl --user edit --full
+wallpaper-engine-rs.service`) to pass flags or use another path. The session's
+`WAYLAND_DISPLAY` must be in the user manager's environment (Plasma and most compositors
+import it). To uninstall: `systemctl --user disable --now wallpaper-engine-rs.socket
+wallpaper-engine-rs.service`.
 
 ## Tools
 

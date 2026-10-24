@@ -36,6 +36,9 @@ struct SoundLayer {
 pub struct Sounds {
     layers: Vec<SoundLayer>,
     output: Option<(SoundOutput, HashMap<i32, TrackId>)>,
+    /// Master volume, scaling every layer's.
+    master: f32,
+    paused: bool,
 }
 
 impl Sounds {
@@ -79,6 +82,8 @@ impl Sounds {
         Self {
             layers,
             output: None,
+            master: 1.0,
+            paused: false,
         }
     }
 
@@ -105,7 +110,13 @@ impl Sounds {
         };
         let mut tracks = HashMap::new();
         for l in &self.layers {
-            match out.add(l.files.clone(), l.state.volume, l.mode, l.state.playing) {
+            let playing = l.state.playing && !self.paused;
+            match out.add(
+                l.files.clone(),
+                l.state.volume * self.master,
+                l.mode,
+                playing,
+            ) {
                 Ok(track) => {
                     tracks.insert(l.id, track);
                 }
@@ -131,6 +142,7 @@ impl Sounds {
             return;
         };
         match command {
+            SoundCommand::Play if self.paused => {}
             SoundCommand::Play => {
                 if let Err(e) = out.resume(track) {
                     tracing::warn!("sound layer {id}: {e}");
@@ -138,7 +150,39 @@ impl Sounds {
             }
             SoundCommand::Pause => out.pause(track),
             SoundCommand::Stop => out.stop(track),
-            SoundCommand::Volume(v) => out.set_volume(track, v),
+            SoundCommand::Volume(v) => out.set_volume(track, v * self.master),
+        }
+    }
+
+    /// Scale every layer's volume by `master`.
+    pub fn set_master(&mut self, master: f32) {
+        self.master = master;
+        if let Some((out, tracks)) = &self.output {
+            for l in &self.layers {
+                if let Some(&track) = tracks.get(&l.id) {
+                    out.set_volume(track, l.state.volume * master);
+                }
+            }
+        }
+    }
+
+    /// Pause every layer, or resume the ones that are playing.
+    pub fn set_paused(&mut self, paused: bool) {
+        self.paused = paused;
+        let Some((out, tracks)) = &self.output else {
+            return;
+        };
+        for l in &self.layers {
+            let Some(&track) = tracks.get(&l.id) else {
+                continue;
+            };
+            if paused {
+                out.pause(track);
+            } else if l.state.playing
+                && let Err(e) = out.resume(track)
+            {
+                tracing::warn!("sound layer {}: {e}", l.id);
+            }
         }
     }
 }

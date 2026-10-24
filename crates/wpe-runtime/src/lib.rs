@@ -10,6 +10,7 @@ mod model_data;
 mod script;
 mod shadow;
 mod sound;
+pub mod steam;
 mod storage;
 mod video;
 mod video_wallpaper;
@@ -28,6 +29,7 @@ use frame::{FrameBuilder, FrameCache};
 
 pub use files::{LoadError, WallpaperFiles};
 pub use material::{SlotTexture, TextureStore};
+pub use wpe_assets::project::{Project, PropertyOption, UserProperty};
 pub use wpe_scene::FillMode;
 
 pub(crate) fn rgba_texture(width: u32, height: u32, pixels: Vec<u8>) -> Texture {
@@ -204,6 +206,14 @@ pub struct Wallpaper {
     /// Spectrum of the latest audio frame, for scripts.
     spectrum: Option<wpe_audio::AudioSpectrum>,
     start: Instant,
+    /// When the wallpaper was paused, freezing its clock.
+    paused_at: Option<Instant>,
+    /// Videos playing when the wallpaper was paused, to resume them.
+    paused_videos: Vec<Arc<video::VideoStream>>,
+    /// Master volume of sound layers and a video wallpaper's sound, 0..1.
+    volume: f32,
+    /// `project.json`.
+    project: wpe_assets::Project,
     /// Smoothed cursor over the output, 0..1 with Y down.
     pointer: Vec2,
     /// Where the cursor actually is.
@@ -241,7 +251,24 @@ impl Wallpaper {
         assets: &Path,
         path: &Path,
     ) -> Result<Self, LoadError> {
+        Self::load_with_properties(gpu, output_format, assets, path, &[])
+    }
+
+    /// [`Self::load`] with user properties set to `properties` (name and
+    /// value) from the start, as if `project.json` declared those values.
+    pub fn load_with_properties(
+        gpu: &Gpu,
+        output_format: wgpu::TextureFormat,
+        assets: &Path,
+        path: &Path,
+        properties: &[(String, serde_json::Value)],
+    ) -> Result<Self, LoadError> {
         let mut files = WallpaperFiles::open_with_assets_dir(assets, path)?;
+        for (name, value) in properties {
+            if let Some(p) = files.project.general.properties.get_mut(name) {
+                p.value = value.clone();
+            }
+        }
         let props = wpe_scene::UserProperties::from_project(&files.project);
         let mut store = TextureStore::default();
         let video_wallpaper = files.video.is_some();
@@ -281,6 +308,10 @@ impl Wallpaper {
             scripts: None,
             spectrum: None,
             start: Instant::now(),
+            paused_at: None,
+            paused_videos: Vec::new(),
+            volume: 1.0,
+            project: files.project.clone(),
             pointer: Vec2::splat(0.5),
             pointer_target: Vec2::splat(0.5),
             last_frame: None,
@@ -568,6 +599,65 @@ impl Wallpaper {
         }
     }
 
+    /// `project.json` of the wallpaper.
+    pub fn project(&self) -> &wpe_assets::Project {
+        &self.project
+    }
+
+    /// Whether this is a video wallpaper (rather than a scene).
+    pub fn is_video(&self) -> bool {
+        self.video_wallpaper
+    }
+
+    /// The current value of user property `name`.
+    pub fn user_property(&self, name: &str) -> Option<&serde_json::Value> {
+        self.props.get(name)
+    }
+
+    /// Seconds since the wallpaper started, not counting time paused.
+    fn clock_time(&self) -> f32 {
+        let now = self.paused_at.unwrap_or_else(Instant::now);
+        (now - self.start).as_secs_f32()
+    }
+
+    pub fn paused(&self) -> bool {
+        self.paused_at.is_some()
+    }
+
+    /// Freeze or unfreeze the wallpaper: its clock (animations, scripts'
+    /// time), videos and sound layers. A paused wallpaper still renders, the
+    /// same frame each time.
+    pub fn set_paused(&mut self, paused: bool) {
+        if paused == self.paused() {
+            return;
+        }
+        if paused {
+            self.paused_at = Some(Instant::now());
+            self.paused_videos = self
+                .videos()
+                .iter()
+                .filter(|(_, stream)| stream.is_playing())
+                .map(|(_, stream)| stream.clone())
+                .collect();
+            for stream in &self.paused_videos {
+                stream.set_paused(true);
+            }
+        } else if let Some(at) = self.paused_at.take() {
+            self.start += at.elapsed();
+            for stream in self.paused_videos.drain(..) {
+                stream.set_paused(false);
+            }
+        }
+        self.sounds.set_paused(paused);
+    }
+
+    /// Master volume (0..1) of the sound layers and a video wallpaper's sound.
+    pub fn set_volume(&mut self, volume: f32) {
+        self.volume = volume.clamp(0.0, 1.0);
+        self.sounds.set_master(self.volume);
+        self.apply_video_audio();
+    }
+
     /// Start or stop audio: playing the wallpaper's sound layers and
     /// analysing system audio for audio-reactive shaders.
     pub fn set_audio(&mut self, enabled: bool) {
@@ -612,7 +702,7 @@ impl Wallpaper {
     fn apply_video_audio(&self) {
         if self.video_wallpaper {
             for (_, stream) in self.videos() {
-                stream.set_audio(self.audio_enabled.then_some(1.0));
+                stream.set_audio(self.audio_enabled.then_some(self.volume));
             }
         }
     }
@@ -736,9 +826,7 @@ impl Wallpaper {
 
     /// Move the perspective camera along its camera paths to this frame's time.
     fn advance_camera_path(&mut self) {
-        let time = self
-            .time_override
-            .unwrap_or_else(|| self.start.elapsed().as_secs_f32());
+        let time = self.time_override.unwrap_or_else(|| self.clock_time());
         if let Some(player) = &mut self.camera_paths {
             let dt = self.camera_path_time.map_or(time, |last| time - last);
             self.camera_path_time = Some(time);
@@ -759,9 +847,7 @@ impl Wallpaper {
     fn globals(&self, size: (u32, u32)) -> FrameGlobals {
         let now = chrono::Local::now().time();
         let centred = Vec2::new(self.pointer.x - 0.5, 0.5 - self.pointer.y);
-        let time = self
-            .time_override
-            .unwrap_or_else(|| self.start.elapsed().as_secs_f32());
+        let time = self.time_override.unwrap_or_else(|| self.clock_time());
         let mut camera = self.camera;
         let script_camera = self.scripts.as_ref().and_then(|s| s.camera());
         if let Some((_, zoom)) = script_camera {
