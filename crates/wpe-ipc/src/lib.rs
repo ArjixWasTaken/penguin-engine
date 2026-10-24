@@ -53,8 +53,11 @@ pub fn socket_path() -> Option<PathBuf> {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum Fill {
-    /// Cover the output, cutting off what doesn't fit.
+    /// Crop, but fit a wallpaper whose orientation differs from the
+    /// output's (portrait on landscape), as Wallpaper Engine does.
     #[default]
+    Auto,
+    /// Cover the output, cutting off what doesn't fit.
     Crop,
     /// Show all of it, with bars.
     Fit,
@@ -98,7 +101,12 @@ macro_rules! names {
     };
 }
 
-names!(Fill { Crop = "crop", Fit = "fit", Stretch = "stretch" });
+names!(Fill {
+    Auto = "auto",
+    Crop = "crop",
+    Fit = "fit",
+    Stretch = "stretch"
+});
 names!(Layer {
     Background = "background",
     Bottom = "bottom"
@@ -160,7 +168,7 @@ impl Default for Settings {
             fps: 0,
             audio: false,
             volume: 100,
-            fill: Fill::Crop,
+            fill: Fill::Auto,
             layer: Layer::Background,
             passthrough: false,
         }

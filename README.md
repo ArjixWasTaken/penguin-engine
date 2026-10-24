@@ -170,7 +170,7 @@ wallpaperctl reset-properties              # back to the wallpaper's (or preset'
 wallpaperctl set --prop speed=2 3566329932 # load with property values
 wallpaperctl pause | resume                # [--output X]
 wallpaperctl audio on|off ; wallpaperctl volume 40 ; wallpaperctl fps 30
-wallpaperctl fill fit                      # [--output X] crop | fit | stretch
+wallpaperctl fill fit                      # [--output X] auto | crop | fit | stretch
 wallpaperctl reload                        # re-read config.toml (as SIGHUP does)
 wallpaperctl quit
 wallpaperctl version                       # daemon version, protocol, features (web)
@@ -250,7 +250,7 @@ Settings live in `$XDG_CONFIG_HOME/wallpaper-engine-rs/config.toml` (all optiona
 fps = 0              # frame rate cap, 0 = follow the display
 audio = false
 volume = 100         # percent
-fill = "crop"        # crop | fit | stretch
+fill = "auto"        # auto | crop | fit | stretch
 layer = "background" # background | bottom
 passthrough = false
 ```

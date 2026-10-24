@@ -28,7 +28,7 @@ struct Args {
     /// Output size for --screenshot, or the initial window size.
     #[arg(long, default_value = "1920x1080", value_parser = parse_size)]
     size: (u32, u32),
-    #[arg(long, value_enum, default_value_t = Fill::Crop)]
+    #[arg(long, value_enum, default_value_t = Fill::Auto)]
     fill: Fill,
     /// Scene time in seconds for --screenshot.
     #[arg(long, default_value_t = 0.0)]
@@ -60,6 +60,7 @@ fn parse_property(s: &str) -> Result<(String, serde_json::Value), String> {
 
 #[derive(Clone, Copy, clap::ValueEnum)]
 enum Fill {
+    Auto,
     Crop,
     Fit,
     Stretch,
@@ -68,6 +69,7 @@ enum Fill {
 impl From<Fill> for FillMode {
     fn from(f: Fill) -> Self {
         match f {
+            Fill::Auto => FillMode::Auto,
             Fill::Crop => FillMode::Crop,
             Fill::Fit => FillMode::Fit,
             Fill::Stretch => FillMode::Stretch,

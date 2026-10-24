@@ -78,7 +78,8 @@ enum Command {
     },
     /// Frame rate cap (0 follows the display).
     Fps { fps: u32 },
-    /// How wallpapers fill the outputs: crop, fit or stretch.
+    /// How wallpapers fill the outputs: auto (crop, but fit a portrait
+    /// wallpaper on a landscape output and the reverse), crop, fit or stretch.
     Fill {
         #[arg(long)]
         output: Option<String>,

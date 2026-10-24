@@ -92,7 +92,8 @@ struct Args {
     /// Wallpaper Engine's stock assets directory.
     #[arg(long)]
     assets: Option<PathBuf>,
-    /// How the wallpaper fills the output: crop, fit or stretch.
+    /// How the wallpaper fills the output: auto (crop, but fit a portrait
+    /// wallpaper on a landscape output and the reverse), crop, fit or stretch.
     #[arg(long)]
     fill: Option<Fill>,
     /// Layer-shell layer: background (default) or bottom. On KDE Plasma
@@ -152,6 +153,7 @@ fn parse_property(s: &str) -> Result<(String, serde_json::Value), String> {
 
 fn fill_mode(fill: Fill) -> FillMode {
     match fill {
+        Fill::Auto => FillMode::Auto,
         Fill::Crop => FillMode::Crop,
         Fill::Fit => FillMode::Fit,
         Fill::Stretch => FillMode::Stretch,

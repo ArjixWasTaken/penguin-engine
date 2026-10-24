@@ -8,8 +8,23 @@ pub enum FillMode {
     /// Show the whole scene, letterboxed.
     Fit,
     /// Fill the output, cropping the scene.
-    #[default]
     Crop,
+    /// As Wallpaper Engine does: crop, but fit a scene whose orientation
+    /// differs from the output's (a portrait scene on a landscape output),
+    /// which cropping would cut down to a strip.
+    #[default]
+    Auto,
+}
+
+impl FillMode {
+    /// The mode `Auto` stands for with these aspect ratios (width / height).
+    pub fn resolve(self, scene_aspect: f32, out_aspect: f32) -> Self {
+        match self {
+            Self::Auto if (scene_aspect > 1.0) != (out_aspect > 1.0) => Self::Fit,
+            Self::Auto => Self::Crop,
+            mode => mode,
+        }
+    }
 }
 
 /// The scene's `"global"` orthographic camera. World units are scene pixels
@@ -32,7 +47,8 @@ impl OrthoCamera {
         let scene_aspect = scene.x / scene.y;
         let fit_width = Vec2::new(scene.x, scene.x / out_aspect);
         let fit_height = Vec2::new(scene.y * out_aspect, scene.y);
-        match fill {
+        match fill.resolve(scene_aspect, out_aspect) {
+            FillMode::Auto => unreachable!("resolved"),
             FillMode::Stretch => scene,
             FillMode::Fit if out_aspect < scene_aspect => fit_width,
             FillMode::Fit => fit_height,
@@ -172,6 +188,34 @@ mod tests {
     fn project(m: Mat4, p: Vec3) -> Vec2 {
         let c = m * p.extend(1.0);
         c.truncate().truncate() / c.w
+    }
+
+    #[test]
+    fn auto_fits_only_across_orientations() {
+        let portrait = OrthoCamera {
+            scene_size: Vec2::new(1080.0, 1920.0),
+            zoom: 1.0,
+        };
+        let wide = OrthoCamera {
+            scene_size: Vec2::new(2560.0, 1080.0),
+            zoom: 1.0,
+        };
+        let landscape = (1920, 1080);
+        // A portrait scene on a landscape output: all of its height shows.
+        assert_eq!(
+            portrait.extent(landscape, FillMode::Auto),
+            portrait.extent(landscape, FillMode::Fit)
+        );
+        assert_eq!(portrait.extent(landscape, FillMode::Auto).y, 1920.0);
+        // Same orientation: cropped as before.
+        assert_eq!(
+            wide.extent(landscape, FillMode::Auto),
+            wide.extent(landscape, FillMode::Crop)
+        );
+        assert_eq!(
+            wide.extent((1080, 1920), FillMode::Auto),
+            wide.extent((1080, 1920), FillMode::Fit)
+        );
     }
 
     #[test]
