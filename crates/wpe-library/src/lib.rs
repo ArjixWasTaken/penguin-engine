@@ -14,6 +14,7 @@ mod library;
 pub mod locale;
 pub mod presets;
 pub mod steam;
+pub mod thumbs;
 
 pub use details::{localization, properties, property_infos, resolution};
 pub use library::{Library, Sources, default_cache_path};

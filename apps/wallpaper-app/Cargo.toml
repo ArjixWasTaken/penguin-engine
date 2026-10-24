@@ -1,0 +1,22 @@
+[package]
+name = "wallpaper-app"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[build-dependencies]
+tauri-build = { version = "=3.0.0-alpha.4", features = [] }
+
+[dependencies]
+dirs = "7.0.0"
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.154"
+tauri = { version = "=3.0.0-alpha.5", features = [] }
+tauri-runtime-wry = "=3.0.0-alpha.5"
+tauri-plugin-dialog = "=3.0.0-alpha.4"
+tauri-plugin-opener = "=3.0.0-alpha.3"
+tokio = { version = "1", features = ["sync"] }
+tracing = "0.1.44"
+tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
+wpe-ipc = { version = "0.1.0", path = "../../crates/wpe-ipc" }
+wpe-library = { version = "0.1.0", path = "../../crates/wpe-library" }
