@@ -1,6 +1,9 @@
 use glam::{Mat4, Quat, Vec3};
 use serde_json::json;
-use wpe_mdl::{AnimationLayer, Bone, BoneFrame, Mdl, MdlAnimation, PlayMode, Puppet, Skeleton};
+use wpe_mdl::{
+    AnimationLayer, Bone, BoneFrame, Mdl, MdlAnimation, MdlMesh, MorphTarget, PlayMode, Puppet,
+    Skeleton,
+};
 
 fn bone(parent: Option<usize>, t: Vec3) -> Bone {
     Bone {
@@ -43,6 +46,7 @@ fn model(mode: PlayMode) -> Mdl {
                 vec![frame(child, 0., 1.); 3],
             ],
             events: Vec::new(),
+            morph_tracks: Vec::new(),
         }],
         ..Mdl::default()
     }
@@ -204,4 +208,61 @@ fn unmatched_layers_and_static_models() {
     let mut f = vec![1.0];
     p.bones(1.0, &mut f);
     assert!(f.is_empty());
+}
+
+/// [`model`] with two blend shapes on the warp mesh; animation 1 keyframes
+/// the first one 0 → 1 → 0.5 and has no track for the second.
+fn morph_model(mode: PlayMode) -> Mdl {
+    let mut mdl = model(mode);
+    let shape = |name: &str| MorphTarget {
+        name: name.into(),
+        positions: vec![[0.; 3]],
+        deltas: vec![[1., 0., 0.]],
+    };
+    mdl.meshes.push(MdlMesh {
+        positions: vec![[0.; 3]],
+        morphs: vec![shape("blink"), shape("smile")],
+        ..MdlMesh::default()
+    });
+    mdl.animations[0].morph_tracks = vec![vec![0., 1., 0.5]];
+    mdl
+}
+
+fn weights(p: &Puppet, t: f64, base: &[f32]) -> Vec<f32> {
+    let mut out = Vec::new();
+    p.morph_weights(t, base, &mut out);
+    out
+}
+
+#[test]
+fn blend_shape_lookup() {
+    let p = Puppet::new(&morph_model(PlayMode::Loop), &[]);
+    assert_eq!(p.blend_shape_count(), 2);
+    assert_eq!(p.blend_shape_names(), ["blink", "smile"]);
+    assert_eq!(p.blend_shape_index("smile"), Some(1));
+    assert_eq!(p.blend_shape_index("frown"), None);
+    assert_eq!(weights(&p, 1.0, &[0.25]), [0.25, 0.0]);
+    let p = Puppet::new(&model(PlayMode::Loop), &[]);
+    assert_eq!(p.blend_shape_count(), 0);
+}
+
+#[test]
+fn animated_blend_shape_weights() {
+    let mdl = morph_model(PlayMode::Loop);
+    let p = Puppet::new(&mdl, &layer(json!({})));
+    assert_eq!(weights(&p, 0.0, &[]), [0.0, 0.0]);
+    assert_eq!(weights(&p, 0.5, &[]), [0.5, 0.0]);
+    assert_eq!(weights(&p, 1.0, &[0.0, 0.7]), [1.0, 0.7]);
+    let p = Puppet::new(&mdl, &layer(json!({"blend": 0.5})));
+    assert_eq!(weights(&p, 1.0, &[0.2]), [0.6, 0.0]);
+    let p = Puppet::new(&mdl, &layer(json!({"additive": true})));
+    assert_eq!(weights(&p, 1.0, &[0.2]), [1.2, 0.0]);
+    let p = Puppet::new(&mdl, &layer(json!({"visible": false})));
+    assert_eq!(weights(&p, 1.0, &[0.2]), [0.2, 0.0]);
+    let p = Puppet::new(&morph_model(PlayMode::Single), &layer(json!({})));
+    assert_eq!(
+        weights(&p, 5.0, &[]),
+        [1.0, 0.0],
+        "single holds frame length − 1"
+    );
 }

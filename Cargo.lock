@@ -4484,6 +4484,7 @@ dependencies = [
  "glam",
  "serde_json",
  "thiserror 2.0.21",
+ "wpe-vfs",
 ]
 
 [[package]]

@@ -74,6 +74,7 @@ struct Animation {
     fps: f64,
     length: u32,
     tracks: Vec<Vec<Frame>>,
+    morph_tracks: Vec<Vec<f32>>,
 }
 
 impl Animation {
@@ -133,6 +134,7 @@ pub struct Puppet {
     bones: Vec<PuppetBone>,
     animations: Vec<Animation>,
     layers: Vec<Layer>,
+    blend_shapes: Vec<String>,
 }
 
 impl Puppet {
@@ -185,12 +187,14 @@ impl Puppet {
                             .collect()
                     })
                     .collect(),
+                morph_tracks: a.morph_tracks.clone(),
             })
             .collect();
         let mut puppet = Self {
             bones,
             animations,
             layers: Vec::new(),
+            blend_shapes: mdl.blend_shapes().iter().map(|m| m.name.clone()).collect(),
         };
         puppet.set_layers(
             animation_layers
@@ -341,6 +345,80 @@ impl Puppet {
         self.bone_matrices(time, &mut mats);
         out.clear();
         out.extend(mats.iter().flat_map(Mat4::to_cols_array));
+    }
+
+    /// Number of blend shapes of the warp mesh.
+    pub fn blend_shape_count(&self) -> usize {
+        self.blend_shapes.len()
+    }
+
+    /// Names of the warp mesh's blend shapes, by index (empty strings when
+    /// the file stores none).
+    pub fn blend_shape_names(&self) -> &[String] {
+        &self.blend_shapes
+    }
+
+    /// Index of the blend shape called `name` (SceneScript
+    /// `getBlendShapeIndex`, which reports a miss as -1).
+    pub fn blend_shape_index(&self, name: &str) -> Option<usize> {
+        self.blend_shapes.iter().position(|n| n == name)
+    }
+
+    /// Blend shape weights at `time` seconds since the layers started
+    /// playing, starting from `base` (e.g. weights set by a script; missing
+    /// entries are 0). See [`Self::morph_weights_with`].
+    pub fn morph_weights(&self, time: f64, base: &[f32], out: &mut Vec<f32>) {
+        self.morph_weights_with(
+            |_, p| LayerPose {
+                time: time * p.rate,
+                blend: p.blend,
+                visible: p.visible,
+            },
+            base,
+            out,
+        );
+    }
+
+    /// Blend shape weights (one per blend shape of the warp mesh) with each
+    /// animation layer where `pose` puts it. Layers combine like bone
+    /// channels: a weight track interpolated between frames; non-additive
+    /// layers blend from the weight below toward it by `blend`, additive
+    /// layers add `blend ×` its change since frame 0. Layers without a track
+    /// for a blend shape leave it alone.
+    pub fn morph_weights_with(
+        &self,
+        pose: impl Fn(usize, &AnimationLayer) -> LayerPose,
+        base: &[f32],
+        out: &mut Vec<f32>,
+    ) {
+        out.clear();
+        out.extend((0..self.blend_shapes.len()).map(|k| base.get(k).copied().unwrap_or(0.0)));
+        for (i, layer) in self.layers.iter().enumerate() {
+            let Some(anim) = layer.animation.map(|a| &self.animations[a]) else {
+                continue;
+            };
+            if anim.morph_tracks.is_empty() {
+                continue;
+            }
+            let pose = pose(i, &layer.params);
+            if !pose.visible {
+                continue;
+            }
+            let (a, b, t) = anim.sample_point(pose.time);
+            let w = pose.blend.clamp(0.0, 1.0) as f32;
+            for (weight, track) in out.iter_mut().zip(&anim.morph_tracks) {
+                if track.is_empty() {
+                    continue;
+                }
+                let last = track.len() - 1;
+                let value = track[a.min(last)] + (track[b.min(last)] - track[a.min(last)]) * t;
+                if layer.params.additive {
+                    *weight += w * (value - track[0]);
+                } else {
+                    *weight += (value - *weight) * w;
+                }
+            }
+        }
     }
 
     /// Length of animation layer `layer`'s animation in seconds, if it exists.

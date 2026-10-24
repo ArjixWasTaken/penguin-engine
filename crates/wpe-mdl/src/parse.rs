@@ -4,8 +4,8 @@ use binrw::{BinRead, BinReaderExt, NullString, binread};
 use glam::{Mat4, Vec3};
 
 use crate::{
-    AnimationEvent, Attachment, Bone, BoneFrame, Mdl, MdlAnimation, MdlError, MdlMesh, PlayMode,
-    Skeleton, VertexFormat,
+    AnimationEvent, Attachment, Bone, BoneFrame, Mdl, MdlAnimation, MdlError, MdlMesh, MorphTarget,
+    PlayMode, Skeleton, VertexFormat,
 };
 
 const BONE_FRAME_BYTES: u32 = 36;
@@ -181,10 +181,12 @@ pub(crate) fn parse(bytes: &[u8]) -> Result<Mdl, MdlError> {
 
     let mut resync_from = None;
     for index in 0..submeshes as usize {
+        let meshes_before = mdl.meshes.len();
         let after_indices = submesh(&mut r, &mut mdl, index)?;
         if version >= 21 {
             match post_submesh(&mut r, version) {
-                Ok(masks) => {
+                Ok((morphs, masks)) => {
+                    attach_morphs(&mut mdl, index, meshes_before, morphs);
                     for mask in masks {
                         mdl.warnings.push(format!(
                             "submesh {index}: clipping mask {mask} is not applied"
@@ -214,6 +216,7 @@ pub(crate) fn parse(bytes: &[u8]) -> Result<Mdl, MdlError> {
     }
     sections(&mut r, &mut mdl)?;
     finish_skinning(&mut mdl);
+    finish_morphs(&mut mdl);
     Ok(mdl)
 }
 
@@ -399,14 +402,19 @@ fn decode_vertices(data: &[u8], format: VertexFormat, count: usize) -> MdlMesh {
 }
 
 /// Morph targets, part ranges and (v23) clipping masks stored after each
-/// submesh in v21+; returns the clipping-mask texture paths.
-fn post_submesh(r: &mut Reader, version: u32) -> Result<Vec<String>, MdlError> {
+/// submesh in v21+; returns the raw morph target blobs and the clipping-mask
+/// texture paths.
+fn post_submesh<'a>(
+    r: &mut Reader<'a>,
+    version: u32,
+) -> Result<(Vec<&'a [u8]>, Vec<String>), MdlError> {
+    let mut morphs = Vec::new();
     if r.u8()? != 0 {
-        let morphs = r.u32()?;
-        r.ensure_count(morphs.into(), 4, "morph target")?;
-        for _ in 0..morphs {
+        let count = r.u32()?;
+        r.ensure_count(count.into(), 4, "morph target")?;
+        for _ in 0..count {
             let bytes = r.u32()?;
-            r.skip(bytes.into())?;
+            morphs.push(r.take(bytes.into())?);
         }
     }
     if r.u8()? != 0 {
@@ -428,7 +436,45 @@ fn post_submesh(r: &mut Reader, version: u32) -> Result<Vec<String>, MdlError> {
             }
         }
     }
-    Ok(masks)
+    Ok((morphs, masks))
+}
+
+/// Decode a submesh's morph target blobs into the mesh just parsed (if it
+/// was not skipped). Each blob is one `vec3` per vertex.
+fn attach_morphs(mdl: &mut Mdl, index: usize, meshes_before: usize, blobs: Vec<&[u8]>) {
+    if blobs.is_empty() {
+        return;
+    }
+    let Some(mesh) = mdl.meshes.get_mut(meshes_before) else {
+        mdl.warnings.push(format!(
+            "submesh {index}: {} morph target(s) of a skipped submesh dropped",
+            blobs.len()
+        ));
+        return;
+    };
+    let n = mesh.vertex_count();
+    let mut dropped = Vec::new();
+    for (k, blob) in blobs.into_iter().enumerate() {
+        if blob.len() != n * 12 {
+            dropped.push(format!(
+                "submesh {index}: morph target {k} has {} bytes, expected {} (12 × {n} vertices); dropped",
+                blob.len(),
+                n * 12
+            ));
+            continue;
+        }
+        let f = |c: &[u8]| f32::from_le_bytes([c[0], c[1], c[2], c[3]]);
+        let targets: Vec<[f32; 3]> = blob
+            .chunks_exact(12)
+            .map(|c| [f(&c[0..4]), f(&c[4..8]), f(&c[8..12])])
+            .collect();
+        mesh.morphs.push(MorphTarget {
+            name: String::new(),
+            positions: targets,
+            deltas: Vec::new(),
+        });
+    }
+    mdl.warnings.extend(dropped);
 }
 
 fn sections(r: &mut Reader, mdl: &mut Mdl) -> Result<(), MdlError> {
@@ -458,6 +504,10 @@ fn sections(r: &mut Reader, mdl: &mut Mdl) -> Result<(), MdlError> {
         match kind {
             "MDLS" => mdl.skeleton = Some(skeleton(r, section_version, end)?),
             "MDAT" => mdl.attachments = attachments(r)?,
+            "MDLE" => match morph_pose(r) {
+                Ok(pose) => mdl.morph_pose = pose,
+                Err(e) => mdl.warnings.push(format!("MDLE: {e}; ignored")),
+            },
             "MDLA" => {
                 mdl.animation_version = Some(section_version);
                 animations(r, mdl, section_version, end.unwrap_or(r.len()));
@@ -539,6 +589,16 @@ fn attachments(r: &mut Reader) -> Result<Vec<Attachment>, MdlError> {
             })
         })
         .collect()
+}
+
+/// `MDLE` body: `u32 bytes`, then `bytes / 64` column-major matrices.
+fn morph_pose(r: &mut Reader) -> Result<Vec<Mat4>, MdlError> {
+    let bytes = r.u32()?;
+    if bytes % 64 != 0 {
+        return Err(r.malformed(format!("MDLE matrix data size {bytes}")));
+    }
+    r.ensure_count(u64::from(bytes / 64), 64, "MDLE matrix")?;
+    (0..bytes / 64).map(|_| r.mat4()).collect()
 }
 
 fn play_mode(s: &str) -> Option<PlayMode> {
@@ -656,10 +716,11 @@ fn animation(r: &mut Reader, version: u32) -> Result<Option<MdlAnimation>, MdlEr
             .collect::<Result<Vec<_>, MdlError>>()?;
         tracks.push(track);
     }
+    let mut morph_tracks = Vec::new();
     let events = if version <= 2 {
         events(r).unwrap_or_default()
     } else {
-        skip_animation_trailer(r, version).ok();
+        morph_tracks = animation_trailer(r, version).unwrap_or_default();
         Vec::new()
     };
     if !(fps > 0.0 && fps.is_finite()) || length <= 0 {
@@ -673,26 +734,34 @@ fn animation(r: &mut Reader, version: u32) -> Result<Option<MdlAnimation>, MdlEr
         length: length as u32,
         tracks,
         events,
+        morph_tracks,
     }))
 }
 
 /// Per-animation data after the bone tracks in MDLA v3+ (all zero in the
-/// corpus apart from v6 morph-weight tracks).
-fn skip_animation_trailer(r: &mut Reader, version: u32) -> Result<(), MdlError> {
+/// corpus apart from v6 morph weight tracks, which are returned).
+fn animation_trailer(r: &mut Reader, version: u32) -> Result<Vec<Vec<f32>>, MdlError> {
     match version {
-        3 => r.skip(9),
-        5 => r.skip(34),
+        3 => r.skip(9).map(|()| Vec::new()),
+        5 => r.skip(34).map(|()| Vec::new()),
         6.. => {
-            let tracks = r.u32()?;
-            r.ensure_count(tracks.into(), 8, "morph weight track")?;
-            for _ in 0..tracks {
+            let count = r.u32()?;
+            r.ensure_count(count.into(), 8, "morph weight track")?;
+            let mut tracks = Vec::with_capacity(count as usize);
+            for _ in 0..count {
                 let _unk = r.u32()?;
                 let bytes = r.u32()?;
-                r.skip(bytes.into())?;
+                let data = r.take(bytes.into())?;
+                tracks.push(
+                    data.chunks_exact(4)
+                        .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+                        .collect(),
+                );
             }
-            r.skip(31)
+            r.skip(31)?;
+            Ok(tracks)
         }
-        _ => Ok(()),
+        _ => Ok(Vec::new()),
     }
 }
 
@@ -739,6 +808,81 @@ fn finish_skinning(mdl: &mut Mdl) {
             if *idx >= bones {
                 *idx = 0;
             }
+        }
+    }
+}
+
+/// Turn the stored blend shape targets into offsets in the mesh's space.
+///
+/// A target is the shaped mesh posed by the `MDLE` skeleton: undoing that
+/// pose per vertex (the inverse of `Σ weight · pose_world · bind_world⁻¹`)
+/// gives the shaped vertex in the mesh's space. Without a usable pose (static
+/// models, missing or mismatched `MDLE`) the target is taken as already being
+/// in the mesh's space.
+fn finish_morphs(mdl: &mut Mdl) {
+    if mdl.meshes.iter().all(|m| m.morphs.is_empty()) {
+        return;
+    }
+    let bones = mdl.skeleton.as_ref().map_or(&[][..], |s| &s.bones[..]);
+    let pose = &mdl.morph_pose;
+    let poses = if bones.is_empty() || pose.is_empty() || !pose.len().is_multiple_of(bones.len()) {
+        if !bones.is_empty() {
+            mdl.warnings.push(format!(
+                "blend shapes with {} MDLE matrices for {} bones; targets used unposed",
+                pose.len(),
+                bones.len()
+            ));
+        }
+        0
+    } else {
+        pose.len() / bones.len()
+    };
+    let world = |locals: &mut dyn Iterator<Item = Mat4>| {
+        let mut out: Vec<Mat4> = Vec::with_capacity(bones.len());
+        for (b, local) in bones.iter().zip(locals) {
+            let w = b.parent.map_or(local, |p| out[p] * local);
+            out.push(w);
+        }
+        out
+    };
+    let inverse_bind: Vec<Mat4> = world(&mut bones.iter().map(|b| b.bind))
+        .iter()
+        .map(Mat4::inverse)
+        .collect();
+    // Skinning matrices of each MDLE pose (one pose shared by all targets,
+    // or one per target).
+    let skins: Vec<Vec<Mat4>> = (0..poses)
+        .map(|k| {
+            let chunk = &pose[k * bones.len()..(k + 1) * bones.len()];
+            world(&mut chunk.iter().copied())
+                .iter()
+                .zip(&inverse_bind)
+                .map(|(w, ib)| *w * *ib)
+                .collect()
+        })
+        .collect();
+    for mesh in &mut mdl.meshes {
+        for (k, morph) in mesh.morphs.iter_mut().enumerate() {
+            let skin = skins.get(if poses > 1 { k } else { 0 });
+            morph.deltas = (0..mesh.positions.len())
+                .map(|v| {
+                    let base = Vec3::from(mesh.positions[v]);
+                    let target = Vec3::from(morph.positions[v]);
+                    let shaped = skin
+                        .and_then(|skin| {
+                            let (idx, w) = (mesh.blend_indices.get(v)?, mesh.blend_weights.get(v)?);
+                            let m = idx
+                                .iter()
+                                .zip(w)
+                                .map(|(&i, &w)| skin.get(i as usize).map(|s| *s * w))
+                                .sum::<Option<Mat4>>()?;
+                            (m.determinant().abs() > 1e-12)
+                                .then(|| m.inverse().transform_point3(target))
+                        })
+                        .unwrap_or(target);
+                    (shaped - base).to_array()
+                })
+                .collect();
         }
     }
 }

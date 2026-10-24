@@ -192,7 +192,7 @@ fn unknown_vertex_format_is_skipped() {
 }
 
 #[test]
-fn v21_morphs_parts_and_v23_clipping_masks_are_skipped() {
+fn v21_morphs_parts_and_v23_clipping_masks() {
     let mut b = Bytes::mdlv(23);
     b.u32(9)
         .u32(1)
@@ -221,6 +221,10 @@ fn v21_morphs_parts_and_v23_clipping_masks_are_skipped() {
     assert_eq!(mdl.meshes[0].indices, [0, 1, 2]);
     assert_eq!(mdl.warnings.len(), 1, "{:?}", mdl.warnings);
     assert!(mdl.warnings[0].contains("clipping_mask_0"));
+    // A static model's blend shape targets are already in mesh space.
+    let morph = &mdl.blend_shapes()[0];
+    assert_eq!(morph.positions, [[5.; 3]; 3]);
+    assert_eq!(morph.deltas, [[5.; 3]; 3]);
 }
 
 /// v14 puppet: standard vertex layout, MDLS v2, MDLA v2 with an event.
@@ -394,7 +398,7 @@ fn puppet_v23(rest: bool) -> Bytes {
     }
     b.end_section(a);
     let e = b.section("MDLE", 2);
-    b.u32(0xdead_beef);
+    b.u32(0);
     b.end_section(e);
     b.u8(0);
     b
@@ -425,6 +429,8 @@ fn puppet_v23_sections() {
     assert_eq!(mdl.animations[0].mode, PlayMode::Mirror);
     assert_eq!(mdl.animations[1].mode, PlayMode::Single);
     assert_eq!(mdl.animations[1].name, "");
+    assert_eq!(mdl.animations[1].morph_tracks, [vec![1., 1.]]);
+    assert!(mdl.morph_pose.is_empty() && m.morphs.is_empty());
 }
 
 #[test]
@@ -555,4 +561,121 @@ fn bad_frame_size_keeps_earlier_animations() {
     let mdl = Mdl::parse(&b.0).unwrap();
     assert_eq!(mdl.animations.len(), 1);
     assert_eq!(mdl.warnings.len(), 1);
+}
+
+/// v23 puppet with one blend shape captured in a posed skeleton (`MDLE`)
+/// and an MDLA v6 animation keyframing its weight.
+fn blend_shape_puppet(target_bytes: Option<u32>, mdle_bones: usize) -> Bytes {
+    let mut b = Bytes::mdlv(23);
+    b.u32(STD_PUPPET)
+        .u32(1)
+        .u32(1)
+        .str("materials/p.json")
+        .u32(0)
+        .floats(&[0.; 6]);
+    b.u32(STD_PUPPET).u32(2 * 52);
+    puppet_vertex(
+        &mut b,
+        [1., 2., 0.],
+        [0; 4],
+        [1., 0., 0., 0.],
+        [0.; 2],
+        false,
+    );
+    puppet_vertex(
+        &mut b,
+        [12., 0., 0.],
+        [1, 0, 0, 0],
+        [1., 0., 0., 0.],
+        [0.; 2],
+        false,
+    );
+    b.u32(6).u16(0).u16(1).u16(1);
+    // Targets: the mesh shaped by (0, 1, 0) and (0, 3, 0), then posed with
+    // the root moved by +5 x and the child turned 90° about its origin.
+    let target_bytes = target_bytes.unwrap_or(24);
+    b.u8(1).u32(1).u32(target_bytes);
+    b.floats(&[6., 3., 0., 12., 2., 0.]);
+    b.0.resize(b.0.len() + target_bytes as usize - 24, 0);
+    b.u8(0).u32(0);
+    let s = b.section("MDLS", 4);
+    b.u16(2).u16(0);
+    bone(&mut b, -1, [0., 0., 0.], "");
+    bone(&mut b, 0, [10., 0., 0.], "");
+    b.u16(0).u8(0).u32(0).u32(0).u8(0).u8(0).u8(0);
+    b.end_section(s);
+    let a = b.section("MDLA", 6);
+    b.u32(1)
+        .i32(7)
+        .i32(0)
+        .str("blink")
+        .str("loop")
+        .f32(1.)
+        .i32(2)
+        .i32(0)
+        .u32(0);
+    b.u32(1).u32(0).u32(12).floats(&[0., 1., 0.5]);
+    b.0.resize(b.0.len() + 31, 0);
+    b.end_section(a);
+    let e = b.section("MDLE", 2);
+    b.u32(64 * mdle_bones as u32);
+    let poses = [
+        [
+            1., 0., 0., 0., 0., 1., 0., 0., 0., 0., 1., 0., 5., 0., 0., 1.,
+        ],
+        [
+            0., 1., 0., 0., -1., 0., 0., 0., 0., 0., 1., 0., 10., 0., 0., 1.,
+        ],
+    ];
+    for i in 0..mdle_bones {
+        b.floats(&poses[i % 2]);
+    }
+    b.end_section(e);
+    b.u8(0);
+    b
+}
+
+fn close(a: [f32; 3], b: [f32; 3]) -> bool {
+    a.iter().zip(&b).all(|(x, y)| (x - y).abs() < 1e-4)
+}
+
+#[test]
+fn blend_shape_targets_are_unposed_into_mesh_space() {
+    let mdl = Mdl::parse(&blend_shape_puppet(None, 2).0).unwrap();
+    assert!(mdl.warnings.is_empty(), "{:?}", mdl.warnings);
+    assert_eq!(mdl.morph_pose.len(), 2);
+    let m = &mdl.meshes[0];
+    assert_eq!(m.morphs.len(), 1);
+    assert_eq!(m.morphs[0].name, "");
+    assert_eq!(m.morphs[0].positions, [[6., 3., 0.], [12., 2., 0.]]);
+    let d = &m.morphs[0].deltas;
+    assert!(
+        close(d[0], [0., 1., 0.]) && close(d[1], [0., 3., 0.]),
+        "{d:?}"
+    );
+    let p = m.morphed_positions(&[0.5]);
+    assert!(
+        close(p[0], [1., 2.5, 0.]) && close(p[1], [12., 1.5, 0.]),
+        "{p:?}"
+    );
+    assert_eq!(m.morphed_positions(&[]), m.positions);
+    assert_eq!(mdl.animations[0].morph_tracks, [vec![0., 1., 0.5]]);
+    assert_eq!(mdl.animations[0].name, "blink");
+}
+
+#[test]
+fn blend_shape_with_mismatched_pose_or_size() {
+    // An MDLE that does not cover the skeleton: targets are used unposed.
+    let mdl = Mdl::parse(&blend_shape_puppet(None, 3).0).unwrap();
+    assert_eq!(mdl.warnings.len(), 1, "{:?}", mdl.warnings);
+    assert_eq!(mdl.meshes[0].morphs[0].deltas[0], [5., 1., 0.]);
+    // A target whose size is not 12 bytes per vertex is dropped.
+    let mdl = Mdl::parse(&blend_shape_puppet(Some(36), 2).0).unwrap();
+    assert!(mdl.meshes[0].morphs.is_empty());
+    assert!(
+        mdl.warnings.iter().any(|w| w.contains("morph target 0")),
+        "{:?}",
+        mdl.warnings
+    );
+    assert_eq!(mdl.animations.len(), 1);
 }
