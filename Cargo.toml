@@ -8,7 +8,7 @@ default-members = ["crates/wpe-assets", "crates/wpe-audio", "crates/wpe-ipc", "c
 version = "0.1.0"
 edition = "2024"
 license = "GPL-2.0-only"
-repository = "https://github.com/arjix/wallpaper-engine-rs"
+repository = "https://github.com/ArjixWasTaken/penguin-engine"
 
 [workspace.dependencies]
 wpe-vfs = { path = "crates/wpe-vfs" }
