@@ -24,3 +24,7 @@ wayland-client = { version = "0.31.15", features = ["system"] }
 wpe-ipc = { version = "0.1.0", path = "../../crates/wpe-ipc" }
 wpe-render = { version = "0.1.0", path = "../../crates/wpe-render" }
 wpe-runtime = { version = "0.1.0", path = "../../crates/wpe-runtime" }
+
+[features]
+# Web wallpapers, rendered with Servo (a long first build).
+web = ["wpe-runtime/web"]

@@ -9,9 +9,9 @@ use wpe_vfs::MemoryFs;
 /// Texture name the video plays into.
 pub const TEXTURE: &str = "__video";
 /// The scene file the made-up documents are mounted under.
-pub const SCENE_FILE: &str = "__video/scene.json";
-const MODEL: &str = "__video/model.json";
-const MATERIAL: &str = "__video/material.json";
+pub const SCENE_FILE: &str = "__generated/scene.json";
+const MODEL: &str = "__generated/model.json";
+const MATERIAL: &str = "__generated/material.json";
 
 /// The picture size of `mp4`, as it is shown (rotation applied), from its
 /// first video track.
@@ -40,8 +40,8 @@ pub fn dimensions(mp4: &[u8]) -> Option<(u32, u32)> {
 }
 
 /// The scene, model and material a `width`×`height` video wallpaper is
-/// shown with.
-pub fn documents(width: u32, height: u32) -> MemoryFs {
+/// shown with: one layer showing `texture` (web wallpapers use them too).
+pub fn documents(texture: &str, width: u32, height: u32) -> MemoryFs {
     let (w, h) = (width as f32, height as f32);
     let scene = json!({
         "camera": {
@@ -75,7 +75,7 @@ pub fn documents(width: u32, height: u32) -> MemoryFs {
             "depthtest": "disabled",
             "depthwrite": "disabled",
             "shader": "genericimage2",
-            "textures": [TEXTURE],
+            "textures": [texture],
         }],
     });
     let mut fs = MemoryFs::new();
@@ -87,6 +87,14 @@ pub fn documents(width: u32, height: u32) -> MemoryFs {
 
 /// A video texture playing `mp4` (shown black until the first frame).
 pub fn texture(mp4: Vec<u8>, width: u32, height: u32) -> Texture {
+    Texture {
+        video: Some(mp4),
+        ..blank(width, height)
+    }
+}
+
+/// A black `width`×`height` texture to be filled in later.
+pub fn blank(width: u32, height: u32) -> Texture {
     Texture {
         format: TexFormat::Rgba8,
         flags: TexFlags::empty(),
@@ -106,7 +114,7 @@ pub fn texture(mp4: Vec<u8>, width: u32, height: u32) -> Texture {
         }],
         sprite_frames: Vec::new(),
         variants: Vec::new(),
-        video: Some(mp4),
+        video: None,
     }
 }
 
@@ -117,7 +125,7 @@ mod tests {
     #[test]
     fn documents_make_a_one_layer_scene() {
         let mut vfs = wpe_vfs::Vfs::new();
-        vfs.mount("video", documents(1280, 720));
+        vfs.mount("video", documents(TEXTURE, 1280, 720));
         let scene: wpe_assets::Scene = wpe_assets::load_json(&vfs, SCENE_FILE).unwrap();
         assert_eq!(scene.objects.len(), 1);
         let model: serde_json::Value = wpe_assets::load_json(&vfs, MODEL).unwrap();

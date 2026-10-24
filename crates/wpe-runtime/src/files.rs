@@ -13,6 +13,10 @@ pub enum LoadError {
     Asset(#[from] AssetError),
     #[error("{0} is not a wallpaper directory, .pkg or scene .json")]
     BadPath(PathBuf),
+    #[error("web wallpapers need a build with the `web` feature")]
+    WebUnsupported,
+    #[error("web page: {0}")]
+    Web(String),
 }
 
 /// A wallpaper's mounted files, project and scene document.
@@ -27,6 +31,9 @@ pub struct WallpaperFiles {
     /// For a video wallpaper, its video and picture size; the scene is made
     /// up to show it (see [`crate::video_wallpaper`]).
     pub video: Option<(Vec<u8>, u32, u32)>,
+    /// For a web wallpaper, its directory and page; the scene is made up
+    /// to show it (see [`crate::web_wallpaper`]).
+    pub web: Option<(PathBuf, String)>,
 }
 
 impl WallpaperFiles {
@@ -93,13 +100,29 @@ impl WallpaperFiles {
         {
             let mp4 = vfs.read(file)?.into_owned();
             let (width, height) = crate::video_wallpaper::dimensions(&mp4).unwrap_or((1920, 1080));
-            vfs.mount("video", crate::video_wallpaper::documents(width, height));
+            vfs.mount(
+                "video",
+                crate::video_wallpaper::documents(crate::video_wallpaper::TEXTURE, width, height),
+            );
             video = Some((mp4, width, height));
         }
-        let scene_file = match (&video, scene_file) {
-            (Some(_), _) => crate::video_wallpaper::SCENE_FILE.to_owned(),
-            (None, Some(file)) => file,
-            (None, None) => resolve_scene_file(&project, &vfs),
+        let mut web = None;
+        if project.is_web() && scene_file.is_none() {
+            let file = project
+                .file
+                .clone()
+                .unwrap_or_else(|| "index.html".to_owned());
+            let (width, height) = crate::web_wallpaper::DEFAULT_SIZE;
+            vfs.mount(
+                "web",
+                crate::video_wallpaper::documents(crate::web_wallpaper::TEXTURE, width, height),
+            );
+            web = Some((dir.clone(), file));
+        }
+        let scene_file = match (&video, &web, scene_file) {
+            (Some(_), _, _) | (_, Some(_), _) => crate::video_wallpaper::SCENE_FILE.to_owned(),
+            (None, None, Some(file)) => file,
+            (None, None, None) => resolve_scene_file(&project, &vfs),
         };
         let scene = load_json(&vfs, &scene_file)?;
         let scene_json = load_json(&vfs, &scene_file)?;
@@ -110,6 +133,7 @@ impl WallpaperFiles {
             scene,
             scene_json,
             video,
+            web,
         })
     }
 

@@ -14,6 +14,7 @@ pub mod steam;
 mod storage;
 mod video;
 mod video_wallpaper;
+pub mod web_wallpaper;
 
 use std::path::Path;
 use std::sync::Arc;
@@ -33,6 +34,8 @@ pub use files::{LoadError, WallpaperFiles};
 /// Apps call this before exiting, after dropping their wallpapers.
 pub fn shutdown() {
     video::finish_teardowns();
+    #[cfg(feature = "web")]
+    web_wallpaper::shutdown(std::time::Duration::from_secs(3));
 }
 pub use material::{SlotTexture, TextureStore};
 pub use wpe_assets::project::{Project, PropertyOption, UserProperty};
@@ -209,6 +212,9 @@ pub struct Wallpaper {
     scripts: Option<script::Scripts>,
     /// The wallpaper's files, for assets loaded while running (text fonts).
     vfs: wpe_vfs::Vfs,
+    /// A web wallpaper's page.
+    #[cfg(feature = "web")]
+    web: Option<web_wallpaper::WebState>,
     /// Spectrum of the latest audio frame, for scripts.
     spectrum: Option<wpe_audio::AudioSpectrum>,
     start: Instant,
@@ -464,6 +470,8 @@ pub struct PreparedWallpaper {
     /// What scripts stored last time.
     stored: Option<serde_json::Value>,
     frame: FrameBuild,
+    #[cfg(feature = "web")]
+    web: Option<wpe_web::WebPage>,
     /// How long preparing took.
     pub elapsed: std::time::Duration,
 }
@@ -533,6 +541,12 @@ impl PreparedWallpaper {
             script_pointer: None,
             props: self.props,
             vfs: self.vfs,
+            #[cfg(feature = "web")]
+            web: self.web.map(|page| web_wallpaper::WebState {
+                page,
+                target: None,
+                shown: None,
+            }),
         };
         let built = wallpaper.install(gpu, self.frame);
         tracing::info!(
@@ -623,6 +637,27 @@ impl Wallpaper {
                 video_wallpaper::texture(mp4, width, height),
             );
         }
+        #[cfg(feature = "web")]
+        let web = match files.web.take() {
+            Some((dir, file)) => {
+                let (width, height) = web_wallpaper::DEFAULT_SIZE;
+                store.insert(
+                    web_wallpaper::TEXTURE,
+                    video_wallpaper::blank(width, height),
+                );
+                Some(web_wallpaper::open(
+                    &dir,
+                    &file,
+                    &files.project,
+                    (width, height),
+                )?)
+            }
+            None => None,
+        };
+        #[cfg(not(feature = "web"))]
+        if files.web.is_some() {
+            return Err(LoadError::WebUnsupported);
+        }
         let sounds = sound::Sounds::load(&files, &props);
         let storage = storage::Storage::for_wallpaper(path);
         let stored = storage.load();
@@ -695,6 +730,8 @@ impl Wallpaper {
             storage,
             stored,
             frame,
+            #[cfg(feature = "web")]
+            web,
             elapsed,
         })
     }
@@ -821,6 +858,19 @@ impl Wallpaper {
     /// the property's value (`true`, `0.5`, `"1 0 0"`, ...).
     pub fn set_user_property(&mut self, gpu: &Gpu, name: &str, value: serde_json::Value) {
         self.props.set(name, value.clone());
+        #[cfg(feature = "web")]
+        if let Some(web) = &self.web {
+            // Pages apply properties themselves.
+            let kind = self
+                .project
+                .general
+                .properties
+                .get(name)
+                .and_then(|p| p.kind.as_deref());
+            let changed = serde_json::json!({ name: web_wallpaper::property_json(kind, &value) });
+            web.page.apply_properties(&changed);
+            return;
+        }
         let doc = match serde_json::from_value::<wpe_assets::Scene>(self.scene_json.clone()) {
             Ok(doc) => doc,
             Err(e) => {
@@ -840,6 +890,10 @@ impl Wallpaper {
     /// The user changed the wallpaper's general settings (`json` as Wallpaper
     /// Engine passes them): scripts' `applyGeneralSettings` see them.
     pub fn apply_general_settings(&mut self, json: &serde_json::Value) {
+        #[cfg(feature = "web")]
+        if let Some(web) = &self.web {
+            web.page.apply_general(json);
+        }
         if let Some(scripts) = &mut self.scripts {
             scripts.emit("applyGeneralSettings", json);
         }
@@ -853,6 +907,14 @@ impl Wallpaper {
     /// Whether this is a video wallpaper (rather than a scene).
     pub fn is_video(&self) -> bool {
         self.video_wallpaper
+    }
+
+    /// Whether this is a web wallpaper.
+    pub fn is_web(&self) -> bool {
+        #[cfg(feature = "web")]
+        return self.web.is_some();
+        #[cfg(not(feature = "web"))]
+        false
     }
 
     /// The current value of user property `name`.
@@ -895,6 +957,10 @@ impl Wallpaper {
             }
         }
         self.sounds.set_paused(paused);
+        #[cfg(feature = "web")]
+        if let Some(web) = &self.web {
+            web.page.set_paused(paused);
+        }
     }
 
     /// Master volume (0..1) of the sound layers and a video wallpaper's sound.
@@ -998,6 +1064,53 @@ impl Wallpaper {
         self.sync_scripts(gpu, time);
     }
 
+    /// Lay a web wallpaper's page out at the output's `size` (rebuilding
+    /// the frame around a texture that size) and show its newest frame, or
+    /// wait up to `wait` for one at that size.
+    #[cfg(feature = "web")]
+    fn update_web(&mut self, gpu: &Gpu, size: (u32, u32), wait: Option<std::time::Duration>) {
+        let Some(mut web) = self.web.take() else {
+            return;
+        };
+        if web.page.size() != size && size.0 > 0 && size.1 > 0 {
+            web.page.resize(size);
+            let texture = web_wallpaper::TEXTURE;
+            self.vfs
+                .mount("web", video_wallpaper::documents(texture, size.0, size.1));
+            if let Some(cache) = &mut self.cache {
+                cache.replace(&self.vfs, texture, video_wallpaper::blank(size.0, size.1));
+            }
+            let scene =
+                wpe_assets::load_json::<serde_json::Value>(&self.vfs, video_wallpaper::SCENE_FILE)
+                    .map_err(|e| e.to_string())
+                    .and_then(|json| {
+                        let doc = serde_json::from_value::<wpe_assets::Scene>(json.clone())
+                            .map_err(|e| e.to_string())?;
+                        Ok((json, doc))
+                    });
+            match scene {
+                Ok((json, doc)) => {
+                    self.scene_json = json;
+                    self.build_frame(gpu, doc);
+                }
+                Err(e) => tracing::warn!("web wallpaper scene: {e}"),
+            }
+            web.target = None;
+            web.shown = None;
+        }
+        if web.target.is_none() {
+            web.target = self
+                .cache
+                .as_mut()
+                .and_then(|c| c.uploaded(&self.vfs, web_wallpaper::TEXTURE));
+        }
+        match wait {
+            Some(timeout) => web.wait_frame(gpu, timeout),
+            None => web.upload(gpu),
+        }
+        self.web = Some(web);
+    }
+
     /// Video textures and the streams feeding them.
     fn videos(&self) -> &[(Arc<GpuTexture>, Arc<video::VideoStream>)] {
         self.cache.as_ref().map_or(&[], |c| &c.videos)
@@ -1005,6 +1118,12 @@ impl Wallpaper {
 
     /// The left mouse button was pressed or released at the current pointer.
     pub fn mouse_button(&mut self, down: bool) {
+        #[cfg(feature = "web")]
+        if let Some(web) = &self.web {
+            let (x, y) = web.page_point(self.pointer_target);
+            let button = web_wallpaper::Button::Left;
+            web.page.input(wpe_web::Input::Button(button, down, x, y));
+        }
         if let Some(scripts) = &mut self.scripts {
             scripts.mouse_button(self.pointer_target, down);
         }
@@ -1056,6 +1175,13 @@ impl Wallpaper {
 
     /// Cursor position over the output, 0..1 with Y down.
     pub fn set_pointer(&mut self, pointer: Vec2) {
+        #[cfg(feature = "web")]
+        if let Some(web) = &self.web
+            && pointer != self.pointer_target
+        {
+            let (x, y) = web.page_point(pointer);
+            web.page.input(wpe_web::Input::Move(x, y));
+        }
         self.pointer_target = pointer;
     }
 
@@ -1149,6 +1275,8 @@ impl Wallpaper {
         output: &wgpu::TextureView,
         size: (u32, u32),
     ) {
+        #[cfg(feature = "web")]
+        self.update_web(gpu, size, None);
         self.upload_video_frames(gpu);
         self.smooth_pointer();
         self.advance_camera_path();
@@ -1165,6 +1293,8 @@ impl Wallpaper {
         for (_, stream) in self.videos() {
             stream.wait_started(std::time::Duration::from_secs(5));
         }
+        #[cfg(feature = "web")]
+        self.update_web(gpu, size, Some(std::time::Duration::from_secs(10)));
         self.upload_video_frames(gpu);
         self.advance_camera_path();
         let globals = self.globals(size);

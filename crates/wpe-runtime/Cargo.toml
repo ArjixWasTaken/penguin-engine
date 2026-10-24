@@ -27,3 +27,8 @@ wpe-script = { version = "0.1.0", path = "../wpe-script" }
 wpe-shader = { version = "0.1.0", path = "../wpe-shader" }
 wpe-text = { version = "0.1.0", path = "../wpe-text" }
 wpe-vfs = { version = "0.1.0", path = "../wpe-vfs" }
+wpe-web = { version = "0.1.0", path = "../wpe-web", optional = true }
+
+[features]
+# Web wallpapers, rendered with Servo.
+web = ["dep:wpe-web"]

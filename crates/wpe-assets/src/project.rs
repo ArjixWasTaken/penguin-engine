@@ -43,6 +43,13 @@ impl Project {
             .is_some_and(|k| k.eq_ignore_ascii_case("scene"))
     }
 
+    /// Whether this is a web wallpaper (its `file` is the page).
+    pub fn is_web(&self) -> bool {
+        self.kind
+            .as_deref()
+            .is_some_and(|k| k.eq_ignore_ascii_case("web"))
+    }
+
     /// Whether this is a video wallpaper (its `file` is the video).
     pub fn is_video(&self) -> bool {
         self.kind
@@ -89,13 +96,37 @@ pub struct UserProperty {
     pub condition: Option<String>,
 }
 
-/// One entry of a `combo` property's option list.
+/// One entry of a `combo` property's option list. A bare string (some
+/// web wallpapers list options that way) is both label and value.
 #[derive(Debug, Clone, Default, Deserialize)]
-#[serde(default)]
+#[serde(from = "RawOption")]
 pub struct PropertyOption {
-    #[serde(deserialize_with = "lenient_opt_string")]
     pub label: Option<String>,
     pub value: Value,
+}
+
+#[derive(Deserialize)]
+#[serde(untagged)]
+enum RawOption {
+    Full {
+        #[serde(default, deserialize_with = "lenient_opt_string")]
+        label: Option<String>,
+        #[serde(default)]
+        value: Value,
+    },
+    Bare(Value),
+}
+
+impl From<RawOption> for PropertyOption {
+    fn from(raw: RawOption) -> Self {
+        match raw {
+            RawOption::Full { label, value } => Self { label, value },
+            RawOption::Bare(value) => Self {
+                label: value.as_str().map(ToOwned::to_owned),
+                value,
+            },
+        }
+    }
 }
 
 /// Name of the scene JSON inside the wallpaper's package.
@@ -118,6 +149,17 @@ pub fn resolve_scene_file(project: &Project, vfs: &Vfs) -> String {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn bare_string_options() {
+        let p: super::UserProperty = serde_json::from_str(
+            r#"{"type": "combo", "value": "a", "options": ["a", {"label": "B", "value": "b"}]}"#,
+        )
+        .unwrap();
+        assert_eq!(p.options[0].label.as_deref(), Some("a"));
+        assert_eq!(p.options[0].value, "a");
+        assert_eq!(p.options[1].label.as_deref(), Some("B"));
+    }
+
     use std::borrow::Cow;
 
     use super::*;

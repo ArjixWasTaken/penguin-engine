@@ -31,7 +31,7 @@ impl Stats {
         if !self.seen.insert(key) {
             return;
         }
-        match material::prepare(&files.vfs, store, pass, &BTreeMap::new()) {
+        match material::prepare(&files.vfs, store, &mut Default::default(), pass, &BTreeMap::new()) {
             Ok(_) => self.ok += 1,
             Err(e) => {
                 self.failed += 1;

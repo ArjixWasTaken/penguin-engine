@@ -1,0 +1,588 @@
+//! The thread Servo runs on. Servo isn't `Send`, so it lives here with
+//! every page's WebView and rendering context, driven by [`Cmd`]s.
+
+use std::cell::RefCell;
+use std::collections::HashMap;
+use std::rc::Rc;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::mpsc::{Receiver, RecvTimeoutError, Sender, channel};
+use std::sync::{Arc, Mutex, OnceLock};
+use std::thread::JoinHandle;
+use std::time::{Duration, Instant};
+
+use dpi::PhysicalSize;
+use euclid::Scale;
+use http::{HeaderValue, StatusCode};
+use servo::{
+    ConsoleLogLevel, CreateNewWebViewRequest, DevicePoint, EventLoopWaker, InputEvent, LoadStatus,
+    MouseButton, MouseButtonAction, MouseButtonEvent, MouseMoveEvent, NavigationRequest,
+    PermissionRequest, RenderingContext, Servo, ServoBuilder, UserContentManager, UserScript,
+    WebResourceLoad, WebResourceResponse, WebView, WebViewBuilder, WebViewDelegate, WebViewId,
+    WheelDelta, WheelEvent, WheelMode,
+};
+use url::Url;
+
+use crate::context::PageContext;
+use crate::policy::{self, NetworkPolicy, Verdict};
+use crate::{Button, Frame, Input, PageOptions, Shared, WebError};
+
+pub enum Cmd {
+    Open {
+        id: u64,
+        options: Box<PageOptions>,
+        shared: Arc<Shared>,
+        ready: Sender<Result<(), WebError>>,
+    },
+    Resize {
+        id: u64,
+        size: (u32, u32),
+    },
+    Input {
+        id: u64,
+        input: Input,
+    },
+    Js {
+        id: u64,
+        script: String,
+    },
+    Paused {
+        id: u64,
+        paused: bool,
+    },
+    Close {
+        id: u64,
+    },
+    /// Whether `host` resolved to a local address, for the loads waiting on it.
+    Resolved {
+        host: String,
+        local: bool,
+    },
+    /// Servo has work to do.
+    Wake,
+    Shutdown(Sender<()>),
+}
+
+struct Host {
+    tx: Mutex<Sender<Cmd>>,
+    thread: Mutex<Option<JoinHandle<()>>>,
+}
+
+static HOST: OnceLock<Host> = OnceLock::new();
+static NEXT_ID: AtomicU64 = AtomicU64::new(1);
+
+fn host(profile_dir: Option<&std::path::Path>) -> &'static Host {
+    HOST.get_or_init(|| {
+        let (tx, rx) = channel();
+        let waker = tx.clone();
+        let profile_dir = profile_dir.map(ToOwned::to_owned);
+        let thread = std::thread::Builder::new()
+            .name("servo".to_owned())
+            .spawn(move || run(rx, waker, profile_dir))
+            .expect("spawn the servo thread");
+        Host {
+            tx: Mutex::new(tx),
+            thread: Mutex::new(Some(thread)),
+        }
+    })
+}
+
+pub fn send(cmd: Cmd) {
+    if let Some(host) = HOST.get() {
+        let _ = host.tx.lock().unwrap().send(cmd);
+    }
+}
+
+/// Open a page on the Servo thread (starting it on first use) and wait
+/// for it to be ready, at most `timeout`.
+pub fn open(options: PageOptions, shared: Arc<Shared>, timeout: Duration) -> Result<u64, WebError> {
+    let id = NEXT_ID.fetch_add(1, Ordering::Relaxed);
+    let (ready, ready_rx) = channel();
+    let host = host(options.profile_dir.as_deref());
+    host.tx
+        .lock()
+        .unwrap()
+        .send(Cmd::Open {
+            id,
+            options: Box::new(options),
+            shared,
+            ready,
+        })
+        .map_err(|_| WebError::HostGone)?;
+    match ready_rx.recv_timeout(timeout) {
+        Ok(Ok(())) => Ok(id),
+        Ok(Err(e)) => Err(e),
+        Err(RecvTimeoutError::Timeout) => {
+            tracing::warn!("page {id} still loading after {timeout:?}; showing it anyway");
+            Ok(id)
+        }
+        Err(RecvTimeoutError::Disconnected) => Err(WebError::HostGone),
+    }
+}
+
+/// Close every page and stop Servo, waiting at most `timeout`. Apps call
+/// this before exiting, after dropping their pages.
+pub fn shutdown(timeout: Duration) {
+    let Some(host) = HOST.get() else {
+        return;
+    };
+    let (done, done_rx) = channel();
+    if host.tx.lock().unwrap().send(Cmd::Shutdown(done)).is_err() {
+        return;
+    }
+    if done_rx.recv_timeout(timeout).is_ok() {
+        if let Some(thread) = host.thread.lock().unwrap().take() {
+            let _ = thread.join();
+        }
+    } else {
+        tracing::warn!("servo didn't stop within {timeout:?}");
+    }
+}
+
+#[derive(Clone)]
+struct Waker(Sender<Cmd>);
+
+impl EventLoopWaker for Waker {
+    fn clone_box(&self) -> Box<dyn EventLoopWaker> {
+        Box::new(self.clone())
+    }
+    fn wake(&self) {
+        let _ = self.0.send(Cmd::Wake);
+    }
+}
+
+struct Page {
+    id: u64,
+    webview: WebView,
+    context: Rc<PageContext>,
+    shared: Arc<Shared>,
+    root: std::path::PathBuf,
+    origin: Url,
+    network: NetworkPolicy,
+    ready: Option<Sender<Result<(), WebError>>>,
+    loaded: bool,
+    paused: bool,
+}
+
+struct Pages {
+    by_webview: RefCell<HashMap<WebViewId, Page>>,
+    /// Back to the Servo thread's queue.
+    tx: Sender<Cmd>,
+    /// Whether hosts resolve to local addresses, once known.
+    resolved: RefCell<HashMap<String, bool>>,
+    /// Loads waiting for their host to resolve.
+    waiting: RefCell<HashMap<String, Vec<(WebResourceLoad, Url)>>>,
+}
+
+impl Pages {
+    fn with<R>(&self, webview: &WebView, f: impl FnOnce(&mut Page) -> R) -> Option<R> {
+        self.by_webview.borrow_mut().get_mut(&webview.id()).map(f)
+    }
+
+    fn by_id<R>(&self, id: u64, f: impl FnOnce(&mut Page) -> R) -> Option<R> {
+        self.by_webview
+            .borrow_mut()
+            .values_mut()
+            .find(|p| p.id == id)
+            .map(f)
+    }
+
+    /// Page `id`'s WebView, to call into Servo with nothing borrowed.
+    fn webview(&self, id: u64) -> Option<WebView> {
+        self.by_id(id, |p| p.webview.clone())
+    }
+}
+
+impl WebViewDelegate for Pages {
+    fn notify_new_frame_ready(&self, webview: WebView) {
+        // Servo may call back into the delegate while painting, so nothing
+        // stays borrowed across it.
+        let Some((context, shared, paused)) = self.with(&webview, |p| {
+            (p.context.clone(), p.shared.clone(), p.paused)
+        }) else {
+            return;
+        };
+        if paused {
+            return;
+        }
+        let _ = context.make_current();
+        webview.paint();
+        if let Some(image) = context.read_frame() {
+            let (width, height) = image.dimensions();
+            *shared.frame.lock().unwrap() = Some(Frame {
+                width,
+                height,
+                pixels: image.into_raw(),
+            });
+            shared.fresh.store(true, Ordering::Release);
+        }
+        context.present();
+        self.with(&webview, |page| {
+            if page.loaded && page.ready.is_some() {
+                page.became_ready();
+            }
+        });
+    }
+
+    fn notify_load_status_changed(&self, webview: WebView, status: LoadStatus) {
+        if status == LoadStatus::Complete {
+            self.with(&webview, |page| {
+                page.loaded = true;
+                tracing::debug!("page {} loaded", page.id);
+                // The first frame after load marks it ready.
+                if page.shared.fresh.load(Ordering::Acquire) {
+                    page.became_ready();
+                }
+            });
+        }
+    }
+
+    fn load_web_resource(&self, webview: WebView, load: WebResourceLoad) {
+        let Some((root, origin, network)) = self.with(&webview, |p| {
+            (p.root.clone(), p.origin.clone(), p.network.clone())
+        }) else {
+            return;
+        };
+        let url = load.request().url.clone();
+        if url.origin() == origin.origin() {
+            serve(load, root, url);
+            return;
+        }
+        match network.check(&url) {
+            Verdict::Allow => {}
+            Verdict::Block => block(load, &url),
+            Verdict::Resolve(host, port) => {
+                if let Some(&local) = self.resolved.borrow().get(&host) {
+                    if local {
+                        block(load, &url);
+                    }
+                    return;
+                }
+                let mut waiting = self.waiting.borrow_mut();
+                let queue = waiting.entry(host.clone()).or_default();
+                queue.push((load, url));
+                if queue.len() == 1 {
+                    // Resolving may take a while; keep Servo's thread free.
+                    let tx = self.tx.clone();
+                    std::thread::spawn(move || {
+                        let local = policy::resolves_local(&host, port);
+                        let _ = tx.send(Cmd::Resolved { host, local });
+                    });
+                }
+            }
+        }
+    }
+
+    fn request_navigation(&self, webview: WebView, request: NavigationRequest) {
+        let same_origin = self
+            .with(&webview, |p| request.url.origin() == p.origin.origin())
+            .unwrap_or(false);
+        if same_origin || request.url.scheme() == "about" || request.url.scheme() == "data" {
+            request.allow();
+        } else {
+            tracing::info!("blocked navigation to {}", request.url);
+            request.deny();
+        }
+    }
+
+    fn request_create_new(&self, _parent: WebView, _request: CreateNewWebViewRequest) {
+        // No popups: ignoring the request opens nothing.
+    }
+
+    fn request_permission(&self, _webview: WebView, request: PermissionRequest) {
+        request.deny();
+    }
+
+    fn show_console_message(&self, webview: WebView, level: ConsoleLogLevel, message: String) {
+        let id = self.with(&webview, |p| p.id).unwrap_or(0);
+        match level {
+            ConsoleLogLevel::Error => {
+                tracing::warn!(target: "wpe_web::console", "[{id}] {message}")
+            }
+            ConsoleLogLevel::Warn => tracing::info!(target: "wpe_web::console", "[{id}] {message}"),
+            _ => tracing::debug!(target: "wpe_web::console", "[{id}] {message}"),
+        }
+    }
+
+    fn notify_crashed(&self, webview: WebView, reason: String, _backtrace: Option<String>) {
+        tracing::warn!("page crashed: {reason}");
+        webview.reload();
+    }
+}
+
+impl Page {
+    fn became_ready(&mut self) {
+        self.shared.ready.store(true, Ordering::Release);
+        if let Some(ready) = self.ready.take() {
+            let _ = ready.send(Ok(()));
+        }
+    }
+}
+
+fn block(load: WebResourceLoad, url: &Url) {
+    tracing::info!("blocked a request to {url} (a local address)");
+    load.intercept(WebResourceResponse::new(url.clone()))
+        .cancel();
+}
+
+/// Answer a request on the page's own origin from its directory.
+fn serve(load: WebResourceLoad, root: std::path::PathBuf, url: Url) {
+    let range = load
+        .request()
+        .headers
+        .get(http::header::RANGE)
+        .and_then(|v| v.to_str().ok())
+        .map(ToOwned::to_owned);
+    let response = crate::serve::get(&root, url.path(), range.as_deref());
+    if response.status == 404 {
+        tracing::debug!("not found: {}", url.path());
+    }
+    let mut head = WebResourceResponse::new(url);
+    head.status_code = StatusCode::from_u16(response.status).unwrap_or(StatusCode::OK);
+    head.status_message = head
+        .status_code
+        .canonical_reason()
+        .unwrap_or("")
+        .as_bytes()
+        .to_vec();
+    for (name, value) in response.headers {
+        if let Ok(value) = HeaderValue::from_str(&value) {
+            head.headers.insert(name, value);
+        }
+    }
+    let mut intercepted = load.intercept(head);
+    if !response.body.is_empty() {
+        intercepted.send_body_data(response.body);
+    }
+    intercepted.finish();
+}
+
+fn run(rx: Receiver<Cmd>, waker: Sender<Cmd>, profile_dir: Option<std::path::PathBuf>) {
+    let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
+    let mut opts = servo::Opts::default();
+    if let Some(dir) = &profile_dir {
+        let _ = std::fs::create_dir_all(dir);
+        opts.config_dir = Some(dir.clone());
+    }
+    let prefs = servo::Preferences {
+        dom_webgl2_enabled: false,
+        network_http_proxy_uri: String::new(),
+        devtools_server_enabled: false,
+        ..Default::default()
+    };
+    let servo = ServoBuilder::default()
+        .opts(opts)
+        .preferences(prefs)
+        .event_loop_waker(Box::new(Waker(waker.clone())))
+        .build();
+    let pages = Rc::new(Pages {
+        by_webview: Default::default(),
+        tx: waker,
+        resolved: Default::default(),
+        waiting: Default::default(),
+    });
+
+    let mut shutdown = None;
+    loop {
+        let cmd = match rx.recv_timeout(Duration::from_millis(250)) {
+            Ok(cmd) => Some(cmd),
+            Err(RecvTimeoutError::Timeout) => None,
+            Err(RecvTimeoutError::Disconnected) => break,
+        };
+        match cmd {
+            Some(Cmd::Open {
+                id,
+                options,
+                shared,
+                ready,
+            }) => open_page(&servo, &pages, id, *options, shared, ready),
+            Some(Cmd::Resize { id, size }) => {
+                if let Some(webview) = pages.webview(id) {
+                    webview.resize(PhysicalSize::new(size.0, size.1));
+                }
+            }
+            Some(Cmd::Input { id, input }) => {
+                if let Some(webview) = pages.webview(id) {
+                    webview.notify_input_event(input_event(input));
+                }
+            }
+            Some(Cmd::Js { id, script }) => {
+                if let Some(webview) = pages.webview(id) {
+                    webview.evaluate_javascript(script, move |result| {
+                        if let Err(e) = result {
+                            tracing::debug!("page {id}: script failed: {e:?}");
+                        }
+                    });
+                }
+            }
+            Some(Cmd::Paused { id, paused }) => {
+                if let Some(webview) = pages.webview(id) {
+                    pages.by_id(id, |p| p.paused = paused);
+                    webview.evaluate_javascript(
+                        format!("window.__wpe && __wpe.setPaused({paused})"),
+                        |_| {},
+                    );
+                    if paused {
+                        webview.hide();
+                    } else {
+                        webview.show();
+                    }
+                }
+            }
+            Some(Cmd::Close { id }) => {
+                let closed: Vec<Page> = {
+                    let mut by_webview = pages.by_webview.borrow_mut();
+                    let ids: Vec<WebViewId> = by_webview
+                        .iter()
+                        .filter(|(_, p)| p.id == id)
+                        .map(|(k, _)| *k)
+                        .collect();
+                    ids.iter().filter_map(|k| by_webview.remove(k)).collect()
+                };
+                drop(closed);
+            }
+            Some(Cmd::Resolved { host, local }) => {
+                pages.resolved.borrow_mut().insert(host.clone(), local);
+                let loads = pages.waiting.borrow_mut().remove(&host).unwrap_or_default();
+                for (load, url) in loads {
+                    // A dropped load goes ahead.
+                    if local {
+                        block(load, &url);
+                    }
+                }
+            }
+            Some(Cmd::Wake) | None => {}
+            Some(Cmd::Shutdown(done)) => {
+                let closed: Vec<Page> = pages
+                    .by_webview
+                    .borrow_mut()
+                    .drain()
+                    .map(|(_, p)| p)
+                    .collect();
+                drop(closed);
+                shutdown = Some(done);
+            }
+        }
+        servo.spin_event_loop();
+        if shutdown.is_some() {
+            break;
+        }
+    }
+    // Let Servo finish closing the pages before it goes.
+    let deadline = Instant::now() + Duration::from_millis(500);
+    while Instant::now() < deadline {
+        servo.spin_event_loop();
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    drop(servo);
+    if let Some(done) = shutdown {
+        let _ = done.send(());
+    }
+}
+
+fn open_page(
+    servo: &Servo,
+    pages: &Rc<Pages>,
+    id: u64,
+    options: PageOptions,
+    shared: Arc<Shared>,
+    ready: Sender<Result<(), WebError>>,
+) {
+    let size = PhysicalSize::new(options.size.0.max(1), options.size.1.max(1));
+    let context = match PageContext::new(size) {
+        Ok(c) => Rc::new(c),
+        Err(e) => {
+            let _ = ready.send(Err(WebError::Context(format!("{e:?}"))));
+            return;
+        }
+    };
+    let _ = context.make_current();
+    if crate::serve::find(&options.root, &options.file).is_none() {
+        let _ = ready.send(Err(WebError::BadFile(options.file.clone())));
+        return;
+    }
+    let origin = Url::parse(&format!(
+        "http://{}.wallpaper.localhost/",
+        host_label(&options.name)
+    ))
+    .expect("a valid origin");
+    let url = origin
+        .join(&options.file)
+        .unwrap_or_else(|_| origin.clone());
+    let content = Rc::new(UserContentManager::new(servo));
+    content.add_script(Rc::new(UserScript::new(
+        crate::shim::script(&options.properties, &options.general),
+        None,
+    )));
+    let webview = WebViewBuilder::new(servo, context.clone())
+        .url(url.clone())
+        .hidpi_scale_factor(Scale::new(options.scale.max(0.1)))
+        .user_content_manager(content)
+        .delegate(pages.clone())
+        .build();
+    tracing::debug!("page {id}: opening {url} at {}x{}", size.width, size.height);
+    pages.by_webview.borrow_mut().insert(
+        webview.id(),
+        Page {
+            id,
+            webview,
+            context,
+            shared,
+            root: options.root,
+            origin,
+            network: options.network,
+            ready: Some(ready),
+            loaded: false,
+            paused: false,
+        },
+    );
+}
+
+/// `name` made into one DNS label.
+fn host_label(name: &str) -> String {
+    let label: String = name
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() {
+                c.to_ascii_lowercase()
+            } else {
+                '-'
+            }
+        })
+        .take(63)
+        .collect();
+    let label = label.trim_matches('-');
+    if label.is_empty() {
+        "page".to_owned()
+    } else {
+        label.to_owned()
+    }
+}
+
+fn input_event(input: Input) -> InputEvent {
+    let point = |x: f32, y: f32| DevicePoint::new(x, y).into();
+    match input {
+        Input::Move(x, y) => InputEvent::MouseMove(MouseMoveEvent::new(point(x, y))),
+        Input::Button(button, down, x, y) => InputEvent::MouseButton(MouseButtonEvent::new(
+            if down {
+                MouseButtonAction::Down
+            } else {
+                MouseButtonAction::Up
+            },
+            match button {
+                Button::Left => MouseButton::Primary,
+                Button::Middle => MouseButton::Auxiliary,
+                Button::Right => MouseButton::Secondary,
+            },
+            point(x, y),
+        )),
+        Input::Wheel { dx, dy, x, y } => InputEvent::Wheel(WheelEvent::new(
+            WheelDelta {
+                x: dx as f64,
+                y: dy as f64,
+                z: 0.0,
+                mode: WheelMode::DeltaPixel,
+            },
+            point(x, y),
+        )),
+    }
+}

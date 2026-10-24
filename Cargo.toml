@@ -1,6 +1,8 @@
 [workspace]
 resolver = "2"
 members = ["crates/*", "apps/*", "tools/*"]
+# wpe-web pulls in Servo; build it explicitly (`-p wpe-web`, or `--features web`).
+default-members = ["crates/wpe-assets", "crates/wpe-audio", "crates/wpe-ipc", "crates/wpe-mdl", "crates/wpe-media", "crates/wpe-particles", "crates/wpe-render", "crates/wpe-runtime", "crates/wpe-scene", "crates/wpe-script", "crates/wpe-shader", "crates/wpe-text", "crates/wpe-vfs", "apps/*", "tools/*"]
 
 [workspace.package]
 version = "0.1.0"

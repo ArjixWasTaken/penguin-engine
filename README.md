@@ -17,10 +17,16 @@ Video textures need libmpv. Frames are decoded with VA-API and handed to wgpu as
 without touching the CPU; this needs the Vulkan backend and a Mesa EGL driver. Otherwise
 mpv decodes in software and frames are uploaded (`WPE_VIDEO=cpu` forces this path).
 
+Web wallpapers are rendered with [Servo](https://servo.org), behind the `web` cargo feature
+(off by default; the first build downloads a prebuilt SpiderMonkey and takes a few minutes):
+`cargo build --release -p wallpaper --features web`, likewise for `scene-viewer`. Pages paint on
+the GPU through an offscreen EGL context (`WPE_WEB=cpu` forces Mesa's software renderer); page
+media needs GStreamer.
+
 ## Status
 
-Plays Wallpaper Engine scene and video wallpapers (web and application wallpapers are not
-supported). Video wallpapers play their `.mp4` full screen through libmpv (GPU decoding, the
+Plays Wallpaper Engine scene, video and (with the `web` feature) web wallpapers; application
+wallpapers are not supported. Video wallpapers play their `.mp4` full screen through libmpv (GPU decoding, the
 fill modes, sound with `--audio`). Scenes render with their own shaders, compiled from WE's
 GLSL/HLSL dialect to SPIR-V and run through wgpu:
 
@@ -77,6 +83,7 @@ wallpaper's load time went (texture decoding, shaders, uploads, pipelines, scrip
 | `crates/wpe-mdl` | `.mdl` puppet/model parsing, bone animation and blend shapes |
 | `crates/wpe-script` | SceneScript runtime (QuickJS) |
 | `crates/wpe-audio` | Sound playback and audio spectrum |
+| `crates/wpe-web` | Web wallpapers: Servo host thread, file serving, Wallpaper Engine's JS API |
 | `crates/wpe-runtime` | Embeddable API tying loading, animation and rendering together |
 | `crates/wpe-ipc` | The `wallpaper` daemon's control protocol (requests, responses, client) |
 | `apps/scene-viewer` | Windowed scene viewer |
@@ -96,6 +103,16 @@ cargo run --release -p scene-viewer -- <wallpaper> --audio --fps 30 --stats
 
 The assets directory is found automatically for common Steam installs; pass `--assets` otherwise.
 Set `WPE_DUMP_SHADERS=<dir>` to dump the final GLSL of every compiled shader.
+
+### Web wallpapers
+
+A web wallpaper's directory is served at `http://<workshop id>.wallpaper.localhost/` (its own
+local storage, kept under `<data dir>/wallpaper-engine-rs/web`). Pages get Wallpaper Engine's
+JavaScript API: `wallpaperPropertyListener` (`applyUserProperties`, `applyGeneralProperties`,
+`setPaused`) and `wallpaperRegisterAudioListener`. They may load from the internet, but not
+from this machine or the local network (localhost, private and link-local addresses, and names
+resolving to them); `WPE_WEB_ALLOW_HOSTS=nas.lan,192.168.1.10` lets chosen hosts through.
+Navigating away from the wallpaper and popups are blocked.
 
 ## Desktop wallpaper (Wayland)
 

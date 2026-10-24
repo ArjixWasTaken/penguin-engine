@@ -89,7 +89,7 @@ fn main() -> Result<()> {
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| "info,wgpu_core=warn,wgpu_hal=warn,naga=error".into()),
+                .unwrap_or_else(|_| "info,wgpu_core=warn,wgpu_hal=warn,naga=error,script=warn,webrender=warn,layout=warn,style=warn,net=warn,fonts=warn,constellation=warn,storage=error,profile_traits=error".into()),
         )
         .init();
     let args = Args::parse();
@@ -137,6 +137,14 @@ fn screenshot(args: &Args, assets: &std::path::Path, out: &std::path::Path) -> R
         wallpaper.set_audio(true);
     }
     wallpaper.seek_videos(args.time);
+    // A page runs on the wall clock and lays out at the output size, so it
+    // is shown at full size throughout and given time to load its assets.
+    let web = wallpaper.is_web();
+    let small = if web { args.size } else { (64, 64) };
+    if web {
+        wallpaper.capture(&gpu, args.size);
+        std::thread::sleep(std::time::Duration::from_secs_f32(args.time.max(3.0)));
+    }
     for frame in 1..args.frames {
         wallpaper.time_override = Some(args.time + frame as f32 / 30.0);
         // Every half second, press and release somewhere on a 4x4 grid.
@@ -150,7 +158,10 @@ fn screenshot(args: &Args, assets: &std::path::Path, out: &std::path::Path) -> R
             8 => wallpaper.mouse_button(false),
             _ => {}
         }
-        wallpaper.capture(&gpu, (64, 64));
+        wallpaper.capture(&gpu, small);
+        if web {
+            std::thread::sleep(std::time::Duration::from_millis(33));
+        }
     }
     wallpaper.time_override = Some(args.time + args.frames.saturating_sub(1) as f32 / 30.0);
     let pixels = wallpaper.capture(&gpu, args.size);

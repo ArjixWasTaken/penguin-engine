@@ -758,6 +758,23 @@ pub struct FrameCache {
 }
 
 impl FrameCache {
+    /// The GPU copy of texture `name`, once a build has uploaded it.
+    #[cfg_attr(not(feature = "web"), allow(dead_code))]
+    pub fn uploaded(&mut self, vfs: &Vfs, name: &str) -> Option<Arc<GpuTexture>> {
+        let texture = self.store.get(vfs, name)?;
+        let key = Arc::as_ptr(&texture) as usize;
+        self.uploaded.get(&key).map(|(_, t)| t.clone())
+    }
+
+    /// Replace texture `name`, dropping the old one's GPU copy.
+    #[cfg_attr(not(feature = "web"), allow(dead_code))]
+    pub fn replace(&mut self, vfs: &Vfs, name: &str, texture: Texture) {
+        if let Some(old) = self.store.get(vfs, name) {
+            self.uploaded.remove(&(Arc::as_ptr(&old) as usize));
+        }
+        self.store.insert(name, texture);
+    }
+
     pub fn new(gpu: &Gpu, store: TextureStore, white: Texture) -> Self {
         Self {
             store,
