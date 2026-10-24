@@ -13,13 +13,14 @@ use serde_json::Value;
 use wpe_assets::scene::SceneObject;
 use wpe_assets::value::Dynamic;
 use wpe_render::{CardMesh, Gpu, GpuTexture, SceneRenderer};
-use wpe_scene::{ImageLayer, Motion};
+use wpe_scene::ImageLayer;
 use wpe_script::{CursorEvent, CursorEventKind, CursorState, ScriptRuntime, ScriptValue};
 use wpe_vfs::Vfs;
 
 pub use edit::{SceneEdit, apply as apply_edits, resolve_paths};
 use host::{LayerState, ScriptHost, vec3};
 
+use crate::clock::SharedClocks;
 use crate::frame::LayerSteps;
 use crate::sound::{SoundCommand, SoundState};
 use crate::video::VideoStream;
@@ -118,6 +119,7 @@ impl Scripts {
         project: &wpe_assets::Project,
         view: &SceneView,
         canvas: Vec2,
+        clocks: SharedClocks,
     ) -> Option<Self> {
         let scripts: Vec<_> = view.doc.objects.iter().map(scripted).collect();
         if scripts.iter().all(Vec::is_empty) {
@@ -143,6 +145,7 @@ impl Scripts {
         let by_layer: HashMap<i32, &ImageLayer> = view.layers.iter().map(|l| (l.id, l)).collect();
         let mut host = ScriptHost::new(canvas, view.videos.clone());
         host.sounds = view.sounds.clone();
+        host.clocks = clocks;
         for obj in &view.doc.objects {
             let Some(c) = obj.common() else { continue };
             let steps = view.steps.get(&c.id).cloned().unwrap_or_default();
@@ -183,7 +186,15 @@ impl Scripts {
 
     /// Run the scripts' frame. Follow with [`Self::take_edits`] and
     /// [`Self::apply`].
-    pub fn update(&mut self, time: f32, pointer: Vec2, spectrum: Option<wpe_audio::AudioSpectrum>) {
+    /// `ended_animations`: layers whose animations reached their end, for
+    /// their `addEndedCallback` callbacks.
+    pub fn update(
+        &mut self,
+        time: f32,
+        pointer: Vec2,
+        spectrum: Option<wpe_audio::AudioSpectrum>,
+        ended_animations: &[i32],
+    ) {
         let time = time as f64;
         let dt = (time - self.last_time).clamp(0.0, 0.25);
         self.last_time = time;
@@ -194,6 +205,7 @@ impl Scripts {
             .iter()
             .filter(|(_, v)| v.take_ended())
             .map(|(&id, _)| id)
+            .chain(ended_animations.iter().copied())
             .collect();
         for id in ended {
             tracing::trace!("layer {id} video ended");
@@ -260,7 +272,8 @@ impl Scripts {
         if !l.visible {
             return false;
         }
-        let local = layer_motion(l)
+        let local = l
+            .motion_now()
             .transform_at(0.0)
             .inverse()
             .transform_point3(world.extend(0.0));
@@ -313,7 +326,7 @@ impl Scripts {
                 }
             }
             if l.dirty_transform {
-                let model = layer_motion(l).transform_at(0.0);
+                let model = l.motion_now().transform_at(0.0);
                 for &step in &l.steps.model {
                     renderer.set_model(step, model);
                 }
@@ -334,19 +347,6 @@ impl Scripts {
             l.dirty_color = false;
             l.dirty_text = false;
         }
-    }
-}
-
-/// The layer's transform with script-set origin, scale and angles.
-fn layer_motion(l: &LayerState) -> Motion {
-    Motion {
-        origin: l.origin,
-        scale: l.scale,
-        angles: l.angles,
-        origin_animation: None,
-        scale_animation: None,
-        angles_animation: None,
-        ..l.motion.clone()
     }
 }
 

@@ -238,29 +238,52 @@ impl Puppet {
 
     /// Skinning matrices at `time` seconds since the layer started playing.
     pub fn bone_matrices(&self, time: f64, out: &mut Vec<Mat4>) {
+        self.bone_matrices_with(
+            |_, p| LayerPose {
+                time: time * p.rate,
+                blend: p.blend,
+                visible: p.visible,
+            },
+            out,
+        );
+    }
+
+    /// Skinning matrices with each animation layer (by index) where `pose`
+    /// puts it, e.g. under a script's control.
+    pub fn bone_matrices_with(
+        &self,
+        pose: impl Fn(usize, &AnimationLayer) -> LayerPose,
+        out: &mut Vec<Mat4>,
+    ) {
+        let poses: Vec<LayerPose> = self
+            .layers
+            .iter()
+            .enumerate()
+            .map(|(i, l)| pose(i, &l.params))
+            .collect();
         out.clear();
         out.reserve(self.bones.len());
         for (i, bone) in self.bones.iter().enumerate() {
             let mut translation = bone.rest_translation;
             let mut scale = bone.rest_scale;
             let mut rotation = bone.rest_rotation;
-            for layer in &self.layers {
+            for (layer, pose) in self.layers.iter().zip(&poses) {
                 let Some(anim) = layer.animation.map(|a| &self.animations[a]) else {
                     continue;
                 };
-                if !layer.params.visible {
+                if !pose.visible {
                     continue;
                 }
                 let Some(track) = anim.tracks.get(i).filter(|t| !t.is_empty()) else {
                     continue;
                 };
-                let (a, b, t) = anim.sample_point(time * layer.params.rate);
+                let (a, b, t) = anim.sample_point(pose.time);
                 let last = track.len() - 1;
                 let (fa, fb, base) = (track[a.min(last)], track[b.min(last)], track[0]);
                 let pos = fa.position.lerp(fb.position, t);
                 let scl = fa.scale.lerp(fb.scale, t);
                 let rot = fa.rotation.slerp(fb.rotation, t);
-                let w = layer.params.blend.clamp(0.0, 1.0) as f32;
+                let w = pose.blend.clamp(0.0, 1.0) as f32;
                 if layer.params.additive {
                     translation += w * (pos - base.position);
                     scale += w * (scl - base.scale);
@@ -296,4 +319,19 @@ impl Puppet {
         out.clear();
         out.extend(mats.iter().flat_map(Mat4::to_cols_array));
     }
+
+    /// Length of animation layer `layer`'s animation in seconds, if it exists.
+    pub fn layer_duration(&self, layer: usize) -> Option<f64> {
+        let anim = &self.animations[self.layers.get(layer)?.animation?];
+        (anim.fps > 0.0).then(|| f64::from(anim.length) / anim.fps)
+    }
+}
+
+/// Where one animation layer is: its time in seconds (rate applied), weight
+/// and visibility.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct LayerPose {
+    pub time: f64,
+    pub blend: f64,
+    pub visible: bool,
 }

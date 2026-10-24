@@ -1,5 +1,6 @@
 //! Embeddable wallpaper runtime: load a wallpaper and drive its render loop.
 
+mod clock;
 mod files;
 mod frame;
 pub mod material;
@@ -83,15 +84,17 @@ fn render_text_layers(
     }
 }
 
-/// Bind `texture` to every slot of engine texture `name`.
+/// Bind `texture` to every slot of engine texture `name`, or each slot's
+/// fallback without one.
 fn bind_system(
     renderer: &mut SceneRenderer,
-    slots: &[(usize, usize, String)],
+    slots: &[frame::SystemSlot],
     name: &str,
-    texture: &Arc<GpuTexture>,
+    texture: Option<&Arc<GpuTexture>>,
 ) {
-    for (step, slot, _) in slots.iter().filter(|(_, _, n)| n == name) {
-        renderer.set_texture(*step, *slot, texture.clone());
+    for s in slots.iter().filter(|s| s.name == name) {
+        let texture = texture.unwrap_or(&s.fallback);
+        renderer.set_texture(s.step, s.slot, texture.clone());
     }
 }
 
@@ -187,8 +190,12 @@ pub struct Wallpaper {
     audio: Option<wpe_audio::AudioCapture>,
     sounds: sound::Sounds,
     media: Option<media::Media>,
-    /// Engine texture slots of the current frame: step, slot and name.
-    system_slots: Vec<(usize, usize, String)>,
+    /// Engine texture slots of the current frame.
+    system_slots: Vec<frame::SystemSlot>,
+    /// Animation clocks, shared with the scripts.
+    clocks: clock::SharedClocks,
+    /// Draws showing a layer's sprite sheet: layer id and step.
+    sprite_steps: Vec<(i32, usize)>,
 }
 
 impl Wallpaper {
@@ -237,6 +244,8 @@ impl Wallpaper {
             sounds: sound::Sounds::load(&files, &props),
             media: None,
             system_slots: Vec::new(),
+            clocks: Default::default(),
+            sprite_steps: Vec::new(),
             props,
             vfs: files.vfs,
         };
@@ -255,9 +264,10 @@ impl Wallpaper {
             &files.project,
             &built.view(&objects, &sounds),
             wallpaper.camera.scene_size,
+            wallpaper.clocks.clone(),
         );
         if wallpaper.scripts.is_some() || !wallpaper.system_slots.is_empty() {
-            wallpaper.media = media::Media::start(gpu);
+            wallpaper.media = media::Media::start();
         }
         wallpaper.sync_scripts(gpu);
         Ok(wallpaper)
@@ -310,9 +320,25 @@ impl Wallpaper {
                 &mut self.renderer,
                 &self.system_slots,
                 media::THUMBNAIL,
-                &texture,
+                texture.as_ref(),
             );
         }
+        {
+            let mut clocks = self.clocks.borrow_mut();
+            for binding in &frame.bindings {
+                binding.register_clocks(&mut clocks);
+            }
+            for &(layer, step) in &frame.sprite_steps {
+                if let Some((frames, duration)) = self.renderer.sprite_timing(step)
+                    && duration > 0.0
+                {
+                    let fps = frames as f32 / duration;
+                    let clock = clock::Clock::new(fps, frames as f32, false, true);
+                    clocks.register(layer, clock::TEXTURE_ANIMATION.to_owned(), clock);
+                }
+            }
+        }
+        self.sprite_steps = frame.sprite_steps;
         self.camera = scene.camera;
         self.bindings = frame.bindings;
         self.particles = frame.particles;
@@ -404,12 +430,13 @@ impl Wallpaper {
                     &mut self.renderer,
                     &self.system_slots,
                     media::THUMBNAIL,
-                    &texture,
+                    texture.as_ref(),
                 );
             }
         }
         if let Some(scripts) = &mut self.scripts {
-            scripts.update(time, self.pointer, self.spectrum);
+            let ended = self.clocks.borrow_mut().take_ended();
+            scripts.update(time, self.pointer, self.spectrum, &ended);
         }
         self.sync_scripts(gpu);
     }
@@ -431,9 +458,18 @@ impl Wallpaper {
             time,
             pointer: self.pointer,
         };
+        let mut clocks = self.clocks.borrow_mut();
+        clocks.advance(time);
         for binding in &self.bindings {
-            binding.apply(&mut self.renderer, frame);
+            binding.apply(&mut self.renderer, frame, &clocks);
         }
+        for &(layer, step) in &self.sprite_steps {
+            let time = clocks
+                .get(layer, clock::TEXTURE_ANIMATION)
+                .map(clock::Clock::seconds);
+            self.renderer.set_sprite_time(step, time);
+        }
+        drop(clocks);
         let scene = self.camera.scene_size;
         let cursor = Vec2::new(self.pointer.x, 1.0 - self.pointer.y) * scene;
         for particles in &mut self.particles {

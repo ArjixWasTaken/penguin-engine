@@ -57,7 +57,7 @@ mod puppet;
 use bitflags::bitflags;
 use glam::{Mat4, Vec3};
 
-pub use puppet::{AnimationLayer, Puppet};
+pub use puppet::{AnimationLayer, LayerPose, Puppet};
 
 /// Errors from [`Mdl::parse`].
 #[derive(Debug, thiserror::Error)]

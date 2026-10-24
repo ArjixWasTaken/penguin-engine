@@ -17,6 +17,7 @@ use wpe_render::{
 use wpe_scene::{Animation, Bloom, ImageLayer, Motion, Parallax, apply_override};
 use wpe_vfs::Vfs;
 
+use crate::clock::{self, Clock, Clocks};
 use crate::material::{self, SlotTexture, TextureStore};
 use crate::video::VideoStream;
 
@@ -28,12 +29,24 @@ pub struct Frame {
     pub layer_videos: HashMap<i32, Arc<VideoStream>>,
     /// Layers whose draws start switched off.
     pub hidden: Vec<i32>,
-    /// Engine texture slots to bind while running: step, slot and name.
-    pub system_slots: Vec<(usize, usize, String)>,
+    /// Engine texture slots to bind while running.
+    pub system_slots: Vec<SystemSlot>,
+    /// Draws showing a layer's sprite sheet: layer id and step.
+    pub sprite_steps: Vec<(i32, usize)>,
     pub bindings: Vec<Binding>,
     pub particles: Vec<ParticleInstance>,
     /// Draws of each on-screen layer, by layer id.
     pub layer_steps: HashMap<i32, LayerSteps>,
+}
+
+/// A material slot showing an engine texture (`$mediaThumbnail`).
+#[derive(Clone)]
+pub struct SystemSlot {
+    pub step: usize,
+    pub slot: usize,
+    pub name: String,
+    /// What it shows while the engine has nothing: the material's texture.
+    pub fallback: Arc<GpuTexture>,
 }
 
 /// The draws an on-screen layer produced.
@@ -83,8 +96,8 @@ struct Resolved {
     uv_scale: Vec2,
     sprites: Vec<SpriteAnimation>,
     animated: Vec<(String, Vec<f32>, Animation)>,
-    /// Slots showing engine textures, by name (`$mediaThumbnail`).
-    system: Vec<(usize, String)>,
+    /// Slots showing engine textures (step filled in when drawn).
+    system: Vec<SystemSlot>,
 }
 
 /// A simulated particle object and the draws its subsystems feed.
@@ -204,12 +217,14 @@ impl LayerPuppet {
 pub enum Binding {
     /// The layer's animated and/or parallax-shifted transform.
     Model {
+        layer: i32,
         step: usize,
         motion: Motion,
         parallax: Option<LayerParallax>,
     },
     /// The layer's animated colour and alpha uniforms.
     Color {
+        layer: i32,
         step: usize,
         motion: Motion,
         color: glam::Vec3,
@@ -219,11 +234,13 @@ pub enum Binding {
     },
     /// A puppet's skinning matrices (`g_Bones`).
     Bones {
+        layer: i32,
         step: usize,
         puppet: Arc<LayerPuppet>,
     },
     /// An animated material constant.
     Constant {
+        layer: i32,
         step: usize,
         uniform: String,
         base: Vec<f32>,
@@ -262,15 +279,51 @@ pub struct FrameState {
 }
 
 impl Binding {
-    pub fn apply(&self, renderer: &mut wpe_render::SceneRenderer, frame: FrameState) {
-        let time = frame.time;
+    /// Give every animation this binding plays a clock (kept when it
+    /// already has one).
+    pub fn register_clocks(&self, clocks: &mut Clocks) {
+        let mut add = |layer: i32, a: &Animation| {
+            clocks.register(
+                layer,
+                clock::animation_key(&a.name),
+                Clock::for_animation(a),
+            );
+        };
+        match self {
+            Self::Model { layer, motion, .. } | Self::Color { layer, motion, .. } => {
+                motion.animations().for_each(|a| add(*layer, a))
+            }
+            Self::Constant {
+                layer, animation, ..
+            } => add(*layer, animation),
+            Self::Bones { layer, puppet, .. } => {
+                for (i, params) in puppet.puppet.layers().enumerate() {
+                    let mut clock = Clock::new(1.0, 0.0, false, true);
+                    clock.rate = params.rate as f32;
+                    clock.blend = params.blend as f32;
+                    clock.visible = params.visible;
+                    clocks.register(*layer, clock::layer_key(i), clock);
+                }
+            }
+        }
+    }
+
+    pub fn apply(
+        &self,
+        renderer: &mut wpe_render::SceneRenderer,
+        frame: FrameState,
+        clocks: &Clocks,
+    ) {
+        let scene_time = frame.time;
         match self {
             Self::Model {
+                layer,
                 step,
                 motion,
                 parallax,
             } => {
-                let mut model = motion.transform_at(time);
+                let mut model =
+                    motion.transform_at(|a: &Animation| clocks.time_of(*layer, a, scene_time));
                 if let Some(p) = parallax {
                     model =
                         Mat4::from_translation(p.offset(motion.position(), frame.pointer)) * model;
@@ -278,12 +331,14 @@ impl Binding {
                 renderer.set_model(*step, model);
             }
             Self::Color {
+                layer,
                 step,
                 motion,
                 color,
                 alpha,
                 neutral,
             } => {
+                let time = |a: &Animation| clocks.time_of(*layer, a, scene_time);
                 let c = motion.color_at(*color, time);
                 let a = motion.alpha_at(*alpha, time);
                 if !neutral {
@@ -294,18 +349,46 @@ impl Binding {
                 renderer.set_uniform(*step, "g_Alpha", vec![a]);
             }
             Self::Constant {
+                layer,
                 step,
                 uniform,
                 base,
                 animation,
-            } => renderer.set_uniform(*step, uniform, animation.sample(time, base)),
-            Self::Bones { step, puppet } => {
-                let mut padded = Vec::new();
-                puppet.puppet.bones(time as f64, &mut padded);
+            } => {
+                let time = |a: &Animation| clocks.time_of(*layer, a, scene_time);
+                renderer.set_uniform(*step, uniform, animation.sample(time, base))
+            }
+            Self::Bones {
+                layer,
+                step,
+                puppet,
+            } => {
+                let mut matrices = Vec::new();
+                puppet.puppet.bone_matrices_with(
+                    |i, params| match clocks.get(*layer, &clock::layer_key(i)) {
+                        Some(c) => wpe_mdl::LayerPose {
+                            time: c.seconds() as f64,
+                            blend: c.blend as f64,
+                            visible: c.visible,
+                        },
+                        None => wpe_mdl::LayerPose {
+                            time: scene_time as f64 * params.rate,
+                            blend: params.blend,
+                            visible: params.visible,
+                        },
+                    },
+                    &mut matrices,
+                );
                 // `mat4x3` columns are written tightly; the block layout pads them.
-                let bones = padded
-                    .chunks_exact(4)
-                    .flat_map(|column| column[..3].to_vec())
+                let bones = matrices
+                    .iter()
+                    .flat_map(|m| {
+                        let c = m.to_cols_array();
+                        [
+                            c[0], c[1], c[2], c[4], c[5], c[6], c[8], c[9], c[10], c[12], c[13],
+                            c[14],
+                        ]
+                    })
                     .collect();
                 renderer.set_uniform(*step, "g_Bones", bones);
             }
@@ -335,7 +418,8 @@ pub struct FrameBuilder<'a> {
     building: Option<i32>,
     /// Layers drawn but initially hidden.
     hidden: Vec<i32>,
-    system_slots: Vec<(usize, usize, String)>,
+    system_slots: Vec<SystemSlot>,
+    sprite_steps: Vec<(i32, usize)>,
     bindings: Vec<Binding>,
     parallax: Option<(Parallax, Vec2)>,
     /// Draws using their compiled material, and all draws.
@@ -391,6 +475,7 @@ impl<'a> FrameBuilder<'a> {
             building: None,
             hidden: Vec::new(),
             system_slots: Vec::new(),
+            sprite_steps: Vec::new(),
             bindings: Vec::new(),
             parallax: None,
             particles: Vec::new(),
@@ -407,6 +492,7 @@ impl<'a> FrameBuilder<'a> {
             layer_videos: self.layer_videos,
             hidden: self.hidden,
             system_slots: self.system_slots,
+            sprite_steps: self.sprite_steps,
             bindings: self.bindings,
             particles: self.particles,
             layer_steps: self.layer_steps,
@@ -527,9 +613,18 @@ impl<'a> FrameBuilder<'a> {
                     }
                     Some(TexRef::Asset(self.upload(t, &label)))
                 }
-                Some(SlotTexture::System(name)) => {
-                    system.push((slot, name.clone()));
-                    Some(TexRef::Asset(self.cache.white.clone()))
+                Some(SlotTexture::System(name, fallback)) => {
+                    let fallback = match fallback {
+                        Some(t) => self.upload(t, &format!("{label} slot {slot}")),
+                        None => self.cache.white.clone(),
+                    };
+                    system.push(SystemSlot {
+                        step: 0,
+                        slot,
+                        name: name.clone(),
+                        fallback: fallback.clone(),
+                    });
+                    Some(TexRef::Asset(fallback))
                 }
                 Some(SlotTexture::RenderTarget(name)) => {
                     let link = link_id(name).and_then(|id| self.links.get(&id).copied());
@@ -639,11 +734,17 @@ impl<'a> FrameBuilder<'a> {
         if let Some(steps) = self.current_steps() {
             steps.all.push(step);
         }
-        for (slot, name) in resolved.system {
-            self.system_slots.push((step, slot, name));
+        for slot in resolved.system {
+            self.system_slots.push(SystemSlot { step, ..slot });
+        }
+        if !resolved.sprites.is_empty()
+            && let Some(layer) = self.building
+        {
+            self.sprite_steps.push((layer, step));
         }
         for (uniform, base, animation) in resolved.animated {
             self.bindings.push(Binding::Constant {
+                layer: self.building.unwrap_or(-1),
                 step,
                 uniform,
                 base,
@@ -918,6 +1019,7 @@ impl<'a> FrameBuilder<'a> {
     fn bind_puppet(&mut self, puppet: Option<Arc<LayerPuppet>>) {
         if let Some(puppet) = puppet.filter(|p| p.puppet.bone_count() > 0) {
             self.bindings.push(Binding::Bones {
+                layer: self.building.unwrap_or(-1),
                 step: self.steps.len() - 1,
                 puppet,
             });
@@ -941,6 +1043,7 @@ impl<'a> FrameBuilder<'a> {
         let parallax = self.layer_parallax(layer);
         if layer.motion.is_transform_animated() || parallax.is_some() {
             self.bindings.push(Binding::Model {
+                layer: layer.id,
                 step,
                 motion: layer.motion.clone(),
                 parallax,
@@ -965,6 +1068,7 @@ impl<'a> FrameBuilder<'a> {
         }
         if m.color_animation.is_some() || m.alpha_animation.is_some() {
             self.bindings.push(Binding::Color {
+                layer: layer.id,
                 step,
                 motion: m.clone(),
                 color: layer.color,

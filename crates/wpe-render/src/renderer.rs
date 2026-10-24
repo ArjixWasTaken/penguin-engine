@@ -174,6 +174,24 @@ impl SceneRenderer {
         }
     }
 
+    /// Play the sprite sheets of the draw at `step` at `time` seconds instead
+    /// of the scene's time; `None` returns them to the scene clock.
+    pub fn set_sprite_time(&mut self, step: usize, time: Option<f32>) {
+        if let Some(PreparedStep::Material(_, d)) = self.steps.get_mut(step) {
+            d.sprite_time = time;
+        }
+    }
+
+    /// Frame count and loop duration of the first sprite sheet of the draw
+    /// at `step`.
+    pub fn sprite_timing(&self, step: usize) -> Option<(usize, f32)> {
+        let Some(PreparedStep::Material(_, d)) = self.steps.get(step) else {
+            return None;
+        };
+        let anim = d.draw.sprites.first()?;
+        Some((anim.frames.len(), anim.duration()))
+    }
+
     /// Bind `texture` to `g_Texture<slot>` of the material draw at `step`.
     pub fn set_texture(&mut self, step: usize, slot: usize, texture: Arc<GpuTexture>) {
         if let Some(PreparedStep::Material(_, d)) = self.steps.get_mut(step) {

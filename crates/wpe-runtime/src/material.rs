@@ -69,8 +69,9 @@ pub enum SlotTexture {
     Asset(Arc<Texture>),
     /// A named render target (`_rt_*`), resolved by the renderer.
     RenderTarget(String),
-    /// An engine-provided texture (`$mediaThumbnail`), bound while running.
-    System(String),
+    /// An engine-provided texture (`$mediaThumbnail`), bound while running,
+    /// with the material's own texture for when the engine has none.
+    System(String, Option<Arc<Texture>>),
 }
 
 /// A material pass ready to draw: compiled program, slot textures and
@@ -104,7 +105,7 @@ fn format_define(format: TexFormat) -> Option<&'static str> {
 fn slot_info(tex: Option<&SlotTexture>) -> TexSlot {
     match tex {
         None => TexSlot::default(),
-        Some(SlotTexture::RenderTarget(_) | SlotTexture::System(_)) => TexSlot {
+        Some(SlotTexture::RenderTarget(_) | SlotTexture::System(..)) => TexSlot {
             enabled: true,
             components: [false; 3],
         },
@@ -148,7 +149,11 @@ pub fn prepare(
             if textures.len() <= slot {
                 textures.resize(slot + 1, None);
             }
-            textures[slot] = Some(SlotTexture::System(user.name.clone()));
+            let fallback = match textures[slot].take() {
+                Some(SlotTexture::Asset(t)) => Some(t),
+                _ => None,
+            };
+            textures[slot] = Some(SlotTexture::System(user.name.clone(), fallback));
         }
     }
 

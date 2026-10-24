@@ -11,28 +11,20 @@ pub const THUMBNAIL: &str = "$mediaThumbnail";
 
 pub struct Media {
     monitor: MediaMonitor,
-    /// The album art texture (transparent without art) and its generation.
-    texture: Arc<GpuTexture>,
+    /// The album art texture, if any, and its generation.
+    texture: Option<Arc<GpuTexture>>,
     generation: u64,
-}
-
-fn transparent(gpu: &Gpu) -> Arc<GpuTexture> {
-    Arc::new(upload_texture(
-        gpu,
-        &crate::rgba_texture(1, 1, vec![0; 4]),
-        "no album art",
-    ))
 }
 
 impl Media {
     /// Start watching media players; `None` without a session bus.
-    pub fn start(gpu: &Gpu) -> Option<Self> {
+    pub fn start() -> Option<Self> {
         let monitor = MediaMonitor::start()
             .inspect_err(|e| tracing::info!("media integration unavailable: {e}"))
             .ok()?;
         Some(Self {
             monitor,
-            texture: transparent(gpu),
+            texture: None,
             generation: 0,
         })
     }
@@ -42,21 +34,21 @@ impl Media {
         self.monitor.poll()
     }
 
-    /// The album art texture; `true` alongside it when it changed since the
-    /// last call.
-    pub fn thumbnail(&mut self, gpu: &Gpu) -> (Arc<GpuTexture>, bool) {
+    /// The album art texture (`None` without art); `true` alongside it when
+    /// it changed since the last call.
+    pub fn thumbnail(&mut self, gpu: &Gpu) -> (Option<Arc<GpuTexture>>, bool) {
         let generation = self.monitor.thumbnail_generation();
         if generation == self.generation {
             return (self.texture.clone(), false);
         }
         self.generation = generation;
         self.texture = match self.monitor.thumbnail() {
-            Some(art) if generation != 0 => Arc::new(upload_texture(
+            Some(art) if generation != 0 => Some(Arc::new(upload_texture(
                 gpu,
                 &crate::rgba_texture(art.width, art.height, art.rgba.clone()),
                 "album art",
-            )),
-            _ => transparent(gpu),
+            ))),
+            _ => None,
         };
         (self.texture.clone(), true)
     }

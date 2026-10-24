@@ -23,6 +23,8 @@ struct Key {
 /// interpolated linearly, as the reference renderer does.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Animation {
+    /// `options.name`, by which scripts control it (`getAnimation(name)`).
+    pub name: String,
     pub mode: AnimationMode,
     pub fps: f32,
     /// Length in frames.
@@ -75,6 +77,10 @@ impl Animation {
             return None;
         }
         Some(Self {
+            name: opt("name")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_owned(),
             mode,
             fps: opt("fps").and_then(number).unwrap_or(30.0),
             length: opt("length").and_then(number).unwrap_or(0.0),
@@ -122,10 +128,19 @@ impl Animation {
         Some(a.value + (frame - a.frame) / span * (b.value - a.value))
     }
 
+    /// Length in seconds.
+    pub fn duration(&self) -> f32 {
+        if self.fps > 0.0 {
+            self.length / self.fps
+        } else {
+            0.0
+        }
+    }
+
     /// `base` with each animated channel replaced (or offset, when relative)
-    /// at `time` seconds since the animation started.
-    pub fn sample(&self, time: f32, base: &[f32]) -> Vec<f32> {
-        let time = if self.start_paused { 0.0 } else { time };
+    /// at `time` (scene seconds, or a clock; see [`AnimationTime`]).
+    pub fn sample(&self, time: impl AnimationTime, base: &[f32]) -> Vec<f32> {
+        let time = time.time(self);
         let mut out = base.to_vec();
         for (i, keys) in self.channels.iter().enumerate() {
             let Some(v) = self.channel_at(keys, time) else {
@@ -141,6 +156,26 @@ impl Animation {
             };
         }
         out
+    }
+}
+
+/// Where an animation is in its timeline, in seconds.
+pub trait AnimationTime: Copy {
+    fn time(&self, animation: &Animation) -> f32;
+}
+
+/// Scene time: every animation plays from the start, except those that
+/// start paused, which hold their first frame.
+impl AnimationTime for f32 {
+    fn time(&self, animation: &Animation) -> f32 {
+        if animation.start_paused { 0.0 } else { *self }
+    }
+}
+
+/// Per-animation clocks (e.g. ones scripts play and pause).
+impl<F: Fn(&Animation) -> f32 + Copy> AnimationTime for F {
+    fn time(&self, animation: &Animation) -> f32 {
+        self(animation)
     }
 }
 

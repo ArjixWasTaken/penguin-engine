@@ -378,6 +378,11 @@ pub struct SpriteAnimation {
 }
 
 impl SpriteAnimation {
+    /// Seconds per loop through all frames.
+    pub fn duration(&self) -> f32 {
+        self.frames.iter().map(|f| f.duration.max(0.0)).sum()
+    }
+
     fn frame_at(&self, time: f32) -> Option<&SpriteFrame> {
         let total: f32 = self.frames.iter().map(|f| f.duration.max(0.0)).sum();
         if total <= 0.0 {
@@ -418,6 +423,8 @@ pub(crate) struct PreparedMaterialDraw {
     pub(crate) draw: MaterialDraw,
     /// Uniform values replaced every frame (animations, scripts).
     pub(crate) overrides: HashMap<String, Vec<f32>>,
+    /// Sprite-sheet time instead of the scene's (scripts' texture animation).
+    pub(crate) sprite_time: Option<f32>,
     block: UniformBlock,
     uniforms: Option<wgpu::Buffer>,
     geometry: Option<Geometry>,
@@ -532,6 +539,7 @@ impl PreparedMaterialDraw {
         Self {
             draw,
             overrides: HashMap::new(),
+            sprite_time: None,
             block,
             uniforms,
             geometry,
@@ -604,7 +612,7 @@ impl PreparedMaterialDraw {
         targets: &Targets,
     ) {
         for anim in &self.draw.sprites {
-            let Some(frame) = anim.frame_at(globals.time) else {
+            let Some(frame) = anim.frame_at(self.sprite_time.unwrap_or(globals.time)) else {
                 continue;
             };
             let Some(page) = anim.pages.get(frame.page) else {

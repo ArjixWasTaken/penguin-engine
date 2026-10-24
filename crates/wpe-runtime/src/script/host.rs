@@ -12,6 +12,7 @@ use wpe_script::{LayerInfo, LayerKind, LogLevel, SceneHost, ScriptValue};
 
 use super::audit::Audit;
 use super::edit::SceneEdit;
+use crate::clock::{self, SharedClocks};
 use crate::frame::LayerSteps;
 use crate::sound::{SoundCommand, SoundState};
 use crate::video::VideoStream;
@@ -126,6 +127,19 @@ impl LayerState {
             dirty_color: false,
             dirty_text: false,
         })
+    }
+
+    /// The layer's motion with script-set origin, scale and angles.
+    pub fn motion_now(&self) -> Motion {
+        Motion {
+            origin: self.origin,
+            scale: self.scale,
+            angles: self.angles,
+            origin_animation: None,
+            scale_animation: None,
+            angles_animation: None,
+            ..self.motion.clone()
+        }
     }
 
     /// Follow a rebuilt frame: take the scene's values for whatever scripts
@@ -273,6 +287,8 @@ pub struct ScriptHost {
     /// Sound layers' play state, and what scripts did to them.
     pub sounds: HashMap<i32, SoundState>,
     pub sound_commands: Vec<(i32, SoundCommand)>,
+    /// Animation clocks, shared with the frame's bindings.
+    pub clocks: SharedClocks,
     pub audit: Option<Audit>,
 }
 
@@ -288,6 +304,7 @@ impl ScriptHost {
             next_id: 1,
             sounds: HashMap::new(),
             sound_commands: Vec::new(),
+            clocks: Default::default(),
             audit: Audit::from_env(),
         }
     }
@@ -313,6 +330,72 @@ impl ScriptHost {
 
     fn layer_mut(&mut self, id: i32) -> Option<&mut LayerState> {
         self.by_id.get(&id).map(|&i| &mut self.layers[i])
+    }
+
+    /// Index of a puppet animation layer named or numbered `key`.
+    fn animation_layer_index(&self, layer: i32, key: &str) -> Option<usize> {
+        if let Ok(index) = key.parse() {
+            return Some(index);
+        }
+        self.layer(layer)?
+            .config
+            .get("animationlayers")?
+            .as_array()?
+            .iter()
+            .position(|l| l.get("name").and_then(Value::as_str) == Some(key))
+    }
+
+    /// An animation's playback members (`play`, `getFrame`, `rate`, ...) on
+    /// the clock `key` of `layer`.
+    fn clock_call(
+        &mut self,
+        layer: i32,
+        key: Option<String>,
+        target: &str,
+        method: &str,
+        args: &[ScriptValue],
+    ) -> Option<ScriptValue> {
+        let mut clocks = self.clocks.borrow_mut();
+        let Some(clock) = key.and_then(|k| clocks.get_mut(layer, &k)) else {
+            drop(clocks);
+            self.unhandled("invoke", &format!("{target}.{method} (no such animation)"));
+            return None;
+        };
+        let arg = || args.first().and_then(ScriptValue::as_f64).map(|v| v as f32);
+        let number = |v: f32| Some(ScriptValue::Number(v as f64));
+        match method {
+            "play" => {
+                if clock.single && clock.frames > 0.0 && clock.frame >= clock.frames {
+                    clock.frame = 0.0;
+                }
+                clock.playing = true;
+            }
+            "pause" => clock.playing = false,
+            "stop" => clock.stop(),
+            "isPlaying" => return Some(ScriptValue::Bool(clock.playing)),
+            "getFrame" => return number(clock.current_frame().floor()),
+            "setFrame" => clock.frame = arg()?.max(0.0),
+            "frameCount" => return number(clock.frames),
+            "fps" => return number(clock.fps),
+            "duration" => {
+                return number(if clock.fps > 0.0 {
+                    clock.frames / clock.fps
+                } else {
+                    0.0
+                });
+            }
+            "rate" => return number(clock.rate),
+            "setRate" => clock.rate = arg()?,
+            "blend" => return number(clock.blend),
+            "setBlend" => clock.blend = arg()?.clamp(0.0, 1.0),
+            "visible" => return Some(ScriptValue::Bool(clock.visible)),
+            "setVisible" => clock.visible = args.first()?.as_bool()?,
+            _ => {
+                drop(clocks);
+                self.unhandled("invoke", &format!("{target}.{method}"));
+            }
+        }
+        None
     }
 
     /// A sound layer's `play`, `pause`, `stop` or `isPlaying`.
@@ -421,6 +504,21 @@ impl SceneHost for ScriptHost {
             "name" => ScriptValue::String(l.info.name.clone()),
             "text" => ScriptValue::String(l.text.clone()?),
             "__config" => ScriptValue::Json(l.initial_config.clone()),
+            "transform" => {
+                let m = l.motion_now().transform_at(0.0).to_cols_array();
+                ScriptValue::Json(m.iter().map(|&v| v as f64).collect::<Vec<_>>().into())
+            }
+            "worldOrigin" | "worldScale" => {
+                let (scale, _, translation) = l
+                    .motion_now()
+                    .transform_at(0.0)
+                    .to_scale_rotation_translation();
+                vec3(if property == "worldOrigin" {
+                    translation
+                } else {
+                    scale
+                })
+            }
             _ => match layout_get(&l.config, property) {
                 Some(v) => v,
                 None => {
@@ -518,6 +616,28 @@ impl SceneHost for ScriptHost {
                 video_call(self.videos.get(&layer)?, method, args)
             }
             "" if self.sounds.contains_key(&layer) => self.sound_call(layer, method),
+            "textureAnimation" | "animation" => {
+                let key = match target {
+                    "animation" => self.clocks.borrow().first_animation(layer),
+                    _ => Some(clock::TEXTURE_ANIMATION.to_owned()),
+                };
+                self.clock_call(layer, key, target, method, args)
+            }
+            _ if target.contains("animation:") => {
+                // `animation:<name>`, also under `material/` or `effects/<i>/`.
+                let name = &target[target.find("animation:").unwrap() + "animation:".len()..];
+                self.clock_call(
+                    layer,
+                    Some(clock::animation_key(name)),
+                    target,
+                    method,
+                    args,
+                )
+            }
+            _ if target.starts_with("animationLayer:") => {
+                let key = self.animation_layer_index(layer, &target["animationLayer:".len()..]);
+                self.clock_call(layer, key.map(clock::layer_key), target, method, args)
+            }
             _ => {
                 self.unhandled("invoke", &format!("{target}.{method}"));
                 None

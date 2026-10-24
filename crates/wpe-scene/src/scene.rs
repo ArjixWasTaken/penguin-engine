@@ -6,6 +6,8 @@ use wpe_assets::scene::{
     ImageEffect, ImageObject, ObjectCommon, ParticleObject, SceneObject, TextObject,
 };
 use wpe_assets::{AssetError, ImageModel, load_json};
+
+use crate::AnimationTime;
 use wpe_vfs::Vfs;
 
 use crate::{Animation, OrthoCamera, UserProperties, alignment_offset, local_transform};
@@ -133,7 +135,7 @@ pub struct Motion {
     pub alpha_animation: Option<Animation>,
 }
 
-fn animate3(base: Vec3, anim: &Option<Animation>, time: f32) -> Vec3 {
+fn animate3(base: Vec3, anim: &Option<Animation>, time: impl AnimationTime) -> Vec3 {
     match anim {
         Some(a) => {
             let v = a.sample(time, &base.to_array());
@@ -155,7 +157,20 @@ impl Motion {
             || self.angles_animation.is_some()
     }
 
-    pub fn transform_at(&self, time: f32) -> Mat4 {
+    /// Every animation of the motion, for registering clocks.
+    pub fn animations(&self) -> impl Iterator<Item = &Animation> {
+        [
+            &self.origin_animation,
+            &self.scale_animation,
+            &self.angles_animation,
+            &self.color_animation,
+            &self.alpha_animation,
+        ]
+        .into_iter()
+        .flatten()
+    }
+
+    pub fn transform_at(&self, time: impl AnimationTime) -> Mat4 {
         let origin = animate3(self.origin, &self.origin_animation, time) + self.offset;
         let scale = animate3(self.scale, &self.scale_animation, time);
         let angles = animate3(self.angles, &self.angles_animation, time);
@@ -164,11 +179,11 @@ impl Motion {
             * Mat4::from_translation(self.local_offset)
     }
 
-    pub fn color_at(&self, base: Vec3, time: f32) -> Vec3 {
+    pub fn color_at(&self, base: Vec3, time: impl AnimationTime) -> Vec3 {
         animate3(base, &self.color_animation, time)
     }
 
-    pub fn alpha_at(&self, base: f32, time: f32) -> f32 {
+    pub fn alpha_at(&self, base: f32, time: impl AnimationTime) -> f32 {
         self.alpha_animation
             .as_ref()
             .map_or(base, |a| a.sample(time, &[base])[0])

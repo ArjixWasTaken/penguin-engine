@@ -6,7 +6,7 @@ mod props;
 mod scene;
 mod transform;
 
-pub use animation::{Animation, AnimationMode};
+pub use animation::{Animation, AnimationMode, AnimationTime};
 pub use camera::{FillMode, OrthoCamera};
 pub use props::UserProperties;
 pub use scene::{
