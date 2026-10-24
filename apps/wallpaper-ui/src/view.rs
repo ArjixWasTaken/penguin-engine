@@ -60,6 +60,7 @@ fn top_bar(app: &App) -> Element<'_, Message> {
     let sound_on = settings.is_some_and(|s| s.audio);
     let volume = app
         .volume
+        .draft
         .or(settings.map(|s| s.volume))
         .unwrap_or(100);
     let sound = button(if sound_on { icons::volume(16.0) } else { icons::muted(16.0) })
@@ -484,8 +485,34 @@ fn detail(app: &App) -> Element<'_, Message> {
         .push(apply)
         .push(column(facts).spacing(4))
         .push(links);
-    if let Some(form) = app.form.as_ref().filter(|f| f.item == item.id) {
-        content = content.push(iced::widget::rule::horizontal(1)).push(form.view());
+    let live = app.live_output().and_then(|name| {
+        app.status()?
+            .outputs
+            .iter()
+            .find(|o| o.name == name)?
+            .wallpaper
+            .as_ref()
+    });
+    let wallpaper_volume = live.filter(|w| w.sound).map(|w| {
+        let volume = app.wallpaper_volume.draft.unwrap_or(w.volume);
+        column![
+            row![
+                text("Volume").size(13).width(Fill),
+                text(format!("{volume}%")).size(13).color(theme::MUTED),
+            ],
+            iced::widget::slider(0..=100u32, volume, Message::WallpaperVolume),
+        ]
+        .spacing(4)
+    });
+    let form = app.form.as_ref().filter(|f| f.item == item.id);
+    if wallpaper_volume.is_some() || form.is_some() {
+        content = content.push(iced::widget::rule::horizontal(1));
+    }
+    if let Some(volume) = wallpaper_volume {
+        content = content.push(volume);
+    }
+    if let Some(form) = form {
+        content = content.push(form.view());
     }
     if let Some(description) = item.description.as_deref().filter(|d| !d.trim().is_empty()) {
         content = content.push(text(description).size(13).color(theme::MUTED));

@@ -42,6 +42,9 @@ pub struct SavedOutput {
     /// Fill mode of this output, instead of the global one.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub fill: Option<Fill>,
+    /// The wallpaper's own volume in percent of the global one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub volume: Option<u32>,
 }
 
 impl SavedOutput {
@@ -50,6 +53,7 @@ impl SavedOutput {
             wallpaper,
             properties: BTreeMap::new(),
             fill: None,
+            volume: None,
         }
     }
 }
@@ -162,6 +166,26 @@ impl State {
         }
     }
 
+    /// Output `name` (showing `wallpaper`) plays it at `volume` percent.
+    pub fn set_volume(&mut self, name: &str, wallpaper: &Path, volume: u32) {
+        let volume = (volume != 100).then_some(volume);
+        self.entry(name, wallpaper).volume = volume;
+        // New outputs showing the same wallpaper sound the same.
+        if let Some(last) = &mut self.last
+            && last.wallpaper == wallpaper
+        {
+            last.volume = volume;
+        }
+    }
+
+    /// The volume output `name` plays `wallpaper` at, in percent.
+    pub fn volume(&self, name: &str, wallpaper: &Path) -> u32 {
+        self.for_output(name)
+            .filter(|saved| saved.wallpaper == wallpaper)
+            .and_then(|saved| saved.volume)
+            .unwrap_or(100)
+    }
+
     pub fn set_fill(&mut self, name: &str, wallpaper: &Path, fill: Option<Fill>) {
         self.entry(name, wallpaper).fill = fill;
     }
@@ -169,16 +193,14 @@ impl State {
     /// Output `name`'s own entry, made from what it shows (`wallpaper`,
     /// with the last one's properties when it is that one) if it has none.
     fn entry(&mut self, name: &str, wallpaper: &Path) -> &mut SavedOutput {
-        let inherited = self
-            .last
-            .as_ref()
-            .filter(|last| last.wallpaper == wallpaper)
-            .map(|last| last.properties.clone())
-            .unwrap_or_default();
+        let last = self.last.as_ref().filter(|last| last.wallpaper == wallpaper);
+        let inherited = last.map(|last| last.properties.clone()).unwrap_or_default();
+        let volume = last.and_then(|last| last.volume);
         self.outputs
             .entry(name.to_owned())
             .or_insert_with(|| SavedOutput {
                 properties: inherited,
+                volume,
                 ..SavedOutput::new(wallpaper.to_owned())
             })
     }
@@ -283,6 +305,23 @@ mod tests {
         std::fs::write(&path, "{broken").unwrap();
         assert_eq!(State::load(&path), State::default());
         std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn wallpaper_volume_stays_with_the_wallpaper() {
+        let mut state = State::default();
+        let (one, two) = (Path::new("/w/1"), Path::new("/w/2"));
+        state.set_wallpaper("DP-1", one, BTreeMap::new());
+        assert_eq!(state.volume("DP-1", one), 100);
+        state.set_volume("DP-1", one, 40);
+        assert_eq!(state.volume("DP-1", one), 40);
+        // A new output showing the same wallpaper sounds the same.
+        assert_eq!(state.volume("HDMI-A-1", one), 40);
+        // Another wallpaper starts at full volume.
+        state.set_wallpaper("DP-1", two, BTreeMap::new());
+        assert_eq!(state.volume("DP-1", two), 100);
+        state.set_volume("DP-1", two, 100);
+        assert_eq!(state.outputs["DP-1"].volume, None);
     }
 
     #[test]

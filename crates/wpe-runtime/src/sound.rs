@@ -87,6 +87,10 @@ impl Sounds {
         }
     }
 
+    pub fn is_empty(&self) -> bool {
+        self.layers.is_empty()
+    }
+
     /// Each sound layer's id and state.
     pub fn states(&self) -> HashMap<i32, SoundState> {
         self.layers.iter().map(|l| (l.id, l.state)).collect()

@@ -170,6 +170,7 @@ wallpaperctl reset-properties              # back to the wallpaper's (or preset'
 wallpaperctl set --prop speed=2 3566329932 # load with property values
 wallpaperctl pause | resume                # [--output X]
 wallpaperctl audio on|off ; wallpaperctl volume 40 ; wallpaperctl fps 30
+wallpaperctl wallpaper-volume 50           # [--output X] this wallpaper, % of the global volume
 wallpaperctl fill fit                      # [--output X] auto | crop | fit | stretch
 wallpaperctl reload                        # re-read config.toml (as SIGHUP does)
 wallpaperctl quit
@@ -206,7 +207,7 @@ can show an output without a wallpaper yet.
 Requests: `status`, `set` {`output`?, `wallpaper`, `properties`?}, `properties` {`output`?},
 `property` {`output`?, `name`, `value`}, `set-properties` {`output`?, `values`},
 `reset-properties` {`output`?}, `pause` / `resume` {`output`?}, `audio` {`enabled`}, `volume`
-{`volume`}, `fps` {`fps`}, `fill` {`output`?, `fill`}, `settings` {`fps`?, `audio`?, `volume`?,
+{`volume`}, `wallpaper-volume` {`output`?, `volume`}, `fps` {`fps`}, `fill` {`output`?, `fill`}, `settings` {`fps`?, `audio`?, `volume`?,
 `fill`?, `layer`?, `passthrough`?}, `reload-settings`, `version`, `subscribe`, `quit`. Without
 `output` a request applies to every output.
 

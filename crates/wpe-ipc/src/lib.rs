@@ -222,6 +222,14 @@ pub enum Request {
     Volume {
         volume: u32,
     },
+    /// The volume of the wallpaper an output shows, in percent (0..=100) of
+    /// the global volume; kept until another wallpaper is set there.
+    /// (Protocol 2.)
+    WallpaperVolume {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        output: Option<String>,
+        volume: u32,
+    },
     /// Frame rate cap; 0 follows the display.
     Fps {
         fps: u32,
@@ -359,6 +367,21 @@ pub struct WallpaperInfo {
     /// `workshop_id` and `title` are the preset item's. (Protocol 2.)
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub dependency: Option<String>,
+    /// It plays sound (sound layers, a video's sound track, or a web page,
+    /// which may). (Protocol 2.)
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub sound: bool,
+    /// Its own volume in percent, on top of the global one. (Protocol 2.)
+    #[serde(default = "full_volume", skip_serializing_if = "is_full_volume")]
+    pub volume: u32,
+}
+
+fn full_volume() -> u32 {
+    100
+}
+
+fn is_full_volume(v: &u32) -> bool {
+    *v == 100
 }
 
 /// One output's wallpaper's user properties.
@@ -540,8 +563,34 @@ mod tests {
     }
 
     #[test]
+    fn wallpaper_sound_and_volume() {
+        // Older daemons send neither: no sound, full volume.
+        let info: WallpaperInfo = serde_json::from_value(
+            json!({"path": "/w", "workshop_id": null, "title": "W", "type": "scene"}),
+        )
+        .unwrap();
+        assert!(!info.sound);
+        assert_eq!(info.volume, 100);
+        let info = WallpaperInfo {
+            sound: true,
+            volume: 30,
+            ..info
+        };
+        let wire = serde_json::to_value(&info).unwrap();
+        assert_eq!((&wire["sound"], &wire["volume"]), (&json!(true), &json!(30)));
+        assert_eq!(serde_json::from_value::<WallpaperInfo>(wire).unwrap(), info);
+    }
+
+    #[test]
     fn requests_on_the_wire() {
         round_trip(Request::Status, json!({"cmd": "status"}));
+        round_trip(
+            Request::WallpaperVolume {
+                output: Some("DP-1".into()),
+                volume: 40,
+            },
+            json!({"cmd": "wallpaper-volume", "output": "DP-1", "volume": 40}),
+        );
         round_trip(
             Request::Set {
                 output: Some("DP-1".into()),
@@ -798,6 +847,8 @@ mod tests {
                         title: "One".into(),
                         kind: "scene".into(),
                         dependency: None,
+                        sound: false,
+                        volume: 100,
                     }),
                     paused: false,
                     fps: 60.0,

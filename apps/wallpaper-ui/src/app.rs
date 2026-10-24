@@ -36,10 +36,10 @@ pub struct App {
     pub form: Option<Form>,
     /// The selection to restore once the library is loaded.
     restore: Option<String>,
-    /// The volume being dragged to, until the daemon has it.
-    pub volume: Option<u32>,
-    volume_inflight: bool,
-    volume_queued: Option<u32>,
+    /// The global volume.
+    pub volume: Throttled,
+    /// The selected wallpaper's own volume, on the output it plays on.
+    pub wallpaper_volume: Throttled,
 }
 
 pub struct Filters {
@@ -169,6 +169,8 @@ pub enum Message {
     Sound(bool),
     Volume(u32),
     VolumeSent(Result<(), String>),
+    WallpaperVolume(u32),
+    WallpaperVolumeSent(String, Result<(), String>),
     Props(String, Option<String>, Result<library::Props, String>),
     Edit(Edit),
     PickFile(String, bool),
@@ -198,9 +200,8 @@ impl App {
             applying: None,
             notice: None,
             form: None,
-            volume: None,
-            volume_inflight: false,
-            volume_queued: None,
+            volume: Throttled::default(),
+            wallpaper_volume: Throttled::default(),
         };
         let load = Task::perform(library::load(), Message::Loaded);
         let mut tasks = vec![load, status()];
@@ -303,6 +304,7 @@ impl App {
                 self.selected = Some(id.clone());
                 self.preview = None;
                 self.form = None;
+                self.wallpaper_volume.draft = None;
                 self.save_state();
                 let mut tasks = vec![self.load_form()];
                 if let Some(preview) = self.item(&id).and_then(|i| i.preview.clone()) {
@@ -439,24 +441,33 @@ impl App {
                 });
             }
             Message::Volume(volume) => {
-                if self.status().is_none() {
-                    return Task::none();
+                if self.status().is_some()
+                    && let Some(volume) = self.volume.set(volume)
+                {
+                    return send_volume(volume);
                 }
-                self.volume = Some(volume);
-                if self.volume_inflight {
-                    self.volume_queued = Some(volume);
-                    return Task::none();
-                }
-                return self.send_volume(volume);
             }
             Message::VolumeSent(result) => {
-                self.volume_inflight = false;
                 if let Err(e) = result {
                     tracing::warn!("setting the volume: {e}");
                 }
-                match self.volume_queued.take() {
-                    Some(volume) => return self.send_volume(volume),
-                    None => self.volume = None,
+                if let Some(volume) = self.volume.sent() {
+                    return send_volume(volume);
+                }
+            }
+            Message::WallpaperVolume(volume) => {
+                if let Some(output) = self.live_output()
+                    && let Some(volume) = self.wallpaper_volume.set(volume)
+                {
+                    return send_wallpaper_volume(output, volume);
+                }
+            }
+            Message::WallpaperVolumeSent(output, result) => {
+                if let Err(e) = result {
+                    tracing::warn!("setting the wallpaper's volume: {e}");
+                }
+                if let Some(volume) = self.wallpaper_volume.sent() {
+                    return send_wallpaper_volume(output, volume);
                 }
             }
             Message::OpenWorkshop(id) => open(&format!(
@@ -475,17 +486,6 @@ impl App {
 
     pub fn view(&self) -> iced::Element<'_, Message> {
         view::view(self)
-    }
-
-    fn send_volume(&mut self, volume: u32) -> Task<Message> {
-        self.volume_inflight = true;
-        let patch = SettingsPatch {
-            volume: Some(volume),
-            ..Default::default()
-        };
-        Task::perform(daemon::request(Request::Settings { patch }), |r| {
-            Message::VolumeSent(r.map(|_| ()))
-        })
     }
 
     /// The output the selected wallpaper plays on, among the target ones.
@@ -562,6 +562,65 @@ impl App {
             Sort::Size => self.visible.sort_by_key(|&i| std::cmp::Reverse(items[i].size)),
         }
     }
+}
+
+/// A value dragged on a slider and sent to the daemon: at most one
+/// request in flight, then the newest value, so a drag follows as fast as
+/// the daemon applies it and no faster.
+#[derive(Default)]
+pub struct Throttled {
+    /// What the slider shows until the daemon has it.
+    pub draft: Option<u32>,
+    inflight: bool,
+    queued: Option<u32>,
+}
+
+impl Throttled {
+    /// The slider moved: the value to send now, if nothing is in flight.
+    fn set(&mut self, value: u32) -> Option<u32> {
+        self.draft = Some(value);
+        if self.inflight {
+            self.queued = Some(value);
+            return None;
+        }
+        self.inflight = true;
+        Some(value)
+    }
+
+    /// A request came back: the value to send next, if it moved since.
+    fn sent(&mut self) -> Option<u32> {
+        self.inflight = false;
+        match self.queued.take() {
+            Some(value) => {
+                self.inflight = true;
+                Some(value)
+            }
+            None => {
+                self.draft = None;
+                None
+            }
+        }
+    }
+}
+
+fn send_volume(volume: u32) -> Task<Message> {
+    let patch = SettingsPatch {
+        volume: Some(volume),
+        ..Default::default()
+    };
+    Task::perform(daemon::request(Request::Settings { patch }), |r| {
+        Message::VolumeSent(r.map(|_| ()))
+    })
+}
+
+fn send_wallpaper_volume(output: String, volume: u32) -> Task<Message> {
+    let request = Request::WallpaperVolume {
+        output: Some(output.clone()),
+        volume,
+    };
+    Task::perform(daemon::request(request), move |r| {
+        Message::WallpaperVolumeSent(output.clone(), r.map(|_| ()))
+    })
 }
 
 fn toggle<T: std::hash::Hash + Eq>(set: &mut HashSet<T>, value: T) {

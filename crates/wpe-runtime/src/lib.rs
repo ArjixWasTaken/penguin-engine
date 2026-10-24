@@ -980,6 +980,14 @@ impl Wallpaper {
         }
     }
 
+    /// Whether it plays sound: sound layers, a video wallpaper's sound
+    /// track, or a web page (which may).
+    pub fn has_sound(&self) -> bool {
+        !self.sounds.is_empty()
+            || self.is_web()
+            || (self.video_wallpaper && self.videos().iter().any(|(_, s)| s.has_audio_track()))
+    }
+
     /// Master volume (0..1) of the sound layers and a video wallpaper's sound.
     pub fn set_volume(&mut self, volume: f32) {
         self.volume = volume.clamp(0.0, 1.0);

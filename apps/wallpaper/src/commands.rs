@@ -87,7 +87,8 @@ pub fn property_infos(
 
 /// What `screen` shows. For a preset item: the item's path, id and title,
 /// the dependency's type, and the dependency.
-fn wallpaper_info(screen: &Screen) -> WallpaperInfo {
+/// What `screen` shows; it plays at `volume` percent of the global volume.
+fn wallpaper_info(screen: &Screen, volume: u32) -> WallpaperInfo {
     let (path, wallpaper) = (&screen.path, &screen.wallpaper);
     let project = wallpaper.project();
     let kind = match &project.kind {
@@ -115,6 +116,8 @@ fn wallpaper_info(screen: &Screen) -> WallpaperInfo {
                 .unwrap_or_else(|| wallpaper.title.clone()),
             kind,
             dependency: Some(preset.dependency.display().to_string()),
+            sound: wallpaper.has_sound(),
+            volume,
         },
         None => WallpaperInfo {
             path: path.display().to_string(),
@@ -122,6 +125,8 @@ fn wallpaper_info(screen: &Screen) -> WallpaperInfo {
             title: wallpaper.title.clone(),
             kind,
             dependency: None,
+            sound: wallpaper.has_sound(),
+            volume,
         },
     }
 }
@@ -229,6 +234,9 @@ impl control::Handler for App {
             Request::Resume { output } => self.pause(output.as_deref(), false),
             Request::Audio { enabled } => self.change_settings(|s| s.audio = enabled),
             Request::Volume { volume } => self.change_settings(|s| s.volume = volume),
+            Request::WallpaperVolume { output, volume } => {
+                self.set_wallpaper_volume(output.as_deref(), volume)
+            }
             Request::Fps { fps } => self.change_settings(|s| s.fps = fps),
             Request::Fill { output, fill } => self.set_fill(output.as_deref(), fill),
             Request::ReloadSettings => self.reload_settings().map(|()| Response::ok()),
@@ -280,7 +288,8 @@ impl App {
                     width: logical.0,
                     height: logical.1,
                     scale,
-                    wallpaper: screen.map(wallpaper_info),
+                    wallpaper: screen
+                        .map(|s| wallpaper_info(s, self.state.volume(&s.name, &s.path))),
                     paused: screen.is_some_and(|s| s.paused),
                     fps: screen
                         .filter(|s| !s.paused)
@@ -602,6 +611,32 @@ impl App {
         Ok(Response::ok())
     }
 
+    fn set_wallpaper_volume(
+        &mut self,
+        output: Option<&str>,
+        volume: u32,
+    ) -> Result<Response, String> {
+        if volume > 100 {
+            return Err(format!("volume {volume} is out of range (0-100)"));
+        }
+        for i in self.select_screens(output)? {
+            let screen = &self.screens[i];
+            self.state.set_volume(&screen.name, &screen.path, volume);
+        }
+        self.apply_volumes();
+        self.save_state();
+        Ok(Response::ok())
+    }
+
+    /// Play each screen's wallpaper at its own volume times the global one.
+    pub fn apply_volumes(&mut self) {
+        let global = self.settings.volume as f32 / 100.0;
+        for s in &mut self.screens {
+            let own = self.state.volume(&s.name, &s.path) as f32 / 100.0;
+            s.wallpaper.set_volume(global * own);
+        }
+    }
+
     fn set_fill(&mut self, output: Option<&str>, fill: Fill) -> Result<Response, String> {
         match output {
             Some(_) => {
@@ -697,9 +732,7 @@ impl App {
             }
         }
         if old.volume != new.volume {
-            for s in &mut self.screens {
-                s.wallpaper.set_volume(new.volume as f32 / 100.0);
-            }
+            self.apply_volumes();
         }
         if old.audio != new.audio {
             self.apply_audio();

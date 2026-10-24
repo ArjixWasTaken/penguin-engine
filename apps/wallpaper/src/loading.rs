@@ -395,7 +395,6 @@ impl App {
         let prepare = prepared.elapsed;
         let finished = Instant::now();
         let mut wallpaper = prepared.finish(&gpu);
-        wallpaper.set_volume(self.settings.volume as f32 / 100.0);
         wallpaper.apply_general_settings(&crate::general_settings(&self.settings));
         let spec = load.spec;
         tracing::info!(
@@ -434,6 +433,7 @@ impl App {
                 .set_wallpaper(&spec.name, &spec.path, spec.properties.clone());
         }
         self.apply_audio();
+        self.apply_volumes();
         self.update_status();
         if let Some(i) = self.screen_for(&spec.output) {
             self.emit_properties(i);

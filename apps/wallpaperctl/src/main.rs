@@ -76,6 +76,14 @@ enum Command {
         #[arg(value_parser = clap::value_parser!(u32).range(0..=100))]
         volume: u32,
     },
+    /// The volume of the wallpaper an output shows, in percent of the
+    /// global volume (kept until another wallpaper is set there).
+    WallpaperVolume {
+        #[arg(long)]
+        output: Option<String>,
+        #[arg(value_parser = clap::value_parser!(u32).range(0..=100))]
+        volume: u32,
+    },
     /// Frame rate cap (0 follows the display).
     Fps { fps: u32 },
     /// How wallpapers fill the outputs: auto (crop, but fit a portrait
@@ -160,6 +168,7 @@ fn request(command: Command) -> Request {
             enabled: matches!(state, OnOff::On),
         },
         Command::Volume { volume } => Request::Volume { volume },
+        Command::WallpaperVolume { output, volume } => Request::WallpaperVolume { output, volume },
         Command::Fps { fps } => Request::Fps { fps },
         Command::Fill { output, fill } => Request::Fill { output, fill },
         Command::Reload => Request::ReloadSettings,
