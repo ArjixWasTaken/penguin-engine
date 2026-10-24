@@ -225,6 +225,11 @@ impl Puppet {
         self.layers.iter().filter(|l| l.animation.is_some()).count()
     }
 
+    /// Parent index of each bone.
+    pub fn bone_parents(&self) -> Vec<Option<usize>> {
+        self.bones.iter().map(|b| b.parent).collect()
+    }
+
     /// Number of bones; the value of the `BONECOUNT` shader combo.
     pub fn bone_count(&self) -> usize {
         self.bones.len()
@@ -253,6 +258,27 @@ impl Puppet {
     pub fn bone_matrices_with(
         &self,
         pose: impl Fn(usize, &AnimationLayer) -> LayerPose,
+        out: &mut Vec<Mat4>,
+    ) {
+        self.pose_bones(pose, |_, world| world, out);
+        self.skin(out);
+    }
+
+    /// Turn bone world transforms from [`Self::pose_bones`] into skinning
+    /// matrices.
+    pub fn skin(&self, worlds: &mut [Mat4]) {
+        for (m, bone) in worlds.iter_mut().zip(&self.bones) {
+            *m *= bone.inverse_bind_world;
+        }
+    }
+
+    /// Where each bone is in puppet space (the mesh's space) with each
+    /// animation layer where `pose` puts it. `adjust` may move a bone (e.g.
+    /// dragged or bouncing); its children follow.
+    pub fn pose_bones(
+        &self,
+        pose: impl Fn(usize, &AnimationLayer) -> LayerPose,
+        adjust: impl Fn(usize, Mat4) -> Mat4,
         out: &mut Vec<Mat4>,
     ) {
         let poses: Vec<LayerPose> = self
@@ -297,10 +323,7 @@ impl Puppet {
             }
             let local = Mat4::from_scale_rotation_translation(scale, rotation, translation);
             let world = bone.parent.map_or(local, |p| out[p] * local);
-            out.push(world);
-        }
-        for (m, bone) in out.iter_mut().zip(&self.bones) {
-            *m *= bone.inverse_bind_world;
+            out.push(adjust(i, world));
         }
     }
 

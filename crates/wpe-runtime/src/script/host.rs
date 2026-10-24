@@ -4,7 +4,7 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use glam::{Vec2, Vec3};
+use glam::{Mat4, Vec2, Vec3};
 use serde_json::Value;
 use wpe_assets::scene::{SceneObject, TextObject};
 use wpe_scene::{ImageLayer, Motion};
@@ -12,6 +12,7 @@ use wpe_script::{LayerInfo, LayerKind, LogLevel, SceneHost, ScriptValue};
 
 use super::audit::Audit;
 use super::edit::SceneEdit;
+use crate::bones::SharedBones;
 use crate::clock::{self, SharedClocks};
 use crate::frame::LayerSteps;
 use crate::sound::{SoundCommand, SoundState};
@@ -287,8 +288,9 @@ pub struct ScriptHost {
     /// Sound layers' play state, and what scripts did to them.
     pub sounds: HashMap<i32, SoundState>,
     pub sound_commands: Vec<(i32, SoundCommand)>,
-    /// Animation clocks, shared with the frame's bindings.
+    /// Animation clocks and puppet bones, shared with the frame's bindings.
     pub clocks: SharedClocks,
+    pub bones: SharedBones,
     pub audit: Option<Audit>,
 }
 
@@ -305,6 +307,7 @@ impl ScriptHost {
             sounds: HashMap::new(),
             sound_commands: Vec::new(),
             clocks: Default::default(),
+            bones: Default::default(),
             audit: Audit::from_env(),
         }
     }
@@ -330,6 +333,94 @@ impl ScriptHost {
 
     fn layer_mut(&mut self, id: i32) -> Option<&mut LayerState> {
         self.by_id.get(&id).map(|&i| &mut self.layers[i])
+    }
+
+    /// Puppet bone queries and moves (`getBoneTransform`, `setBoneTransform`,
+    /// `applyBonePhysicsImpulse`, ...), in scene coordinates.
+    fn bone_call(&mut self, layer: i32, method: &str, args: &[ScriptValue]) -> Option<ScriptValue> {
+        tracing::trace!("layer {layer} {method}({args:?})");
+        let model = self.layer(layer)?.motion_now().transform_at(0.0);
+        let mut bones = self.bones.borrow_mut();
+        let puppet = bones.puppets.get_mut(&layer)?;
+        let bone = || {
+            let i = args.first()?.as_f64()?;
+            (i >= 0.0 && (i as usize) < puppet.names.len()).then_some(i as usize)
+        };
+        // A `Mat4` arrives as its 16 numbers, column-major.
+        let matrix = |v: &ScriptValue| -> Option<Mat4> {
+            let ScriptValue::Json(Value::Array(a)) = v else {
+                return None;
+            };
+            let c: Vec<f32> = a
+                .iter()
+                .filter_map(Value::as_f64)
+                .map(|x| x as f32)
+                .collect();
+            (c.len() == 16).then(|| Mat4::from_cols_slice(&c))
+        };
+        let json = |m: Mat4| {
+            let c: Vec<f64> = m.to_cols_array().iter().map(|&x| x as f64).collect();
+            ScriptValue::Json(c.into())
+        };
+        let vector = |v: Option<&ScriptValue>| to_vec3(v?);
+        Some(match method {
+            "getBoneCount" => ScriptValue::Number(puppet.names.len() as f64),
+            "getBoneIndex" => {
+                let name = args.first().and_then(|v| match v {
+                    ScriptValue::String(s) => Some(s.as_str()),
+                    _ => None,
+                })?;
+                let i = puppet.names.iter().position(|n| n == name);
+                ScriptValue::Number(i.map_or(-1.0, |i| i as f64))
+            }
+            "getBoneParentIndex" => {
+                let parent = puppet.parents.get(bone()?).copied().flatten();
+                ScriptValue::Number(parent.map_or(-1.0, |p| p as f64))
+            }
+            "getBoneTransform" => json(model * puppet.worlds[bone()?]),
+            "getLocalBoneTransform" => {
+                let i = bone()?;
+                let parent = puppet.parents[i].map_or(Mat4::IDENTITY, |p| puppet.worlds[p]);
+                json(parent.inverse() * puppet.worlds[i])
+            }
+            "getLocalBoneOrigin" => {
+                let i = bone()?;
+                let parent = puppet.parents[i].map_or(Mat4::IDENTITY, |p| puppet.worlds[p]);
+                vec3((parent.inverse() * puppet.worlds[i]).w_axis.truncate())
+            }
+            "setBoneTransform" => {
+                let (i, m) = (bone()?, matrix(args.get(1)?)?);
+                let target = model.inverse().transform_point3(m.w_axis.truncate());
+                puppet.place(i, target);
+                return None;
+            }
+            "setLocalBoneTransform" | "setLocalBoneOrigin" => {
+                let i = bone()?;
+                let local = match method {
+                    "setLocalBoneOrigin" => vector(args.get(1))?,
+                    _ => matrix(args.get(1)?)?.w_axis.truncate(),
+                };
+                let parent = puppet.parents[i].map_or(Mat4::IDENTITY, |p| puppet.worlds[p]);
+                puppet.place(i, parent.transform_point3(local));
+                return None;
+            }
+            "applyBonePhysicsImpulse" => {
+                let i = bone()?;
+                let direction = vector(args.get(1)).unwrap_or(Vec3::ZERO);
+                puppet.impulse(i, model.inverse().transform_vector3(direction));
+                return None;
+            }
+            "resetBonePhysicsSimulation" => {
+                let i = args.first().and_then(ScriptValue::as_f64);
+                puppet.reset(i.filter(|&i| i >= 0.0).map(|i| i as usize));
+                return None;
+            }
+            _ => {
+                drop(bones);
+                self.unhandled("invoke", &format!("bones.{method}"));
+                return None;
+            }
+        })
     }
 
     /// Index of a puppet animation layer named or numbered `key`.
@@ -616,6 +707,9 @@ impl SceneHost for ScriptHost {
                 video_call(self.videos.get(&layer)?, method, args)
             }
             "" if self.sounds.contains_key(&layer) => self.sound_call(layer, method),
+            "" if self.bones.borrow().puppets.contains_key(&layer) => {
+                self.bone_call(layer, method, args)
+            }
             "textureAnimation" | "animation" => {
                 let key = match target {
                     "animation" => self.clocks.borrow().first_animation(layer),

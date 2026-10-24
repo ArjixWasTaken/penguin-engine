@@ -1,5 +1,6 @@
 //! Embeddable wallpaper runtime: load a wallpaper and drive its render loop.
 
+mod bones;
 mod clock;
 mod files;
 mod frame;
@@ -192,8 +193,9 @@ pub struct Wallpaper {
     media: Option<media::Media>,
     /// Engine texture slots of the current frame.
     system_slots: Vec<frame::SystemSlot>,
-    /// Animation clocks, shared with the scripts.
+    /// Animation clocks and puppet bones, shared with the scripts.
     clocks: clock::SharedClocks,
+    bones: bones::SharedBones,
     /// Draws showing a layer's sprite sheet: layer id and step.
     sprite_steps: Vec<(i32, usize)>,
 }
@@ -245,6 +247,7 @@ impl Wallpaper {
             media: None,
             system_slots: Vec::new(),
             clocks: Default::default(),
+            bones: Default::default(),
             sprite_steps: Vec::new(),
             props,
             vfs: files.vfs,
@@ -265,6 +268,7 @@ impl Wallpaper {
             &built.view(&objects, &sounds),
             wallpaper.camera.scene_size,
             wallpaper.clocks.clone(),
+            wallpaper.bones.clone(),
         );
         if wallpaper.scripts.is_some() || !wallpaper.system_slots.is_empty() {
             wallpaper.media = media::Media::start();
@@ -325,8 +329,10 @@ impl Wallpaper {
         }
         {
             let mut clocks = self.clocks.borrow_mut();
+            let mut bones = self.bones.borrow_mut();
             for binding in &frame.bindings {
                 binding.register_clocks(&mut clocks);
+                binding.register_bones(&mut bones);
             }
             for &(layer, step) in &frame.sprite_steps {
                 if let Some((frames, duration)) = self.renderer.sprite_timing(step)
@@ -459,10 +465,13 @@ impl Wallpaper {
             pointer: self.pointer,
         };
         let mut clocks = self.clocks.borrow_mut();
-        clocks.advance(time);
+        let mut bones = self.bones.borrow_mut();
+        let dt = clocks.advance(time);
+        bones.step(dt);
         for binding in &self.bindings {
-            binding.apply(&mut self.renderer, frame, &clocks);
+            binding.apply(&mut self.renderer, frame, &clocks, &mut bones);
         }
+        drop(bones);
         for &(layer, step) in &self.sprite_steps {
             let time = clocks
                 .get(layer, clock::TEXTURE_ANIMATION)

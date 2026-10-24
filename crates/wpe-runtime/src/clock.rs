@@ -136,13 +136,14 @@ impl Clocks {
         keys.first().map(|k| (*k).clone())
     }
 
-    /// Move every clock to scene time `time`.
-    pub fn advance(&mut self, time: f32) {
+    /// Move every clock to scene time `time`; returns the step in seconds.
+    pub fn advance(&mut self, time: f32) -> f32 {
         let dt = self.last.map_or(time, |last| time - last).max(0.0);
         self.last = Some(time);
         for clock in self.clocks.values_mut() {
             clock.advance(dt);
         }
+        dt
     }
 
     /// Layers with a clock that reached its end since the last call.

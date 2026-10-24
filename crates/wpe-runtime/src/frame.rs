@@ -17,6 +17,7 @@ use wpe_render::{
 use wpe_scene::{Animation, Bloom, ImageLayer, Motion, Parallax, apply_override};
 use wpe_vfs::Vfs;
 
+use crate::bones::{Bones, PuppetBones};
 use crate::clock::{self, Clock, Clocks};
 use crate::material::{self, SlotTexture, TextureStore};
 use crate::video::VideoStream;
@@ -308,11 +309,28 @@ impl Binding {
         }
     }
 
+    /// Make a puppet's bones known to scripts.
+    pub fn register_bones(&self, bones: &mut Bones) {
+        if let Self::Bones { layer, puppet, .. } = self {
+            let names = puppet
+                .mdl
+                .skeleton
+                .as_ref()
+                .map(|s| s.bones.iter().map(|b| b.name.clone()).collect())
+                .unwrap_or_default();
+            bones.register(
+                *layer,
+                PuppetBones::new(names, puppet.puppet.bone_parents()),
+            );
+        }
+    }
+
     pub fn apply(
         &self,
         renderer: &mut wpe_render::SceneRenderer,
         frame: FrameState,
         clocks: &Clocks,
+        bones: &mut Bones,
     ) {
         let scene_time = frame.time;
         match self {
@@ -364,7 +382,12 @@ impl Binding {
                 puppet,
             } => {
                 let mut matrices = Vec::new();
-                puppet.puppet.bone_matrices_with(
+                let state = bones.puppets.get_mut(layer);
+                let offsets: Vec<glam::Vec3> = state
+                    .as_ref()
+                    .map(|s| (0..s.names.len()).map(|i| s.offset(i)).collect())
+                    .unwrap_or_default();
+                puppet.puppet.pose_bones(
                     |i, params| match clocks.get(*layer, &clock::layer_key(i)) {
                         Some(c) => wpe_mdl::LayerPose {
                             time: c.seconds() as f64,
@@ -377,8 +400,16 @@ impl Binding {
                             visible: params.visible,
                         },
                     },
+                    |i, world| match offsets.get(i) {
+                        Some(&o) if o != glam::Vec3::ZERO => Mat4::from_translation(o) * world,
+                        _ => world,
+                    },
                     &mut matrices,
                 );
+                if let Some(state) = state {
+                    state.worlds.clone_from(&matrices);
+                }
+                puppet.puppet.skin(&mut matrices);
                 // `mat4x3` columns are written tightly; the block layout pads them.
                 let bones = matrices
                     .iter()

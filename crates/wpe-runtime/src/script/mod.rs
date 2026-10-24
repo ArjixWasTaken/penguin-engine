@@ -20,6 +20,7 @@ use wpe_vfs::Vfs;
 pub use edit::{SceneEdit, apply as apply_edits, resolve_paths};
 use host::{LayerState, ScriptHost, vec3};
 
+use crate::bones::SharedBones;
 use crate::clock::SharedClocks;
 use crate::frame::LayerSteps;
 use crate::sound::{SoundCommand, SoundState};
@@ -120,6 +121,7 @@ impl Scripts {
         view: &SceneView,
         canvas: Vec2,
         clocks: SharedClocks,
+        bones: SharedBones,
     ) -> Option<Self> {
         let scripts: Vec<_> = view.doc.objects.iter().map(scripted).collect();
         if scripts.iter().all(Vec::is_empty) {
@@ -146,6 +148,7 @@ impl Scripts {
         let mut host = ScriptHost::new(canvas, view.videos.clone());
         host.sounds = view.sounds.clone();
         host.clocks = clocks;
+        host.bones = bones;
         for obj in &view.doc.objects {
             let Some(c) = obj.common() else { continue };
             let steps = view.steps.get(&c.id).cloned().unwrap_or_default();
