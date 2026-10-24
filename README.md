@@ -29,11 +29,24 @@ dialect to SPIR-V and run through wgpu:
 - sound layers and audio-reactive spectrum (`--audio`)
 - particles (sprite, trail, rope) without geometry shaders
 - puppet warp (`.mdl` skinned meshes and bone animations)
-- SceneScript (QuickJS): scripted text, visibility, transforms, colours, clicks, video playback
-  control (`getVideoTexture()`: play/pause/seek/rate/loop, ended callbacks)
+- SceneScript (QuickJS) on any scene value, with the engine services scripts use:
+  - layers: transforms, colour, visibility (groups included), text and layout properties,
+    `createLayer` / `destroyLayer` / `sortLayer` / `setParent` (the frame is rebuilt)
+  - animations: keyframe, sprite-sheet and puppet animation-layer playback control
+  - puppet bones (pose queries, `setBoneTransform`, springy physics impulses)
+  - particles (`instance` overrides, `emitParticles`), material and effect constants,
+    effect visibility, scene settings (`thisScene.bloom`, `camerashake`, ...)
+  - video (`getVideoTexture()`), sound layers (play/pause/stop/volume), media players
+    over MPRIS (media events and the `$mediaThumbnail` album-art texture)
+  - cursor events, `localStorage` (persisted per wallpaper), user property changes
+    (`Wallpaper::set_user_property`, `scene-viewer --property name=value`)
 
-Not yet: 3D models, HDR scenes, SceneScript-driven sound/animation control, desktop
-background (wallpaper) mode and the wallpaper picker UI.
+Not yet: 3D models, HDR scenes, desktop background (wallpaper) mode and the wallpaper
+picker UI.
+
+Debugging aids: `WPE_SCRIPT_AUDIT=<file>` records script requests the runtime doesn't
+handle, `WPE_FAKE_AUDIO=1` feeds a synthetic spectrum, `scene-viewer --frames N` runs N
+frames (with clicks) before a `--screenshot`.
 
 ## Layout
 
