@@ -169,6 +169,13 @@ impl SceneRenderer {
         }
     }
 
+    /// Replace the mesh of the material draw at `step` (e.g. particles each frame).
+    pub fn set_mesh(&mut self, step: usize, mesh: crate::Mesh) {
+        if let Some(PreparedStep::Material(_, d)) = self.steps.get_mut(step) {
+            d.set_mesh(mesh);
+        }
+    }
+
     /// Override a uniform of the material draw at `step` from the next frame on.
     pub fn set_uniform(&mut self, step: usize, name: &str, values: Vec<f32>) {
         if let Some(PreparedStep::Material(_, d)) = self.steps.get_mut(step) {

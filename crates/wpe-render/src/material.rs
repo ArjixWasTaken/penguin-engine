@@ -30,7 +30,7 @@ pub struct ShaderProgram {
     vertex_attributes: Vec<wgpu::VertexAttribute>,
     vertex_stride: u64,
     /// `None` caches a pipeline wgpu rejected.
-    pipelines: Mutex<HashMap<(BlendMode, wgpu::TextureFormat), Option<wgpu::RenderPipeline>>>,
+    pipelines: Mutex<HashMap<PipelineKey, Option<wgpu::RenderPipeline>>>,
 }
 
 fn module(gpu: &Gpu, label: &str, words: &[u32]) -> Result<wgpu::ShaderModule, ProgramError> {
@@ -147,10 +147,11 @@ impl ShaderProgram {
         device: &wgpu::Device,
         blend: BlendMode,
         format: wgpu::TextureFormat,
+        topology: wgpu::PrimitiveTopology,
     ) -> Option<wgpu::RenderPipeline> {
         let mut pipelines = self.pipelines.lock().unwrap_or_else(|e| e.into_inner());
         pipelines
-            .entry((blend, format))
+            .entry((blend, format, topology))
             .or_insert_with(|| {
                 let scope = device.push_error_scope(wgpu::ErrorFilter::Validation);
                 let pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
@@ -167,7 +168,7 @@ impl ShaderProgram {
                         })],
                     },
                     primitive: wgpu::PrimitiveState {
-                        topology: wgpu::PrimitiveTopology::TriangleStrip,
+                        topology,
                         ..Default::default()
                     },
                     depth_stencil: None,
@@ -194,6 +195,66 @@ impl ShaderProgram {
                 }
             })
             .clone()
+    }
+}
+
+type PipelineKey = (BlendMode, wgpu::TextureFormat, wgpu::PrimitiveTopology);
+
+/// Named per-vertex attribute streams, matched to shader inputs by name
+/// (`a_Position`, `a_TexCoord`, ...), drawn as an indexed or plain triangle list.
+#[derive(Debug, Clone, Default)]
+pub struct MeshData {
+    pub vertex_count: u32,
+    /// Attribute name, component count, and `vertex_count × components` values.
+    pub attributes: Vec<(String, u8, Vec<f32>)>,
+    pub indices: Option<Vec<u32>>,
+}
+
+/// Geometry of a material draw.
+#[derive(Debug, Clone)]
+pub enum Mesh {
+    /// A textured card (triangle strip).
+    Card(CardMesh),
+    Triangles(MeshData),
+}
+
+impl From<CardMesh> for Mesh {
+    fn from(card: CardMesh) -> Self {
+        Self::Card(card)
+    }
+}
+
+impl Mesh {
+    fn topology(&self) -> wgpu::PrimitiveTopology {
+        match self {
+            Self::Card(_) => wgpu::PrimitiveTopology::TriangleStrip,
+            Self::Triangles(_) => wgpu::PrimitiveTopology::TriangleList,
+        }
+    }
+
+    fn data(&self) -> std::borrow::Cow<'_, MeshData> {
+        match self {
+            Self::Card(card) => {
+                let corners = card.corners();
+                std::borrow::Cow::Owned(MeshData {
+                    vertex_count: 4,
+                    attributes: vec![
+                        (
+                            "a_Position".to_owned(),
+                            3,
+                            corners.iter().flat_map(|c| c.0).collect(),
+                        ),
+                        (
+                            "a_TexCoord".to_owned(),
+                            2,
+                            corners.iter().flat_map(|c| c.1).collect(),
+                        ),
+                    ],
+                    indices: None,
+                })
+            }
+            Self::Triangles(data) => std::borrow::Cow::Borrowed(data),
+        }
     }
 }
 
@@ -347,7 +408,7 @@ pub struct MaterialDraw {
     /// Static uniform values (defaults, material constants, layer values).
     pub constants: HashMap<String, Vec<f32>>,
     pub model: Mat4,
-    pub mesh: CardMesh,
+    pub mesh: Mesh,
     pub blend: BlendMode,
     pub camera: Camera,
     pub sprites: Vec<SpriteAnimation>,
@@ -359,7 +420,9 @@ pub(crate) struct PreparedMaterialDraw {
     pub(crate) overrides: HashMap<String, Vec<f32>>,
     block: UniformBlock,
     uniforms: Option<wgpu::Buffer>,
-    vertices: wgpu::Buffer,
+    geometry: Option<Geometry>,
+    /// The mesh changed and must be re-uploaded.
+    mesh_dirty: bool,
     /// Rebuilt when render targets are reallocated.
     bind_group: Option<(u64, wgpu::BindGroup)>,
 }
@@ -465,13 +528,14 @@ impl PreparedMaterialDraw {
                 mapped_at_creation: false,
             })
         });
-        let vertices = vertex_buffer(gpu, &draw.program, &draw.mesh);
+        let geometry = Geometry::upload(gpu, &draw.program, &draw.mesh, None);
         Self {
             draw,
             overrides: HashMap::new(),
             block,
             uniforms,
-            vertices,
+            geometry,
+            mesh_dirty: false,
             bind_group: None,
         }
     }
@@ -569,6 +633,11 @@ impl PreparedMaterialDraw {
                 }
             }
         }
+        if self.mesh_dirty {
+            self.mesh_dirty = false;
+            let previous = self.geometry.take();
+            self.geometry = Geometry::upload(gpu, &self.draw.program, &self.draw.mesh, previous);
+        }
         self.bind(gpu, placeholders, targets);
         let Some(buffer) = &self.uniforms else { return };
         let r = &self.draw.program.reflection;
@@ -655,51 +724,140 @@ impl PreparedMaterialDraw {
         let Some((_, group)) = &self.bind_group else {
             return;
         };
-        let Some(pipeline) = self.draw.program.pipeline(device, self.draw.blend, format) else {
+        let Some(geometry) = &self.geometry else {
+            return;
+        };
+        let topology = self.draw.mesh.topology();
+        let Some(pipeline) = self
+            .draw
+            .program
+            .pipeline(device, self.draw.blend, format, topology)
+        else {
             return;
         };
         pass.set_pipeline(&pipeline);
         pass.set_bind_group(0, group, &[]);
-        pass.set_vertex_buffer(0, self.vertices.slice(..));
-        pass.draw(0..4, 0..1);
+        geometry.draw(pass);
+    }
+
+    /// Replace the mesh; it is uploaded on the next update.
+    pub fn set_mesh(&mut self, mesh: Mesh) {
+        self.draw.mesh = mesh;
+        self.mesh_dirty = true;
     }
 }
 
-fn vertex_buffer(gpu: &Gpu, program: &ShaderProgram, mesh: &CardMesh) -> wgpu::Buffer {
+/// Vertex (and index) buffers holding a mesh in a program's input layout.
+struct Geometry {
+    vertices: wgpu::Buffer,
+    indices: Option<wgpu::Buffer>,
+    /// Vertices, or indices when indexed.
+    count: u32,
+}
+
+impl Geometry {
+    /// Upload `mesh`, reusing `previous` buffers when they are large enough.
+    /// `None` for an empty mesh.
+    fn upload(
+        gpu: &Gpu,
+        program: &ShaderProgram,
+        mesh: &Mesh,
+        previous: Option<Geometry>,
+    ) -> Option<Self> {
+        let data = mesh.data();
+        let bytes = vertex_bytes(program, &data);
+        if bytes.is_empty() {
+            return None;
+        }
+        let buffer = |old: Option<wgpu::Buffer>, size: usize, usage, label| match old
+            .filter(|b| b.size() >= size as u64)
+        {
+            Some(b) => b,
+            None => gpu.device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some(label),
+                size: (size as u64).next_power_of_two().max(64),
+                usage: usage | wgpu::BufferUsages::COPY_DST,
+                mapped_at_creation: false,
+            }),
+        };
+        let (old_vertices, old_indices) = match previous {
+            Some(g) => (Some(g.vertices), g.indices),
+            None => (None, None),
+        };
+        let vertices = buffer(
+            old_vertices,
+            bytes.len(),
+            wgpu::BufferUsages::VERTEX,
+            "mesh vertices",
+        );
+        gpu.queue.write_buffer(&vertices, 0, &bytes);
+        let (indices, count) = match &data.indices {
+            Some(idx) if !idx.is_empty() => {
+                let idx_bytes: &[u8] = bytemuck::cast_slice(idx);
+                let b = buffer(
+                    old_indices,
+                    idx_bytes.len(),
+                    wgpu::BufferUsages::INDEX,
+                    "mesh indices",
+                );
+                gpu.queue.write_buffer(&b, 0, idx_bytes);
+                (Some(b), idx.len() as u32)
+            }
+            Some(_) => return None,
+            None => (None, data.vertex_count),
+        };
+        Some(Self {
+            vertices,
+            indices,
+            count,
+        })
+    }
+
+    fn draw(&self, pass: &mut wgpu::RenderPass) {
+        pass.set_vertex_buffer(0, self.vertices.slice(..));
+        match &self.indices {
+            Some(indices) => {
+                pass.set_index_buffer(indices.slice(..), wgpu::IndexFormat::Uint32);
+                pass.draw_indexed(0..self.count, 0, 0..1);
+            }
+            None => pass.draw(0..self.count, 0..1),
+        }
+    }
+}
+
+/// Interleave `mesh`'s streams in `program`'s vertex layout. Inputs the mesh
+/// lacks get zero, except `a_Color` which defaults to opaque white.
+fn vertex_bytes(program: &ShaderProgram, mesh: &MeshData) -> Vec<u8> {
     let inputs = &program.reflection.vertex_inputs;
     let stride = program.vertex_stride.max(4) as usize;
-    let mut data = vec![0u8; stride * 4];
-    for (v, (pos, uv)) in mesh.corners().iter().enumerate() {
-        for (input, attr) in inputs.iter().zip(&program.vertex_attributes) {
+    let count = mesh.vertex_count as usize;
+    let mut data = vec![0u8; stride * count];
+    for (input, attr) in inputs.iter().zip(&program.vertex_attributes) {
+        let stream = mesh
+            .attributes
+            .iter()
+            .find(|(name, ..)| *name == input.name);
+        for v in 0..count {
             let at = v * stride + attr.offset as usize;
-            let mut values = [0.0f32; 4];
-            match input.name.as_str() {
-                "a_Position" => {
-                    values[..3].copy_from_slice(pos);
-                    values[3] = 1.0;
-                }
-                "a_TexCoord" => values[..2].copy_from_slice(uv),
-                "a_Color" => values = [1.0; 4],
-                _ => {}
-            }
-            for (c, value) in values.iter().take(input.components as usize).enumerate() {
+            for c in 0..input.components as usize {
+                let value = match stream {
+                    Some((_, n, values)) if c < *n as usize => {
+                        values.get(v * *n as usize + c).copied().unwrap_or(0.0)
+                    }
+                    Some(_) if input.name == "a_Position" && c == 3 => 1.0,
+                    None if input.name == "a_Color" => 1.0,
+                    _ => 0.0,
+                };
                 let bytes = match input.scalar {
                     Scalar::Float | Scalar::Bool => value.to_le_bytes(),
-                    Scalar::Int => (*value as i32).to_le_bytes(),
-                    Scalar::Uint => (*value as u32).to_le_bytes(),
+                    Scalar::Int => (value as i32).to_le_bytes(),
+                    Scalar::Uint => (value as u32).to_le_bytes(),
                 };
                 data[at + c * 4..at + c * 4 + 4].copy_from_slice(&bytes);
             }
         }
     }
-    let buffer = gpu.device.create_buffer(&wgpu::BufferDescriptor {
-        label: Some("card"),
-        size: data.len() as u64,
-        usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
-        mapped_at_creation: false,
-    });
-    gpu.queue.write_buffer(&buffer, 0, &data);
-    buffer
+    data
 }
 
 #[cfg(test)]

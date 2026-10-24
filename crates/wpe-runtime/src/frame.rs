@@ -368,7 +368,7 @@ impl<'a> FrameBuilder<'a> {
                 textures: resolved.textures,
                 constants: resolved.constants,
                 model,
-                mesh,
+                mesh: mesh.into(),
                 blend,
                 camera,
                 sprites: resolved.sprites,
@@ -804,7 +804,8 @@ impl<'a> FrameBuilder<'a> {
             draw.mesh = CardMesh {
                 size: layer.size,
                 uv_scale: Vec2::ONE,
-            };
+            }
+            .into();
             if layer.motion.is_transform_animated() {
                 self.bindings.push(Binding::Model {
                     step: index,
