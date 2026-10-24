@@ -347,6 +347,7 @@ impl App {
         let finished = Instant::now();
         let mut wallpaper = prepared.finish(&gpu);
         wallpaper.set_volume(self.settings.volume as f32 / 100.0);
+        wallpaper.apply_general_settings(&crate::general_settings(&self.settings));
         let spec = load.spec;
         tracing::info!(
             "loaded \"{}\" ({}) in {:.1?}: prepared in {prepare:.1?} on a worker, finished in {:.1?}",

@@ -17,6 +17,7 @@ glow = "0.17"
 dpi = "0.1"
 http = "1.4"
 thiserror = "2.0.21"
+khronos-egl = { version = "6.0.0", features = ["static"] }
 
 [dev-dependencies]
 image = { version = "0.25", default-features = false, features = ["png"] }

@@ -7,6 +7,7 @@
 //! script ([`shim`]), and painted frames come back as RGBA pixels.
 
 mod context;
+mod gpu;
 mod host;
 mod policy;
 mod serve;
@@ -17,6 +18,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+pub use gpu::{Dmabuf, GpuFrames, Slots};
 pub use host::shutdown;
 pub use policy::NetworkPolicy;
 
@@ -52,6 +54,9 @@ pub struct PageOptions {
     pub network: NetworkPolicy,
     /// Where Servo keeps local storage and caches.
     pub profile_dir: Option<PathBuf>,
+    /// Hand frames over as dma-bufs ([`WebPage::take_gpu_frames`]) rather
+    /// than as pixels, when the page paints on the GPU.
+    pub export_frames: bool,
 }
 
 /// A painted frame: `width`×`height` RGBA8, rows top-down.
@@ -74,7 +79,7 @@ pub enum Input {
     /// The pointer is at this device pixel.
     Move(f32, f32),
     Button(Button, bool, f32, f32),
-    /// Scrolled by this many pixels at a point.
+    /// Scrolled by this many pixels at a point; positive is down/right.
     Wheel {
         dx: f32,
         dy: f32,
@@ -91,6 +96,13 @@ struct Shared {
     fresh: AtomicBool,
     /// The page finished loading and painted once.
     ready: AtomicBool,
+    /// Newly exported textures, until the renderer takes them.
+    gpu_frames: Mutex<Option<GpuFrames>>,
+    /// The renderer couldn't use exported textures: send pixels.
+    readback: AtomicBool,
+    pacer: Arc<context::Pacer>,
+    /// The renderer ticks the page; until then it ticks itself.
+    driven: AtomicBool,
 }
 
 /// One open page.
@@ -98,16 +110,22 @@ pub struct WebPage {
     id: u64,
     shared: Arc<Shared>,
     size: (u32, u32),
+    scale: f32,
 }
 
 impl WebPage {
     /// Open a page and wait (up to `timeout`) for it to load and paint.
     /// A page that is still loading by then is returned anyway.
     pub fn open(options: PageOptions, timeout: Duration) -> Result<Self, WebError> {
-        let size = options.size;
+        let (size, scale) = (options.size, options.scale);
         let shared = Arc::new(Shared::default());
         let id = host::open(options, shared.clone(), timeout)?;
-        Ok(Self { id, shared, size })
+        Ok(Self {
+            id,
+            shared,
+            size,
+            scale,
+        })
     }
 
     /// The viewport in device pixels.
@@ -123,6 +141,26 @@ impl WebPage {
         self.shared.frame.lock().unwrap().take()
     }
 
+    /// The textures frames now arrive in, after the page started exporting
+    /// them or was resized. Their slots say which one is newest.
+    pub fn take_gpu_frames(&self) -> Option<GpuFrames> {
+        self.shared.gpu_frames.lock().unwrap().take()
+    }
+
+    /// Switch to pixel frames ([`Self::take_frame`]), for when exported
+    /// textures can't be imported.
+    pub fn use_readback(&self) {
+        self.shared.readback.store(true, Ordering::Release);
+    }
+
+    /// Start the page's next frame: run its animations and
+    /// `requestAnimationFrame` callbacks. Call once per frame drawn; a page
+    /// never ticked runs on its own at 60 Hz.
+    pub fn tick(&self) {
+        self.shared.driven.store(true, Ordering::Relaxed);
+        self.shared.pacer.tick();
+    }
+
     /// Whether the page has loaded and painted.
     pub fn ready(&self) -> bool {
         self.shared.ready.load(Ordering::Acquire)
@@ -133,6 +171,14 @@ impl WebPage {
         if size != self.size && size.0 > 0 && size.1 > 0 {
             self.size = size;
             host::send(host::Cmd::Resize { id: self.id, size });
+        }
+    }
+
+    /// Device pixels per CSS pixel (the output's scale).
+    pub fn set_scale(&mut self, scale: f32) {
+        if scale > 0.0 && scale != self.scale {
+            self.scale = scale;
+            host::send(host::Cmd::Scale { id: self.id, scale });
         }
     }
 

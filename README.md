@@ -20,8 +20,10 @@ mpv decodes in software and frames are uploaded (`WPE_VIDEO=cpu` forces this pat
 Web wallpapers are rendered with [Servo](https://servo.org), behind the `web` cargo feature
 (off by default; the first build downloads a prebuilt SpiderMonkey and takes a few minutes):
 `cargo build --release -p wallpaper --features web`, likewise for `scene-viewer`. Pages paint on
-the GPU through an offscreen EGL context (`WPE_WEB=cpu` forces Mesa's software renderer); page
-media needs GStreamer.
+the GPU through an offscreen EGL context and frames reach wgpu as dma-bufs, like video frames;
+pages animate in step with the wallpaper's frames, so the frame rate limit, pausing and hidden
+outputs apply to them. `WPE_WEB=cpu` forces Mesa's software renderer (WebGL content doesn't show
+there). Page media needs GStreamer.
 
 ## Status
 
@@ -108,8 +110,10 @@ Set `WPE_DUMP_SHADERS=<dir>` to dump the final GLSL of every compiled shader.
 
 A web wallpaper's directory is served at `http://<workshop id>.wallpaper.localhost/` (its own
 local storage, kept under `<data dir>/wallpaper-engine-rs/web`). Pages get Wallpaper Engine's
-JavaScript API: `wallpaperPropertyListener` (`applyUserProperties`, `applyGeneralProperties`,
-`setPaused`) and `wallpaperRegisterAudioListener`. They may load from the internet, but not
+JavaScript API: `wallpaperPropertyListener` (`applyUserProperties`, `applyGeneralProperties`
+with the frame rate limit, `setPaused`) and `wallpaperRegisterAudioListener`. They get the
+pointer, all three mouse buttons and the scroll wheel, and lay out at the output's scale.
+`crates/wpe-web/examples/event-test` is a page logging what it receives. They may load from the internet, but not
 from this machine or the local network (localhost, private and link-local addresses, and names
 resolving to them); `WPE_WEB_ALLOW_HOSTS=nas.lan,192.168.1.10` lets chosen hosts through.
 Navigating away from the wallpaper and popups are blocked.

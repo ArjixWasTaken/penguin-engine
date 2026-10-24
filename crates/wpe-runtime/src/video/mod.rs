@@ -14,6 +14,8 @@
 
 mod cpu;
 mod gl;
+#[cfg(feature = "web")]
+pub(crate) use gl::import as import_dmabuf;
 
 use std::ffi::{c_char, c_void};
 use std::ptr;

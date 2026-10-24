@@ -448,8 +448,10 @@ impl App {
         }
         if old.fps != new.fps {
             let now = Instant::now();
+            let general = crate::general_settings(&new);
             for s in &mut self.screens {
                 s.next_frame = now;
+                s.wallpaper.apply_general_settings(&general);
             }
         }
         self.schedule_all();

@@ -67,8 +67,17 @@ use loading::{LoadSpec, Loads, NewSurface, SurfaceParts};
 use state::{Overrides, SavedOutput, State};
 use systemd::NotifyState;
 
-/// `BTN_LEFT` from linux/input-event-codes.h.
+/// Settings as wallpapers' `applyGeneralProperties`/`applyGeneralSettings`
+/// see them: the frame rate limit (60 when following the display).
+pub fn general_settings(settings: &wpe_ipc::Settings) -> serde_json::Value {
+    let fps = if settings.fps == 0 { 60 } else { settings.fps };
+    serde_json::json!({ "fps": fps })
+}
+
+/// `BTN_LEFT` and friends from linux/input-event-codes.h.
 const BTN_LEFT: u32 = 0x110;
+const BTN_RIGHT: u32 = 0x111;
+const BTN_MIDDLE: u32 = 0x112;
 
 #[derive(Parser)]
 #[command(about = "Play a Wallpaper Engine wallpaper as the desktop background (Wayland)")]
@@ -399,6 +408,8 @@ impl Screen {
         };
         let view = frame.texture.create_view(&Default::default());
         let mut encoder = gpu.device.create_command_encoder(&Default::default());
+        self.wallpaper
+            .set_scale(self.config.width as f32 / self.logical.0.max(1) as f32);
         self.wallpaper.render(
             gpu,
             &mut encoder,
@@ -1122,12 +1133,29 @@ impl PointerHandler for App {
                         event.position.1 as f32 / h.max(1) as f32,
                     ));
                 }
-                PointerEventKind::Press {
-                    button: BTN_LEFT, ..
-                } => screen.wallpaper.mouse_button(true),
-                PointerEventKind::Release {
-                    button: BTN_LEFT, ..
-                } => screen.wallpaper.mouse_button(false),
+                PointerEventKind::Press { button, .. }
+                | PointerEventKind::Release { button, .. } => {
+                    let down = matches!(event.kind, PointerEventKind::Press { .. });
+                    let button = match button {
+                        BTN_LEFT => wpe_runtime::MouseButton::Left,
+                        BTN_RIGHT => wpe_runtime::MouseButton::Right,
+                        BTN_MIDDLE => wpe_runtime::MouseButton::Middle,
+                        _ => continue,
+                    };
+                    screen.wallpaper.pointer_button(button, down);
+                }
+                PointerEventKind::Axis {
+                    horizontal,
+                    vertical,
+                    ..
+                } => {
+                    // Logical pixels to output pixels.
+                    let scale = screen.config.width as f32 / w.max(1) as f32;
+                    screen.wallpaper.scroll(
+                        horizontal.absolute as f32 * scale,
+                        vertical.absolute as f32 * scale,
+                    );
+                }
                 _ => {}
             }
         }

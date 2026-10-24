@@ -1,0 +1,17 @@
+<!doctype html><html><body style="margin:0;background:#222;color:#fff;font:40px sans-serif">
+<div id="t">starting</div>
+<script>
+let frames = 0;
+const log = (m) => console.error("TEST " + m);
+addEventListener("mousedown", e => log("down button=" + e.button + " at " + e.clientX + "," + e.clientY));
+addEventListener("wheel", e => log("wheel dy=" + e.deltaY));
+addEventListener("contextmenu", e => e.preventDefault());
+const t = document.getElementById("t"); const tick = () => { frames++; t.textContent = frames; requestAnimationFrame(tick); };
+requestAnimationFrame(tick);
+setInterval(() => { log("raf/s=" + frames + " dpr=" + devicePixelRatio + " size=" + innerWidth + "x" + innerHeight); frames = 0; }, 1000);
+window.wallpaperPropertyListener = {
+  applyUserProperties: p => { log("props " + JSON.stringify(p)); if (p.color) document.body.style.background = "rgb(" + p.color.value.split(" ").map(c => c * 255) + ")"; },
+  applyGeneralProperties: p => log("general " + JSON.stringify(p)),
+  setPaused: p => log("paused " + p),
+};
+</script></body></html>

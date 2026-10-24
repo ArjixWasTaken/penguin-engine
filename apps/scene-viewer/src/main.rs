@@ -354,12 +354,31 @@ impl ApplicationHandler for App {
             }
             WindowEvent::MouseInput {
                 state: button_state,
-                button: winit::event::MouseButton::Left,
+                button,
                 ..
-            } => state
-                .wallpaper
-                .mouse_button(button_state == ElementState::Pressed),
+            } => {
+                let button = match button {
+                    winit::event::MouseButton::Left => wpe_runtime::MouseButton::Left,
+                    winit::event::MouseButton::Right => wpe_runtime::MouseButton::Right,
+                    winit::event::MouseButton::Middle => wpe_runtime::MouseButton::Middle,
+                    _ => return,
+                };
+                state
+                    .wallpaper
+                    .pointer_button(button, button_state == ElementState::Pressed);
+            }
+            WindowEvent::MouseWheel { delta, .. } => {
+                // winit scrolls up for positive values; wallpapers take down.
+                let (dx, dy) = match delta {
+                    winit::event::MouseScrollDelta::LineDelta(x, y) => (x * 40.0, y * 40.0),
+                    winit::event::MouseScrollDelta::PixelDelta(p) => (p.x as f32, p.y as f32),
+                };
+                state.wallpaper.scroll(-dx, -dy);
+            }
             WindowEvent::RedrawRequested => {
+                state
+                    .wallpaper
+                    .set_scale(state.window.scale_factor() as f32);
                 state.redraw();
                 if self.args.fps == 0 {
                     state.window.request_redraw();

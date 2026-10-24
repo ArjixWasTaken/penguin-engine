@@ -41,6 +41,14 @@ pub use material::{SlotTexture, TextureStore};
 pub use wpe_assets::project::{Project, PropertyOption, UserProperty};
 pub use wpe_scene::FillMode;
 
+/// Mouse buttons wallpapers react to.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum MouseButton {
+    Left,
+    Middle,
+    Right,
+}
+
 pub(crate) fn rgba_texture(width: u32, height: u32, pixels: Vec<u8>) -> Texture {
     Texture {
         format: TexFormat::Rgba8,
@@ -546,6 +554,7 @@ impl PreparedWallpaper {
                 page,
                 target: None,
                 shown: None,
+                shared: None,
             }),
         };
         let built = wallpaper.install(gpu, self.frame);
@@ -650,6 +659,7 @@ impl Wallpaper {
                     &file,
                     &files.project,
                     (width, height),
+                    web_wallpaper::can_share(gpu),
                 )?)
             }
             None => None,
@@ -1106,7 +1116,7 @@ impl Wallpaper {
         }
         match wait {
             Some(timeout) => web.wait_frame(gpu, timeout),
-            None => web.upload(gpu),
+            None => web.frame(gpu),
         }
         self.web = Some(web);
     }
@@ -1114,6 +1124,49 @@ impl Wallpaper {
     /// Video textures and the streams feeding them.
     fn videos(&self) -> &[(Arc<GpuTexture>, Arc<video::VideoStream>)] {
         self.cache.as_ref().map_or(&[], |c| &c.videos)
+    }
+
+    /// A mouse button was pressed or released at the current pointer.
+    /// Scenes only see the left button; web pages see all three.
+    pub fn pointer_button(&mut self, button: MouseButton, down: bool) {
+        match button {
+            MouseButton::Left => self.mouse_button(down),
+            #[cfg(feature = "web")]
+            _ => {
+                if let Some(web) = &self.web {
+                    let (x, y) = web.page_point(self.pointer_target);
+                    let button = match button {
+                        MouseButton::Middle => web_wallpaper::Button::Middle,
+                        _ => web_wallpaper::Button::Right,
+                    };
+                    web.page.input(wpe_web::Input::Button(button, down, x, y));
+                }
+            }
+            #[cfg(not(feature = "web"))]
+            _ => {}
+        }
+    }
+
+    /// Scrolled by `dx`, `dy` output pixels at the current pointer (web
+    /// pages only).
+    pub fn scroll(&mut self, dx: f32, dy: f32) {
+        #[cfg(feature = "web")]
+        if let Some(web) = &self.web {
+            let (x, y) = web.page_point(self.pointer_target);
+            web.page.input(wpe_web::Input::Wheel { dx, dy, x, y });
+        }
+        #[cfg(not(feature = "web"))]
+        let _ = (dx, dy);
+    }
+
+    /// Output pixels per logical pixel; web pages lay out in logical pixels.
+    pub fn set_scale(&mut self, scale: f32) {
+        #[cfg(feature = "web")]
+        if let Some(web) = &mut self.web {
+            web.page.set_scale(scale);
+        }
+        #[cfg(not(feature = "web"))]
+        let _ = scale;
     }
 
     /// The left mouse button was pressed or released at the current pointer.

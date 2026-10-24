@@ -23,6 +23,7 @@ use servo::{
 use url::Url;
 
 use crate::context::PageContext;
+use crate::gpu::Ring;
 use crate::policy::{self, NetworkPolicy, Verdict};
 use crate::{Button, Frame, Input, PageOptions, Shared, WebError};
 
@@ -36,6 +37,10 @@ pub enum Cmd {
     Resize {
         id: u64,
         size: (u32, u32),
+    },
+    Scale {
+        id: u64,
+        scale: f32,
     },
     Input {
         id: u64,
@@ -161,6 +166,64 @@ struct Page {
     ready: Option<Sender<Result<(), WebError>>>,
     loaded: bool,
     paused: bool,
+    export_frames: bool,
+    /// The exported textures frames are copied into.
+    ring: Option<Ring>,
+}
+
+impl Page {
+    /// Hand the painted frame over: copied into an exported texture, or
+    /// read back as pixels.
+    fn deliver_frame(&mut self) {
+        if self.export_frames
+            && !self.shared.readback.load(Ordering::Acquire)
+            && let Some(fbo) = self.context.gpu_framebuffer()
+        {
+            let gl = self.context.glow_gl_api();
+            let size = self.context.size();
+            let size = (size.width, size.height);
+            if self.ring.as_ref().is_some_and(|r| r.size() != size)
+                && let Some(mut old) = self.ring.take()
+            {
+                old.delete(&gl);
+            }
+            if self.ring.is_none() {
+                match Ring::new(&gl, size) {
+                    Ok((ring, frames)) => {
+                        *self.shared.gpu_frames.lock().unwrap() = Some(frames);
+                        self.ring = Some(ring);
+                    }
+                    Err(e) => {
+                        tracing::warn!("page {}: can't share frames on the GPU: {e}", self.id);
+                        self.shared.readback.store(true, Ordering::Release);
+                    }
+                }
+            }
+            if let Some(ring) = &self.ring {
+                ring.copy(&gl, fbo);
+                self.shared.fresh.store(true, Ordering::Release);
+                return;
+            }
+        }
+        if let Some(image) = self.context.read_frame() {
+            let (width, height) = image.dimensions();
+            *self.shared.frame.lock().unwrap() = Some(Frame {
+                width,
+                height,
+                pixels: image.into_raw(),
+            });
+            self.shared.fresh.store(true, Ordering::Release);
+        }
+    }
+}
+
+impl Drop for Page {
+    fn drop(&mut self) {
+        if let Some(mut ring) = self.ring.take() {
+            let _ = self.context.make_current();
+            ring.delete(&self.context.glow_gl_api());
+        }
+    }
 }
 
 struct Pages {
@@ -196,9 +259,7 @@ impl WebViewDelegate for Pages {
     fn notify_new_frame_ready(&self, webview: WebView) {
         // Servo may call back into the delegate while painting, so nothing
         // stays borrowed across it.
-        let Some((context, shared, paused)) = self.with(&webview, |p| {
-            (p.context.clone(), p.shared.clone(), p.paused)
-        }) else {
+        let Some((context, paused)) = self.with(&webview, |p| (p.context.clone(), p.paused)) else {
             return;
         };
         if paused {
@@ -206,21 +267,13 @@ impl WebViewDelegate for Pages {
         }
         let _ = context.make_current();
         webview.paint();
-        if let Some(image) = context.read_frame() {
-            let (width, height) = image.dimensions();
-            *shared.frame.lock().unwrap() = Some(Frame {
-                width,
-                height,
-                pixels: image.into_raw(),
-            });
-            shared.fresh.store(true, Ordering::Release);
-        }
-        context.present();
         self.with(&webview, |page| {
+            page.deliver_frame();
             if page.loaded && page.ready.is_some() {
                 page.became_ready();
             }
         });
+        context.present();
     }
 
     fn notify_load_status_changed(&self, webview: WebView, status: LoadStatus) {
@@ -381,9 +434,20 @@ fn run(rx: Receiver<Cmd>, waker: Sender<Cmd>, profile_dir: Option<std::path::Pat
         waiting: Default::default(),
     });
 
+    const FREE_RUNNING: Duration = Duration::from_micros(16_667);
+    let mut last_tick = Instant::now();
     let mut shutdown = None;
     loop {
-        let cmd = match rx.recv_timeout(Duration::from_millis(250)) {
+        // Pages the renderer doesn't tick (yet) run at 60 Hz.
+        if last_tick.elapsed() >= FREE_RUNNING {
+            last_tick = Instant::now();
+            for page in pages.by_webview.borrow().values() {
+                if !page.shared.driven.load(Ordering::Relaxed) {
+                    page.shared.pacer.tick();
+                }
+            }
+        }
+        let cmd = match rx.recv_timeout(FREE_RUNNING) {
             Ok(cmd) => Some(cmd),
             Err(RecvTimeoutError::Timeout) => None,
             Err(RecvTimeoutError::Disconnected) => break,
@@ -398,6 +462,11 @@ fn run(rx: Receiver<Cmd>, waker: Sender<Cmd>, profile_dir: Option<std::path::Pat
             Some(Cmd::Resize { id, size }) => {
                 if let Some(webview) = pages.webview(id) {
                     webview.resize(PhysicalSize::new(size.0, size.1));
+                }
+            }
+            Some(Cmd::Scale { id, scale }) => {
+                if let Some(webview) = pages.webview(id) {
+                    webview.set_hidpi_scale_factor(Scale::new(scale));
                 }
             }
             Some(Cmd::Input { id, input }) => {
@@ -488,7 +557,7 @@ fn open_page(
     ready: Sender<Result<(), WebError>>,
 ) {
     let size = PhysicalSize::new(options.size.0.max(1), options.size.1.max(1));
-    let context = match PageContext::new(size) {
+    let context = match PageContext::new(size, shared.pacer.clone()) {
         Ok(c) => Rc::new(c),
         Err(e) => {
             let _ = ready.send(Err(WebError::Context(format!("{e:?}"))));
@@ -533,6 +602,8 @@ fn open_page(
             ready: Some(ready),
             loaded: false,
             paused: false,
+            export_frames: options.export_frames,
+            ring: None,
         },
     );
 }
@@ -576,9 +647,11 @@ fn input_event(input: Input) -> InputEvent {
             point(x, y),
         )),
         Input::Wheel { dx, dy, x, y } => InputEvent::Wheel(WheelEvent::new(
+            // Servo takes winit's sign (positive scrolls up); ours is the
+            // DOM's and Wayland's (positive scrolls down).
             WheelDelta {
-                x: dx as f64,
-                y: dy as f64,
+                x: -dx as f64,
+                y: -dy as f64,
                 z: 0.0,
                 mode: WheelMode::DeltaPixel,
             },

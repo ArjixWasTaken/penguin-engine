@@ -5,43 +5,91 @@
 
 use std::cell::{Cell, RefCell};
 use std::rc::Rc;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use dpi::PhysicalSize;
 use euclid::default::Size2D as UntypedSize2D;
 use glow::HasContext;
-use servo::{DeviceIntRect, RenderingContext, RgbaImage, SoftwareRenderingContext};
+use servo::{DeviceIntRect, RefreshDriver, RenderingContext, RgbaImage, SoftwareRenderingContext};
 use surfman::chains::{PreserveBuffer, SwapChain};
 use surfman::{
     Connection, Context, ContextAttributeFlags, ContextAttributes, Device, Error, GLApi, Surface,
     SurfaceAccess, SurfaceInfo, SurfaceTexture, SurfaceType,
 };
 
+/// When pages start their frames (animations, `requestAnimationFrame`):
+/// whenever [`Pacer::tick`] is called, which the renderer does once per
+/// frame it draws, so pages follow its frame rate and stop while it's
+/// paused or hidden.
+#[derive(Default)]
+pub struct Pacer {
+    waiting: Mutex<Vec<Box<dyn Fn() + Send>>>,
+}
+
+impl Pacer {
+    pub fn tick(&self) {
+        let waiting = std::mem::take(&mut *self.waiting.lock().unwrap());
+        for start in waiting {
+            start();
+        }
+    }
+}
+
+struct Driver(Arc<Pacer>);
+
+impl RefreshDriver for Driver {
+    fn observe_next_frame(&self, start: Box<dyn Fn() + Send + 'static>) {
+        self.0.waiting.lock().unwrap().push(start);
+    }
+}
+
 /// A page's rendering context: the GPU one, or the software fallback.
-pub enum PageContext {
+pub struct PageContext {
+    inner: Inner,
+    driver: Rc<Driver>,
+}
+
+enum Inner {
     Gpu(GpuContext),
     Software(SoftwareRenderingContext),
 }
 
 impl PageContext {
     /// A context `size` pixels big, on the GPU unless `WPE_WEB=cpu` or
-    /// that fails.
-    pub fn new(size: PhysicalSize<u32>) -> Result<Self, Error> {
+    /// that fails, whose frames start when `pacer` ticks.
+    pub fn new(size: PhysicalSize<u32>, pacer: Arc<Pacer>) -> Result<Self, Error> {
+        let driver = Rc::new(Driver(pacer));
         if std::env::var("WPE_WEB").as_deref() != Ok("cpu") {
             match GpuContext::new(size) {
-                Ok(context) => return Ok(Self::Gpu(context)),
+                Ok(context) => {
+                    return Ok(Self {
+                        inner: Inner::Gpu(context),
+                        driver,
+                    });
+                }
                 Err(e) => {
                     tracing::warn!("no GPU context for web pages, rendering in software: {e:?}")
                 }
             }
         }
-        SoftwareRenderingContext::new(size).map(Self::Software)
+        Ok(Self {
+            inner: Inner::Software(SoftwareRenderingContext::new(size)?),
+            driver,
+        })
     }
 
     fn inner(&self) -> &dyn RenderingContext {
-        match self {
-            Self::Gpu(c) => c,
-            Self::Software(c) => c,
+        match &self.inner {
+            Inner::Gpu(c) => c,
+            Inner::Software(c) => c,
+        }
+    }
+
+    /// The framebuffer Servo paints into, when it is on the GPU.
+    pub fn gpu_framebuffer(&self) -> Option<u32> {
+        match &self.inner {
+            Inner::Gpu(c) => Some(c.framebuffer()),
+            Inner::Software(_) => None,
         }
     }
 
@@ -90,6 +138,9 @@ impl RenderingContext for PageContext {
     }
     fn connection(&self) -> Option<Connection> {
         self.inner().connection()
+    }
+    fn refresh_driver(&self) -> Option<Rc<dyn RefreshDriver>> {
+        Some(self.driver.clone())
     }
 }
 
@@ -160,7 +211,7 @@ impl GpuContext {
         })
     }
 
-    fn framebuffer(&self) -> u32 {
+    pub(crate) fn framebuffer(&self) -> u32 {
         let device = self.device.borrow();
         let context = self.context.borrow();
         device

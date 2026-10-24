@@ -15,26 +15,54 @@ fn main() {
     let properties = project["general"]["properties"].clone();
     let name = dir.file_name().unwrap().to_string_lossy().into_owned();
     let started = Instant::now();
-    let page = wpe_web::WebPage::open(
-        wpe_web::PageOptions {
-            root: dir,
-            file,
-            name,
-            size: (1920, 1080),
-            scale: 1.0,
-            properties,
-            general: serde_json::json!({ "fps": 30 }),
-            network: Default::default(),
-            profile_dir: None,
-        },
-        Duration::from_secs(20),
-    )
-    .unwrap();
+    let options = wpe_web::PageOptions {
+        root: dir,
+        file,
+        name,
+        size: (1920, 1080),
+        scale: 1.0,
+        properties,
+        general: serde_json::json!({ "fps": 30 }),
+        network: Default::default(),
+        profile_dir: None,
+        export_frames: false,
+    };
+    // `PROBE_TWO`: a second page alongside (as on a second output).
+    let second = std::env::var_os("PROBE_TWO").map(|_| {
+        let mut o = options.clone();
+        o.size = (1280, 720);
+        wpe_web::WebPage::open(o, Duration::from_secs(20)).unwrap()
+    });
+    let mut page = wpe_web::WebPage::open(options, Duration::from_secs(20)).unwrap();
     println!("ready={} after {:?}", page.ready(), started.elapsed());
+    if std::env::var_os("PROBE_EVENTS").is_some() {
+        use wpe_web::{Button, Input};
+        std::thread::sleep(Duration::from_millis(500));
+        page.input(Input::Move(100.0, 200.0));
+        for button in [Button::Left, Button::Right, Button::Middle] {
+            page.input(Input::Button(button, true, 100.0, 200.0));
+            page.input(Input::Button(button, false, 100.0, 200.0));
+        }
+        page.input(Input::Wheel {
+            dx: 0.0,
+            dy: 120.0,
+            x: 100.0,
+            y: 200.0,
+        });
+        page.apply_properties(&serde_json::json!({"color": {"type": "color", "value": "0 0 1"}}));
+        page.set_paused(true);
+        std::thread::sleep(Duration::from_millis(1500));
+        page.set_paused(false);
+        page.set_scale(2.0);
+    }
     let deadline = Instant::now() + Duration::from_secs_f32(seconds);
     let mut frames = 0;
     let mut last = None;
     while Instant::now() < deadline {
+        if std::env::var_os("PROBE_TICK").is_some() {
+            page.tick();
+            std::thread::sleep(Duration::from_millis(28));
+        }
         if let Some(f) = page.take_frame() {
             frames += 1;
             last = Some(f);
@@ -42,6 +70,10 @@ fn main() {
         std::thread::sleep(Duration::from_millis(5));
     }
     println!("{frames} frames in {seconds}s");
+    if let Some(second) = &second {
+        let f = second.take_frame();
+        println!("second page: {:?}", f.map(|f| (f.width, f.height)));
+    }
     if let Some(f) = last {
         image::save_buffer(
             &out,
@@ -53,5 +85,6 @@ fn main() {
         .unwrap();
     }
     drop(page);
+    drop(second);
     wpe_web::shutdown(Duration::from_secs(3));
 }

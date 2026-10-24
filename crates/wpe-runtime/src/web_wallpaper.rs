@@ -36,7 +36,7 @@ mod enabled {
     use std::sync::{Arc, Mutex};
     use std::time::Duration;
 
-    use wpe_render::{Gpu, GpuTexture};
+    use wpe_render::{Gpu, GpuTexture, wgpu};
     pub use wpe_web::{Button, NetworkPolicy, shutdown};
 
     use crate::LoadError;
@@ -71,6 +71,25 @@ mod enabled {
         pub target: Option<Arc<GpuTexture>>,
         /// Size of the frame the target shows.
         pub shown: Option<(u32, u32)>,
+        /// The page's exported textures, imported.
+        pub shared: Option<Shared>,
+    }
+
+    /// Exported textures frames are copied from.
+    pub struct Shared {
+        textures: Vec<wgpu::Texture>,
+        slots: Arc<Mutex<wpe_web::Slots>>,
+        size: (u32, u32),
+    }
+
+    /// Whether pages may hand frames over as dma-bufs: the renderer must
+    /// be able to import them.
+    pub fn can_share(gpu: &Gpu) -> bool {
+        std::env::var("WPE_WEB").as_deref() != Ok("cpu")
+            && gpu
+                .device
+                .features()
+                .contains(wgpu::Features::VULKAN_EXTERNAL_MEMORY_DMA_BUF)
     }
 
     /// Open the page `file` of the wallpaper in `dir`.
@@ -79,6 +98,7 @@ mod enabled {
         file: &str,
         project: &wpe_assets::Project,
         size: (u32, u32),
+        export_frames: bool,
     ) -> Result<wpe_web::WebPage, LoadError> {
         let dir = dir.canonicalize().unwrap_or_else(|_| dir.to_owned());
         let name = dir
@@ -95,6 +115,7 @@ mod enabled {
             general: serde_json::json!({ "fps": 60 }),
             network: network_policy(),
             profile_dir: dirs::data_dir().map(|d| d.join("wallpaper-engine-rs/web")),
+            export_frames,
         };
         wpe_web::WebPage::open(options, Duration::from_secs(20))
             .map_err(|e| LoadError::Web(e.to_string()))
@@ -103,14 +124,51 @@ mod enabled {
     impl WebState {
         /// Show the page's newest frame, if it painted one.
         pub fn upload(&mut self, gpu: &Gpu) {
-            let (Some(target), Some(frame)) = (&self.target, self.page.take_frame()) else {
+            let Some(target) = self.target.clone() else {
                 return;
             };
             let size = target.texture.size();
-            // Frames painted before a resize don't fit.
-            if (frame.width, frame.height) == (size.width, size.height) {
+            let size = (size.width, size.height);
+            if let Some(frames) = self.page.take_gpu_frames() {
+                match import(gpu, frames, target.texture.format()) {
+                    Ok(shared) => {
+                        tracing::debug!("page frames shared on the GPU at {:?}", shared.size);
+                        self.shared = Some(shared);
+                    }
+                    Err(e) => {
+                        tracing::warn!("page frames can't stay on the GPU, reading them back: {e}");
+                        self.shared = None;
+                        self.page.use_readback();
+                    }
+                }
+            }
+            if let Some(shared) = &self.shared
+                && shared.size == size
+            {
+                let Some(slot) = wpe_web::Slots::lock(&shared.slots).take_ready() else {
+                    return;
+                };
+                let source = &shared.textures[slot];
+                let mut encoder = gpu.device.create_command_encoder(&Default::default());
+                encoder.copy_texture_to_texture(
+                    source.as_image_copy(),
+                    target.texture.as_image_copy(),
+                    source.size(),
+                );
+                gpu.queue.submit([encoder.finish()]);
+                let slots = shared.slots.clone();
+                gpu.queue.on_submitted_work_done(move || {
+                    wpe_web::Slots::lock(&slots).release(slot);
+                });
+                self.shown = Some(size);
+                return;
+            }
+            // Pixels, from a page painting in software or before a resize.
+            if let Some(frame) = self.page.take_frame()
+                && (frame.width, frame.height) == size
+            {
                 target.write_rgba(gpu, &frame.pixels);
-                self.shown = Some((frame.width, frame.height));
+                self.shown = Some(size);
             }
         }
 
@@ -119,6 +177,7 @@ mod enabled {
         pub fn wait_frame(&mut self, gpu: &Gpu, timeout: Duration) {
             let deadline = std::time::Instant::now() + timeout;
             loop {
+                self.page.tick();
                 self.upload(gpu);
                 if self.shown == Some(self.page.size()) {
                     return;
@@ -131,10 +190,56 @@ mod enabled {
             }
         }
 
+        /// Show the newest frame and start the next.
+        pub fn frame(&mut self, gpu: &Gpu) {
+            self.upload(gpu);
+            self.page.tick();
+        }
+
         /// The output pointer (0..1, Y down) in page pixels.
         pub fn page_point(&self, pointer: glam::Vec2) -> (f32, f32) {
             let (w, h) = self.page.size();
             (pointer.x * w as f32, pointer.y * h as f32)
         }
+    }
+
+    fn import(
+        gpu: &Gpu,
+        frames: wpe_web::GpuFrames,
+        format: wgpu::TextureFormat,
+    ) -> Result<Shared, String> {
+        if !matches!(
+            format,
+            wgpu::TextureFormat::Rgba8Unorm | wgpu::TextureFormat::Rgba8UnormSrgb
+        ) {
+            return Err(format!("the layer texture is {format:?}"));
+        }
+        let size = wgpu::Extent3d {
+            width: frames.width,
+            height: frames.height,
+            depth_or_array_layers: 1,
+        };
+        let textures = frames
+            .buffers
+            .into_iter()
+            .map(|b| {
+                crate::video::import_dmabuf(
+                    gpu,
+                    b.fd,
+                    b.modifier,
+                    b.stride,
+                    b.offset,
+                    size,
+                    format,
+                    "web frame",
+                )
+                .map_err(|e| e.to_string())
+            })
+            .collect::<Result<_, _>>()?;
+        Ok(Shared {
+            textures,
+            slots: frames.slots,
+            size: (frames.width, frames.height),
+        })
     }
 }

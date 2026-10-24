@@ -397,6 +397,55 @@ impl Drop for Output {
     }
 }
 
+/// Import a single-plane dma-buf as a texture frames are copied from.
+#[allow(clippy::too_many_arguments)]
+pub fn import(
+    gpu: &Gpu,
+    fd: OwnedFd,
+    modifier: u64,
+    stride: u32,
+    offset: u32,
+    size: wgpu::Extent3d,
+    format: wgpu::TextureFormat,
+    label: &str,
+) -> Result<wgpu::Texture, VideoError> {
+    use wgpu::hal::api::Vulkan;
+
+    let raw = {
+        let device = unsafe { gpu.device.as_hal::<Vulkan>() }
+            .ok_or_else(|| VideoError::Share("the renderer isn't on Vulkan".to_owned()))?;
+        let desc = wgpu::hal::TextureDescriptor {
+            label: Some(label),
+            size,
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format,
+            usage: wgpu::TextureUses::COPY_SRC,
+            memory_flags: wgpu::hal::MemoryFlags::empty(),
+            view_formats: Vec::new(),
+        };
+        unsafe { device.texture_from_dmabuf_fd(fd, &desc, modifier, stride as u64, offset as u64) }
+            .map_err(|e| VideoError::Share(format!("importing a dma-buf: {e}")))?
+    };
+    Ok(unsafe {
+        gpu.device.create_texture_from_hal::<Vulkan>(
+            raw,
+            &wgpu::TextureDescriptor {
+                label: Some(label),
+                size,
+                mip_level_count: 1,
+                sample_count: 1,
+                dimension: wgpu::TextureDimension::D2,
+                format,
+                usage: wgpu::TextureUsages::COPY_SRC,
+                view_formats: &[],
+            },
+            wgpu::TextureUses::COPY_SRC,
+        )
+    })
+}
+
 /// The renderer's side: the shared textures as wgpu sees them.
 pub struct Frames {
     textures: Vec<wgpu::Texture>,
@@ -412,57 +461,26 @@ impl Frames {
         format: wgpu::TextureFormat,
         slots: Arc<Mutex<Slots>>,
     ) -> Result<Self, VideoError> {
-        use wgpu::hal::api::Vulkan;
-
         let size = wgpu::Extent3d {
             width,
             height,
             depth_or_array_layers: 1,
         };
-        let mut textures = Vec::new();
-        for buffer in buffers {
-            let raw = {
-                let device = unsafe { gpu.device.as_hal::<Vulkan>() }
-                    .ok_or_else(|| VideoError::Share("the renderer isn't on Vulkan".to_owned()))?;
-                let desc = wgpu::hal::TextureDescriptor {
-                    label: Some("video frame"),
+        let textures = buffers
+            .into_iter()
+            .map(|b| {
+                import(
+                    gpu,
+                    b.fd,
+                    b.modifier,
+                    b.stride,
+                    b.offset,
                     size,
-                    mip_level_count: 1,
-                    sample_count: 1,
-                    dimension: wgpu::TextureDimension::D2,
                     format,
-                    usage: wgpu::TextureUses::COPY_SRC,
-                    memory_flags: wgpu::hal::MemoryFlags::empty(),
-                    view_formats: Vec::new(),
-                };
-                unsafe {
-                    device.texture_from_dmabuf_fd(
-                        buffer.fd,
-                        &desc,
-                        buffer.modifier,
-                        buffer.stride as u64,
-                        buffer.offset as u64,
-                    )
-                }
-                .map_err(|e| VideoError::Share(format!("importing a dma-buf: {e}")))?
-            };
-            textures.push(unsafe {
-                gpu.device.create_texture_from_hal::<Vulkan>(
-                    raw,
-                    &wgpu::TextureDescriptor {
-                        label: Some("video frame"),
-                        size,
-                        mip_level_count: 1,
-                        sample_count: 1,
-                        dimension: wgpu::TextureDimension::D2,
-                        format,
-                        usage: wgpu::TextureUsages::COPY_SRC,
-                        view_formats: &[],
-                    },
-                    wgpu::TextureUses::COPY_SRC,
+                    "video frame",
                 )
-            });
-        }
+            })
+            .collect::<Result<_, _>>()?;
         Ok(Self { textures, slots })
     }
 
