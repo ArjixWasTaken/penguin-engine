@@ -19,6 +19,8 @@ pub struct Scene {
     pub bloom: Option<Bloom>,
     /// Mouse/position parallax, when enabled.
     pub parallax: Option<Parallax>,
+    /// Camera shake, when enabled.
+    pub shake: Option<Shake>,
     /// Image layers in draw order (back to front), including hidden ones
     /// other layers may sample.
     pub layers: Vec<ImageLayer>,
@@ -30,6 +32,24 @@ pub struct Bloom {
     pub strength: f32,
     pub threshold: f32,
     pub tint: Vec3,
+}
+
+/// `general.camerashake*` settings.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Shake {
+    pub amplitude: f32,
+    pub speed: f32,
+    pub roughness: f32,
+}
+
+impl Shake {
+    /// Camera offset at `time`, in units of 1% of the scene size.
+    pub fn offset(&self, time: f32) -> Vec2 {
+        let (t, r) = (time * self.speed, self.roughness);
+        let x = t.sin() + (t * 2.3 + 1.7).sin() * r + (t * 4.7 + 3.1).sin() * r * r;
+        let y = (t * 1.3 + 0.5).cos() + (t * 2.7 + 2.1).cos() * r + (t * 5.1 + 0.9).cos() * r * r;
+        Vec2::new(x, y) * (self.amplitude / (1.0 + r + r * r))
+    }
 }
 
 /// `general.cameraparallax*` settings.
@@ -294,6 +314,11 @@ impl Scene {
                 amount: props.value(&general.cameraparallaxamount),
                 delay: props.value(&general.cameraparallaxdelay),
                 mouse_influence: props.value(&general.cameraparallaxmouseinfluence),
+            }),
+            shake: props.flag(&general.camerashake).then(|| Shake {
+                amplitude: props.value(&general.camerashakeamplitude),
+                speed: props.value(&general.camerashakespeed),
+                roughness: props.value(&general.camerashakeroughness),
             }),
             bloom: props.flag(&general.bloom).then(|| Bloom {
                 strength: props.value(&general.bloomstrength),

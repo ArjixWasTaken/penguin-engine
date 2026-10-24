@@ -54,8 +54,14 @@ pub struct Wallpaper {
     videos: Vec<(Arc<GpuTexture>, video::VideoStream)>,
     bindings: Vec<frame::Binding>,
     start: Instant,
-    /// Cursor over the output, 0..1 with Y down.
+    /// Smoothed cursor over the output, 0..1 with Y down.
     pointer: Vec2,
+    /// Where the cursor actually is.
+    pointer_target: Vec2,
+    /// Wall-clock time of the last frame, for pointer smoothing.
+    last_frame: Option<Instant>,
+    parallax_delay: f32,
+    shake: Option<wpe_scene::Shake>,
     /// `general.cameraparallaxmouseinfluence`.
     parallax_influence: f32,
     /// Fixed scene time in seconds instead of the wall clock.
@@ -163,6 +169,10 @@ impl Wallpaper {
             bindings: frame.bindings,
             start: Instant::now(),
             pointer: Vec2::splat(0.5),
+            pointer_target: Vec2::splat(0.5),
+            last_frame: None,
+            parallax_delay: scene.parallax.map_or(0.0, |p| p.delay),
+            shake: scene.shake,
             parallax_influence: files.scene.general.cameraparallaxmouseinfluence.value,
             time_override: None,
             audio: None,
@@ -229,20 +239,39 @@ impl Wallpaper {
 
     /// Cursor position over the output, 0..1 with Y down.
     pub fn set_pointer(&mut self, pointer: Vec2) {
-        self.pointer = pointer;
+        self.pointer_target = pointer;
+    }
+
+    /// Move the smoothed pointer towards the cursor (`cameraparallaxdelay`).
+    fn smooth_pointer(&mut self) {
+        let now = Instant::now();
+        let dt = self.last_frame.map_or(0.0, |t| (now - t).as_secs_f32());
+        self.last_frame = Some(now);
+        let t = if self.parallax_delay > 0.0 {
+            (dt / self.parallax_delay).min(1.0)
+        } else {
+            1.0
+        };
+        self.pointer += (self.pointer_target - self.pointer) * t;
     }
 
     fn globals(&self, size: (u32, u32)) -> FrameGlobals {
         let now = chrono::Local::now().time();
         let centred = Vec2::new(self.pointer.x - 0.5, 0.5 - self.pointer.y);
+        let time = self
+            .time_override
+            .unwrap_or_else(|| self.start.elapsed().as_secs_f32());
+        let mut view_proj = self.camera.view_proj(size, self.fill);
+        if let Some(shake) = &self.shake {
+            let offset = shake.offset(time) * self.camera.scene_size * 0.01;
+            view_proj *= glam::Mat4::from_translation(offset.extend(0.0));
+        }
         FrameGlobals {
-            time: self
-                .time_override
-                .unwrap_or_else(|| self.start.elapsed().as_secs_f32()),
+            time,
             daytime: now.num_seconds_from_midnight() as f32 / 86_400.0,
             pointer: self.pointer,
             parallax: Vec2::splat(0.5) + centred * self.parallax_influence,
-            view_proj: self.camera.view_proj(size, self.fill),
+            view_proj,
             screen: Vec2::new(size.0 as f32, size.1 as f32),
             eye: (self.camera.scene_size / 2.0).extend(1000.0),
         }
@@ -257,6 +286,7 @@ impl Wallpaper {
         size: (u32, u32),
     ) {
         self.upload_video_frames(gpu);
+        self.smooth_pointer();
         let globals = self.globals(size);
         self.animate(globals.time);
         self.update_audio();
