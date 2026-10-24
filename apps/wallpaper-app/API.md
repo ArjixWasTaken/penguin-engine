@@ -4,11 +4,12 @@ The frontend in `ui/` is Preact + zustand, built with Vite (pnpm).
 `ui/src/api.ts` wraps everything below with types; `ui/src/store.ts`
 holds the app state.
 
-- Develop: `pnpm -C apps/wallpaper-app/ui install`, then
-  `pnpm -C apps/wallpaper-app/ui dev` and `cargo run -p wallpaper-app`
-  (debug builds load the dev server at `localhost:1420` and reload on edit).
-- Release: `pnpm -C apps/wallpaper-app/ui build`, then
+- Build: `pnpm -C apps/wallpaper-app/ui install` once, then
+  `pnpm -C apps/wallpaper-app/ui build` and
   `cargo build --release -p wallpaper-app` (embeds `ui/dist`).
+- Develop: `pnpm -C apps/wallpaper-app/ui dev`, and
+  `cargo run -p wallpaper-app --no-default-features`: the app loads the
+  dev server at `localhost:1420` and reloads as the page changes.
 - Without the app: open `http://localhost:1420` in a browser while
   `pnpm dev` runs. Outside Tauri the page answers its own commands with
   made-up wallpapers and two displays (`ui/src/mock.ts`).

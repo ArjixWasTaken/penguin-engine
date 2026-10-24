@@ -21,3 +21,9 @@ tracing = "0.1.44"
 tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
 wpe-ipc = { version = "0.1.0", path = "../../crates/wpe-ipc" }
 wpe-library = { version = "0.1.0", path = "../../crates/wpe-library" }
+
+[features]
+# Embed the built page (ui/dist). Without it (`--no-default-features`), the
+# app loads the Vite dev server (`pnpm dev`) and reloads as the page changes.
+default = ["custom-protocol"]
+custom-protocol = ["tauri/custom-protocol"]
