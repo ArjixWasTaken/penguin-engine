@@ -13,29 +13,45 @@ Rendering needs the stock assets shipped with Wallpaper Engine (shaders, effects
 Nothing from Wallpaper Engine is bundled here. With a Steam install they live at
 `~/.local/share/Steam/steamapps/common/wallpaper_engine/assets`.
 
+## Status
+
+Renders Wallpaper Engine scene wallpapers with their own shaders, compiled from WE's GLSL/HLSL
+dialect to SPIR-V and run through wgpu:
+
+- image layers with materials, blend modes, `colorBlendMode`, compose/fullscreen layers
+- image effect chains (ping-pong buffers, FBOs, copy commands, layer dependencies)
+- sprite sheets, video textures (via `ffmpeg`), text layers, scene bloom
+- user properties, keyframe animations, camera parallax and shake
+- sound layers and audio-reactive spectrum (`--audio`)
+
+In progress: particles, puppet warp (`.mdl`), SceneScript. Not yet: 3D models, HDR scenes,
+wallpaper (desktop background) mode.
+
 ## Layout
 
 | Path | Purpose |
 |---|---|
 | `crates/wpe-vfs` | `.pkg` archives and the layered, case-insensitive asset filesystem |
 | `crates/wpe-assets` | TEXB textures, scene/project/material/effect JSON models |
-| `crates/wpe-shader` | WE shader preprocessor, GLSL to SPIR-V, reflection, cache |
-| `crates/wpe-scene` | Scene graph, cameras, per-frame shader values |
-| `crates/wpe-render` | wgpu renderer: render graph, passes, effect chains |
-| `crates/wpe-runtime` | Embeddable API tying loading and rendering together |
+| `crates/wpe-shader` | WE shader preprocessor, HLSL repairs, GLSL to SPIR-V (glslang), reflection (naga) |
+| `crates/wpe-scene` | Scene graph, cameras, user properties, animations |
+| `crates/wpe-render` | wgpu renderer: render targets, material draws, effect chains |
+| `crates/wpe-text` | Text layer layout and rasterisation |
+| `crates/wpe-audio` | Sound playback and audio spectrum |
+| `crates/wpe-runtime` | Embeddable API tying loading, animation and rendering together |
 | `apps/scene-viewer` | Windowed scene viewer |
-| `tools/wpe-cli` | Debug tooling (`ls`/`extract` pkg, corpus scans) |
+| `tools/wpe-cli` | Debug tooling (pkg/tex/scene/shader corpus scans) |
 
 ## Scene viewer
 
 ```sh
 cargo run --release -p scene-viewer -- ~/.local/share/Steam/steamapps/workshop/content/431960/<id>
-cargo run --release -p scene-viewer -- <wallpaper> --screenshot out.png --size 1920x1080
+cargo run --release -p scene-viewer -- <wallpaper> --screenshot out.png --size 1920x1080 --time 2.5
+cargo run --release -p scene-viewer -- <wallpaper> --audio --fps 30 --stats
 ```
 
 The assets directory is found automatically for common Steam installs; pass `--assets` otherwise.
-Currently renders static image layers with a built-in stand-in for `genericimage2`; real
-Wallpaper Engine shaders, effects, particles and text are upcoming milestones.
+Set `WPE_DUMP_SHADERS=<dir>` to dump the final GLSL of every compiled shader.
 
 ## Tools
 
@@ -46,4 +62,5 @@ cargo run -p wpe-cli -- scan-pkgs ~/.local/share/Steam/steamapps/workshop/conten
 cargo run -p wpe-cli -- tex2png --pkg path/to/scene.pkg materials/foo.tex out.png
 cargo run -p wpe-cli -- scan-tex --assets <WE assets> --workshop <workshop dir>
 cargo run -p wpe-cli -- scan-scenes --assets <WE assets> --workshop <workshop dir>
+cargo run -p wpe-cli -- scan-shaders --assets <WE assets> --workshop <workshop dir>
 ```
