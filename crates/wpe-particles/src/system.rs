@@ -185,9 +185,10 @@ impl Subsystem {
         self.render.as_ref().and_then(|r| r.material.as_ref())
     }
 
-    /// Shader to compile instead of the material's (`genericparticle` / `genericropeparticle`).
+    /// Shader to compile: `genericropeparticle` for ribbons, else the
+    /// material's own, with `genericparticle` standing in when it names none.
     pub fn shader(&self) -> &str {
-        self.render.as_ref().map_or("", |r| r.shader)
+        self.render.as_ref().map_or("", |r| r.shader.as_str())
     }
 
     /// Shader combos: the material pass combos plus the ones the vertex layout requires.

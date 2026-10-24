@@ -28,7 +28,7 @@ pub(crate) struct RenderSetup {
     pub renderer: RendererDef,
     pub material_path: String,
     pub material: Option<Material>,
-    pub shader: &'static str,
+    pub shader: String,
     pub combos: BTreeMap<String, String>,
     pub uniforms: BTreeMap<String, Vec<f32>>,
     pub thick: bool,
@@ -144,16 +144,27 @@ pub(crate) fn setup(
         }
     }
     let thick = combos.get("THICKFORMAT").is_some_and(|v| v != "0");
+    // Sprites draw with the material's own shader when it names one other
+    // than the stock particle shaders: a project's legacy `particle` shader
+    // reads the same vertex layout (and, say, tints from material colours).
+    // Ribbons always need `genericropeparticle`, whose non-GS path our CPU
+    // expansion is encoded for.
+    let custom = material
+        .as_ref()
+        .and_then(|m| m.passes.first())
+        .map(|p| p.shader.as_str())
+        .filter(|s| !s.is_empty() && !matches!(*s, "genericparticle" | "genericropeparticle"));
+    let shader = match (rope, custom) {
+        (true, _) => "genericropeparticle".to_owned(),
+        (false, Some(s)) => s.to_owned(),
+        (false, None) => "genericparticle".to_owned(),
+    };
     RenderSetup {
         kind,
         renderer,
         material_path,
         material,
-        shader: if rope {
-            "genericropeparticle"
-        } else {
-            "genericparticle"
-        },
+        shader,
         combos,
         uniforms,
         thick,

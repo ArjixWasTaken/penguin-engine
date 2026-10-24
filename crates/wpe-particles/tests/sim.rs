@@ -194,6 +194,25 @@ fn spritetrail_uses_velocity_layout() {
 }
 
 #[test]
+fn sprites_keep_a_custom_material_shader() {
+    // A project's own particle shader (say the legacy `particle`, tinting
+    // from material colours) draws sprites; ribbons stay on the rope shader.
+    let material = json!({"passes": [{"shader": "particle", "blending": "additive",
+                                      "textures": ["particle/halo"]}]});
+    for (renderer, shader) in [("sprite", "particle"), ("rope", "genericropeparticle")] {
+        let mut def = base(20.0, 2.0, 100);
+        def["material"] = json!("materials/custom.json");
+        def["renderer"] = json!([{"name": renderer}]);
+        let v = vfs(&[
+            ("particles/a.json", def),
+            ("materials/custom.json", material.clone()),
+        ]);
+        let s = ParticleSystem::load(&v, "particles/a.json", None).unwrap();
+        assert_eq!(s.root().shader(), shader, "{renderer}");
+    }
+}
+
+#[test]
 fn rope_and_ropetrail_meshes_are_valid() {
     for (name, kind) in [
         ("rope", RendererKind::Rope),
