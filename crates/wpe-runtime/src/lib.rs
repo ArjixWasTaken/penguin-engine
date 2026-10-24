@@ -420,6 +420,8 @@ impl Wallpaper {
                 match &command {
                     script::ParticleCommand::Override(json) => particles.set_override(json),
                     script::ParticleCommand::Emit(count) => particles.emit(*count),
+                    script::ParticleCommand::Playing(playing) => particles.set_playing(*playing),
+                    script::ParticleCommand::Stop => particles.stop(),
                 }
             }
         }
@@ -445,6 +447,14 @@ impl Wallpaper {
             let sounds = self.sounds.states();
             scripts.rebind(&built.view(&objects, &self.scene_json["general"], &sounds));
             scripts.user_property_changed(name, value);
+        }
+    }
+
+    /// The user changed the wallpaper's general settings (`json` as Wallpaper
+    /// Engine passes them): scripts' `applyGeneralSettings` see them.
+    pub fn apply_general_settings(&mut self, json: &serde_json::Value) {
+        if let Some(scripts) = &mut self.scripts {
+            scripts.emit("applyGeneralSettings", json);
         }
     }
 
@@ -502,9 +512,8 @@ impl Wallpaper {
                 self.script_pointer = Some(self.pointer_target);
                 scripts.cursor_moved(self.pointer_target);
             }
-            let ended = self.clocks.borrow_mut().take_ended();
             let screen = [size.0 as f32, size.1 as f32];
-            scripts.update(time, self.pointer, screen, self.spectrum, &ended);
+            scripts.update(time, self.pointer, screen, self.spectrum);
         }
         self.sync_scripts(gpu, time);
     }
@@ -578,7 +587,17 @@ impl Wallpaper {
         let time = self
             .time_override
             .unwrap_or_else(|| self.start.elapsed().as_secs_f32());
-        let mut view_proj = self.camera.view_proj(size, self.fill);
+        let mut camera = self.camera;
+        let script_camera = self.scripts.as_ref().and_then(|s| s.camera());
+        if let Some((_, zoom)) = script_camera {
+            camera.zoom = if camera.zoom > 0.0 { camera.zoom } else { 1.0 } * zoom;
+        }
+        let mut view_proj = camera.view_proj(size, self.fill);
+        // Scripts' `setCameraTransforms` moves where the camera looks.
+        if let Some((center, _)) = script_camera {
+            let offset = camera.scene_size / 2.0 - center;
+            view_proj *= glam::Mat4::from_translation(offset.extend(0.0));
+        }
         if let Some(shake) = &self.shake {
             let offset = shake.offset(time) * self.camera.scene_size * 0.01;
             view_proj *= glam::Mat4::from_translation(offset.extend(0.0));

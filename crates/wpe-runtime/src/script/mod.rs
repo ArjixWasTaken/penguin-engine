@@ -204,8 +204,6 @@ impl Scripts {
 
     /// Run the scripts' frame. Follow with [`Self::take_edits`] and
     /// [`Self::apply`].
-    /// `ended_animations`: layers whose animations reached their end, for
-    /// their `addEndedCallback` callbacks.
     /// `screen`: the output size in pixels; scripts get `resizeScreen` when
     /// it changes.
     pub fn update(
@@ -214,7 +212,6 @@ impl Scripts {
         pointer: Vec2,
         screen: [f32; 2],
         spectrum: Option<wpe_audio::AudioSpectrum>,
-        ended_animations: &[i32],
     ) {
         if self.host.screen != Some(screen) {
             let resized = self.host.screen.is_some();
@@ -227,17 +224,44 @@ impl Scripts {
         let dt = (time - self.last_time).clamp(0.0, 0.25);
         self.last_time = time;
         self.host.spectrum = spectrum;
+        self.host.time = time;
+        let (animations_ended, events) = {
+            let mut clocks = self.host.clocks.borrow_mut();
+            (clocks.take_ended(), clocks.take_events())
+        };
+        // `playSingleAnimation` layers remove themselves when they finish
+        // (highest index first, so the others keep theirs).
+        let mut finished: Vec<(i32, usize)> = animations_ended
+            .iter()
+            .filter_map(|(layer, key)| {
+                let index = key.strip_prefix("animationLayer:")?.parse().ok()?;
+                self.host
+                    .single_layers
+                    .contains(&(*layer, index))
+                    .then_some((*layer, index))
+            })
+            .collect();
+        finished.sort_by_key(|&(_, index)| std::cmp::Reverse(index));
+        for (layer, index) in finished {
+            self.host.destroy_animation_layer(layer, index);
+        }
+        let mut animations_ended: Vec<i32> = animations_ended.iter().map(|(l, _)| *l).collect();
+        animations_ended.dedup();
         let ended: Vec<i32> = self
             .host
             .videos
             .iter()
             .filter(|(_, v)| v.take_ended())
             .map(|(&id, _)| id)
-            .chain(ended_animations.iter().copied())
+            .chain(animations_ended)
             .collect();
         for id in ended {
             tracing::trace!("layer {id} video ended");
             self.runtime.video_ended(&mut self.host, id);
+        }
+        for (layer, name, frame) in events {
+            self.runtime
+                .animation_event(&mut self.host, layer, &name, frame as f64);
         }
         let cursor = self.cursor_state(pointer);
         self.runtime.update(&mut self.host, time, dt, Some(cursor));
@@ -247,8 +271,21 @@ impl Scripts {
     /// `applyUserProperties` see the new value.
     pub fn user_property_changed(&mut self, name: &str, value: Value) {
         self.user.insert(name.to_owned(), value.clone());
+        // Shortcuts the user bound (`{"file": …, "isbound": true}`), for
+        // `engine.openUserShortcut`.
+        if value.get("file").is_some() || value.get("isbound").is_some() {
+            self.host
+                .user_shortcuts
+                .insert(name.to_owned(), value.clone());
+        }
         let changed = serde_json::json!({ name: value });
         self.runtime.apply_user_properties(&mut self.host, &changed);
+    }
+
+    /// The camera centre (scene pixels) and zoom scripts set with
+    /// `setCameraTransforms`, if any.
+    pub fn camera(&self) -> Option<(Vec2, f32)> {
+        self.host.camera
     }
 
     /// Call `handler(arg)` on every script exporting it (media events, ...).
@@ -292,6 +329,13 @@ impl Scripts {
         }
         self.host.groups_dirty = true;
         self.host.videos = view.videos.clone();
+        let mut clocks = self.host.clocks.borrow_mut();
+        for &(layer, index) in &self.host.single_layers {
+            if let Some(clock) = clocks.get_mut(layer, &crate::clock::layer_key(index)) {
+                clock.single = true;
+            }
+        }
+        drop(clocks);
         // Rebuilt particle systems start from the scene's overrides.
         for (&layer, over) in &self.host.particle_overrides {
             self.host
@@ -358,6 +402,9 @@ impl Scripts {
     ) {
         if std::mem::take(&mut self.host.groups_dirty) {
             self.host.update_ancestors();
+        }
+        for target in std::mem::take(&mut self.host.clears) {
+            renderer.clear_target(target);
         }
         let user = |name: &str| self.user.get(name).cloned();
         for l in &mut self.host.layers {

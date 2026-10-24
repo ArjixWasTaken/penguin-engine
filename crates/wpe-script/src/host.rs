@@ -122,8 +122,22 @@ pub trait SceneHost {
     fn sort_layer(&mut self, layer: LayerId, index: usize) {
         let _ = (layer, index);
     }
-    fn set_parent(&mut self, layer: LayerId, parent: Option<LayerId>) {
-        let _ = (layer, parent);
+    /// Re-parent `layer`, optionally to a named `attachment` of the parent;
+    /// with `adjust` it keeps its place in the world.
+    fn set_parent(
+        &mut self,
+        layer: LayerId,
+        parent: Option<LayerId>,
+        attachment: Option<&str>,
+        adjust: bool,
+    ) {
+        let _ = (layer, parent, attachment, adjust);
+    }
+    /// `engine.openUserShortcut(name)`: open what the user bound to the
+    /// `usershortcut` property `name`. Returns whether something opened.
+    fn open_user_shortcut(&mut self, name: &str) -> bool {
+        let _ = name;
+        false
     }
     /// Scene-wide properties (`camerashake`, `bloomstrength`, `clearcolor`,
     /// `cameratransforms`, ...).
@@ -145,6 +159,12 @@ pub trait SceneHost {
     fn audio_spectrum(&self, left: &mut [f32], right: &mut [f32]) {
         left.fill(0.0);
         right.fill(0.0);
+    }
+    /// `CursorEvent.hitBox` for a pointer at scene position `world` over
+    /// puppet `layer`: the name (or index) of the bone it's on.
+    fn hit_box(&self, layer: LayerId, world: [f32; 2]) -> Option<String> {
+        let _ = (layer, world);
+        None
     }
     /// `localStorage` changed: `{"global": {...}, "screen": {...}}`, to keep
     /// for [`crate::ScriptRuntime::set_local_storage`] next time.

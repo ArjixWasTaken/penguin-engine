@@ -97,7 +97,7 @@ impl Default for ScriptOptions {
     }
 }
 
-const HANDLERS: [&str; 17] = [
+const HANDLERS: [&str; 18] = [
     "init",
     "update",
     "destroy",
@@ -115,6 +115,7 @@ const HANDLERS: [&str; 17] = [
     "mediaThumbnailChanged",
     "mediaTimelineChanged",
     "applyGeneralSettings",
+    "animationEvent",
 ];
 
 fn handler_bit(name: &str) -> u32 {
@@ -608,6 +609,34 @@ impl ScriptRuntime {
         self.drain_jobs();
     }
 
+    /// An animation of `layer` passed one of its events: `animationEvent`
+    /// handlers of the layer's scripts get `{name, frame}` and their value.
+    pub fn animation_event(
+        &mut self,
+        host: &mut dyn SceneHost,
+        layer: LayerId,
+        name: &str,
+        frame: f64,
+    ) {
+        let slot = self.host.clone();
+        let _guard = slot.enter(host);
+        let budget = self.options.call_budget;
+        for i in 0..self.scripts.len() {
+            let s = &self.scripts[i];
+            if s.layer != layer || s.disabled || !s.has("animationEvent") {
+                continue;
+            }
+            let sid = i as f64;
+            self.arm(budget);
+            let _ = self.run_js(Some(i), "animationEvent", |_, w| {
+                w.get::<_, Function>("animationEvent")?
+                    .call::<_, ()>((sid, name, frame))
+            });
+            self.disarm();
+        }
+        self.drain_jobs();
+    }
+
     /// Call `destroy()` on every script and stop running them.
     pub fn destroy(&mut self, host: &mut dyn SceneHost) {
         let slot = self.host.clone();
@@ -1014,10 +1043,14 @@ fn install_natives<'js>(ctx: &Ctx<'js>, host: Rc<HostSlot>) -> rquickjs::Result<
     let h = host.clone();
     n.set(
         "parent",
-        Function::new(ctx.clone(), move |id: f64, parent: f64| {
-            let parent = (parent >= 0.0).then_some(parent as LayerId);
-            h.with(|h| h.set_parent(id as LayerId, parent));
-        })?,
+        Function::new(
+            ctx.clone(),
+            move |id: f64, parent: f64, attachment: String, adjust: bool| {
+                let parent = (parent >= 0.0).then_some(parent as LayerId);
+                let attachment = (!attachment.is_empty()).then_some(attachment.as_str());
+                h.with(|h| h.set_parent(id as LayerId, parent, attachment, adjust));
+            },
+        )?,
     )?;
     let h = host.clone();
     n.set(
@@ -1053,6 +1086,24 @@ fn install_natives<'js>(ctx: &Ctx<'js>, host: Rc<HostSlot>) -> rquickjs::Result<
             h.with(|h| h.audio_spectrum(&mut left, &mut right));
             left.iter().chain(&right).map(|&v| f64::from(v)).collect()
         })?,
+    )?;
+    let h = host.clone();
+    n.set(
+        "shortcut",
+        Function::new(ctx.clone(), move |name: String| -> bool {
+            h.with(|h| h.open_user_shortcut(&name)).unwrap_or(false)
+        })?,
+    )?;
+    let h = host.clone();
+    n.set(
+        "hitBox",
+        Function::new(
+            ctx.clone(),
+            move |id: f64, x: f64, y: f64| -> Option<String> {
+                h.with(|h| h.hit_box(id as LayerId, [x as f32, y as f32]))
+                    .flatten()
+            },
+        )?,
     )?;
     let h = host.clone();
     n.set(

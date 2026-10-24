@@ -34,6 +34,9 @@ pub struct Animation {
     /// In loop mode, interpolate from the last key back to the first.
     pub wraploop: bool,
     pub start_paused: bool,
+    /// Named events (`options.events`): frame and name, for scripts'
+    /// `animationEvent`.
+    pub events: Vec<(f32, String)>,
     channels: [Vec<Key>; 4],
 }
 
@@ -87,6 +90,19 @@ impl Animation {
             relative: flag(json.get("relative")),
             wraploop: flag(opt("wraploop")),
             start_paused: flag(opt("startpaused")),
+            events: opt("events")
+                .and_then(Value::as_array)
+                .map(|events| {
+                    events
+                        .iter()
+                        .filter_map(|e| {
+                            let frame = number(e.get("frame")?)?;
+                            let name = e.get("name")?.as_str()?.to_owned();
+                            Some((frame, name))
+                        })
+                        .collect()
+                })
+                .unwrap_or_default(),
             channels,
         })
     }

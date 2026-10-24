@@ -167,10 +167,14 @@
 
 		getParent() { const i = infoById(this.__id); return i && i.parent !== null && i.parent !== undefined ? proxy(i.parent) : null; }
 		getChildren() { return layerInfos().filter(l => l.parent === this.__id).map(l => proxy(l.id)); }
-		setParent(parent) {
+		// setParent(parent, adjustTransforms?) or setParent(parent, attachment, adjustTransforms?).
+		setParent(parent, a, b) {
 			const pid = parent === null || parent === undefined ? -1 : resolveId(parent);
 			if (pid === null || pid === this.__id || this.__id < 0) return;
-			N.parent(this.__id, pid);
+			const attached = typeof a === 'string' || typeof a === 'number';
+			const attachment = attached ? String(a) : '';
+			const adjust = !!(attached ? b : a);
+			N.parent(this.__id, pid, attachment, adjust);
 			W.invalidateLayers();
 		}
 		removeFromParent() { this.setParent(null); }
@@ -178,7 +182,11 @@
 		getAttachmentMatrix(a) { return new Mat4(this._invoke('', 'getAttachmentMatrix', [a], undefined)); }
 		getAttachmentOrigin(a) { return this._invoke('', 'getAttachmentOrigin', [a], this.origin); }
 		getAttachmentAngles(a) { return this._invoke('', 'getAttachmentAngles', [a], this.angles); }
-		transformAttachmentToTexture() { return new Mat3(); }
+		transformAttachmentToTexture(layer, attachment) {
+			const id = resolveId(layer);
+			const m = this._invoke('', 'transformAttachmentToTexture', [id === null ? -1 : id, String(attachment)], undefined);
+			return Array.isArray(m) && m.length === 9 ? new Mat3(m.map(Number)) : new Mat3();
+		}
 
 		play() { this._invoke('', 'play'); }
 		pause() { this._invoke('', 'pause'); }
@@ -265,7 +273,7 @@
 			getFrame() { return call('getFrame', [], 0); },
 			setFrame(f) { call('setFrame', [+f]); },
 			addEndedCallback(cb) { if (typeof cb === 'function') layer.__video.ended.push(cb); },
-			join() {},
+			join() { call('join'); },
 		};
 	}
 	function makeVideo(layer) {
@@ -325,8 +333,8 @@
 				return v === undefined || v === null ? true : !!v;
 			},
 			set visible(v) { if (layer.__id >= 0) N.set(layer.__id, base + 'visible', !!v); },
-			getMaterial(i) { return makeMaterial(layer, base + 'material/'); },
-			getMaterialCount() { return 1; },
+			getMaterial(i) { return makeMaterial(layer, base + 'passes/' + ((+i) | 0) + '/constantshadervalues/'); },
+			getMaterialCount() { return layer._invoke('effect:' + idx, 'materialCount', [], 1); },
 			setMaterialProperty(p, v) { if (layer.__id >= 0) N.set(layer.__id, base + 'material/' + p, packMaterial(v)); },
 			executeMaterialFunction(p) { layer._invoke('effect:' + idx, 'executeMaterialFunction', [String(p)]); },
 			getAnimation(n) { return makeAnimation(layer, base + 'animation:' + (n || ''), n || ''); },
@@ -363,6 +371,14 @@
 		'skylightcolor', 'fov', 'nearz', 'farz', 'camerafade', 'camerashake', 'camerashakespeed', 'camerashakeamplitude',
 		'camerashakeroughness', 'cameraparallax', 'cameraparallaxamount', 'cameraparallaxdelay', 'cameraparallaxmouseinfluence'];
 	const sceneShadow = {};
+	const SCENE_ANIMATIONS = {
+		__id: -1,
+		__video: { ended: [] },
+		_invoke(target, method, args, fallback) {
+			const r = N.invoke(-1, target, method, args || []);
+			return r === undefined || r === null ? fallback : r;
+		},
+	};
 	const thisScene = {
 		getLayer(x) { return proxy(resolveId(x)); },
 		getLayerByID(id) { const n = Number(id); return infoById(n) ? proxy(n) : null; },
@@ -406,7 +422,8 @@
 			return { eye: new Vec3(0, 0, 1), center: new Vec3(0, 0, 0), up: new Vec3(0, 1, 0), zoom: 1 };
 		},
 		setCameraTransforms(t) { N.sceneSet('cameratransforms', JSON.parse(stringify(t))); },
-		getAnimation(name) { return makeAnimation(new Layer(-1), 'scene', name || ''); },
+		// An animation of any layer, by name.
+		getAnimation(name) { return makeAnimation(SCENE_ANIMATIONS, 'animation:' + (name || ''), name || ''); },
 		createModelData() { return { applyData() {}, replaceData() {}, toConfigString() { return ''; } }; },
 		destroyModelData() {},
 	};
@@ -438,7 +455,7 @@
 		isWallpaper: () => true,
 		isScreensaver: () => false,
 		getUserProperty(name) { return this.userProperties[name]; },
-		openUserShortcut: () => false,
+		openUserShortcut(name) { return !!N.shortcut(String(name)); },
 		registerAsset(file) { return { __asset: String(file), toConfigString() { return this.__asset; } }; },
 		registerAudioBuffers(resolution) {
 			const r = +resolution || 64;
@@ -557,13 +574,14 @@
 		let obj = layer;
 		const m = /^effects\/(\d+)\//.exec(property);
 		if (layer && m) obj = layer.getEffect(+m[1]) || layer;
-		W.scripts.set(sid, { layer, obj, kind, ns: null });
+		W.scripts.set(sid, { layer, obj, kind, property, ns: null });
 	};
 	W.scopeLayer = sid => W.scripts.get(sid).layer;
 	W.scopeObject = sid => W.scripts.get(sid).obj;
 	const HANDLERS = ['init', 'update', 'destroy', 'applyUserProperties', 'cursorClick', 'cursorDown', 'cursorUp',
 		'cursorMove', 'cursorEnter', 'cursorLeave', 'resizeScreen', 'mediaStatusChanged', 'mediaPlaybackChanged',
-		'mediaPropertiesChanged', 'mediaThumbnailChanged', 'mediaTimelineChanged', 'applyGeneralSettings'];
+		'mediaPropertiesChanged', 'mediaThumbnailChanged', 'mediaTimelineChanged', 'applyGeneralSettings',
+		'animationEvent'];
 	W.attach = function (sid, ns) {
 		const e = W.scripts.get(sid);
 		e.ns = ns;
@@ -612,7 +630,16 @@
 		const world = new Vec3(wx, wy, 0);
 		const origin = e.layer ? e.layer.origin : new Vec3(0, 0, 0);
 		const ev = { worldPosition: world, screenPosition: new Vec2(sx, sy), localPosition: world.subtract(origin), button: 0, x: wx, y: wy };
+		if (e.layer) {
+			const hit = N.hitBox(e.layer.__id, wx, wy);
+			if (hit !== undefined && hit !== null) ev.hitBox = hit;
+		}
 		return within(sid, () => e.ns[name](ev));
+	};
+	W.animationEvent = function (sid, name, frame) {
+		const e = W.scripts.get(sid);
+		const value = e.layer && e.property ? hostGet(e.layer.__id, e.property) : undefined;
+		return within(sid, () => e.ns.animationEvent({ name, frame }, value));
 	};
 	W.videoEnded = function (layerId) {
 		const p = W.proxies.get(layerId);

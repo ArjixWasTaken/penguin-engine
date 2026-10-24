@@ -68,6 +68,8 @@ pub struct LayerSteps {
     pub all: Vec<usize>,
     /// Material passes, for scripts setting their constants.
     pub passes: Vec<PassStep>,
+    /// Effect functions (effect index, name) and the targets they clear.
+    pub functions: HashMap<(usize, String), Vec<TargetId>>,
     /// Draws placed with the layer's transform.
     pub model: Vec<usize>,
     /// Draws carrying the layer's colour uniforms, and whether `g_Color4`
@@ -126,6 +128,7 @@ pub struct ParticleInstance {
     motion: Motion,
     /// Seconds simulated so far.
     simulated: f32,
+    paused: bool,
 }
 
 /// Longest simulation step, so screenshots at a given time are reproducible.
@@ -142,6 +145,18 @@ impl ParticleInstance {
         self.system.emit(count);
     }
 
+    /// Pause or resume the simulation; paused time is skipped, not caught up.
+    pub fn set_playing(&mut self, playing: bool) {
+        self.paused = !playing;
+    }
+
+    /// Clear every particle and pause.
+    pub fn stop(&mut self) {
+        let seed = self.system.seed();
+        self.system.set_seed(seed);
+        self.paused = true;
+    }
+
     /// Simulate up to `time` and upload each subsystem's mesh.
     pub fn advance(
         &mut self,
@@ -154,6 +169,9 @@ impl ParticleInstance {
             cursor,
             ..Default::default()
         };
+        if self.paused {
+            self.simulated = time;
+        }
         while self.simulated < time {
             let dt = (time - self.simulated).min(PARTICLE_STEP);
             self.system.update(dt, &ctx);
@@ -196,8 +214,18 @@ impl LayerPuppet {
 
     /// The puppet mesh in layer-local pixels; UVs scaled onto a padded texture.
     fn mesh(&self, uv_scale: Vec2) -> Mesh {
+        self.morphed_mesh(uv_scale, &[])
+    }
+
+    /// The mesh with blend shapes applied at `weights`.
+    fn morphed_mesh(&self, uv_scale: Vec2, weights: &[f32]) -> Mesh {
         let m = &self.mdl.meshes[0];
         let n = m.positions.len();
+        let positions = if weights.iter().any(|&w| w != 0.0) {
+            m.morphed_positions(weights)
+        } else {
+            m.positions.clone()
+        };
         let normals: Vec<f32> = if m.normals.len() == n {
             m.normals.iter().flatten().copied().collect()
         } else {
@@ -207,7 +235,7 @@ impl LayerPuppet {
             (
                 "a_Position".to_owned(),
                 3,
-                m.positions.iter().flatten().copied().collect(),
+                positions.iter().flatten().copied().collect(),
             ),
             (
                 "a_TexCoord".to_owned(),
@@ -243,12 +271,14 @@ impl LayerPuppet {
 
 /// A value recomputed every frame and written into one draw.
 pub enum Binding {
-    /// The layer's animated and/or parallax-shifted transform.
+    /// The layer's animated and/or parallax-shifted transform, following a
+    /// parent puppet's attachment point when it has one.
     Model {
         layer: i32,
         step: usize,
         motion: Motion,
         parallax: Option<LayerParallax>,
+        attach: Option<(i32, String)>,
     },
     /// The layer's animated colour and alpha uniforms.
     Color {
@@ -260,11 +290,15 @@ pub enum Binding {
         /// `g_Color4` stays white (blend-mode passes).
         neutral: bool,
     },
-    /// A puppet's skinning matrices (`g_Bones`).
+    /// A puppet's skinning matrices (`g_Bones`) and blend shapes.
     Bones {
         layer: i32,
         step: usize,
         puppet: Arc<LayerPuppet>,
+        /// The mesh's UV scale, for re-uploading it morphed.
+        uv_scale: Vec2,
+        /// Blend shape weights the draw's mesh has (empty: none applied).
+        morphed: std::cell::RefCell<Vec<f32>>,
     },
     /// An animated material constant.
     Constant {
@@ -326,10 +360,25 @@ impl Binding {
             } => add(*layer, animation),
             Self::Bones { layer, puppet, .. } => {
                 for (i, params) in puppet.puppet.layers().enumerate() {
+                    // Seconds, rate applied (`fps` 1).
                     let mut clock = Clock::new(1.0, 0.0, false, true);
                     clock.rate = params.rate as f32;
                     clock.blend = params.blend as f32;
                     clock.visible = params.visible;
+                    if let Some(anim) = puppet
+                        .mdl
+                        .animations
+                        .iter()
+                        .find(|a| a.id == params.animation)
+                        && anim.fps > 0.0
+                    {
+                        clock.events = anim
+                            .events
+                            .iter()
+                            .map(|e| (e.frame as f32 / anim.fps, e.name.clone()))
+                            .collect();
+                        clock.frames = anim.length as f32 / anim.fps;
+                    }
                     clocks.register(*layer, clock::layer_key(i), clock);
                 }
             }
@@ -339,16 +388,35 @@ impl Binding {
     /// Make a puppet's bones known to scripts.
     pub fn register_bones(&self, bones: &mut Bones) {
         if let Self::Bones { layer, puppet, .. } = self {
-            let names = puppet
+            let names: Vec<String> = puppet
                 .mdl
                 .skeleton
                 .as_ref()
                 .map(|s| s.bones.iter().map(|b| b.name.clone()).collect())
                 .unwrap_or_default();
-            bones.register(
-                *layer,
-                PuppetBones::new(names, puppet.puppet.bone_parents()),
-            );
+            let mut state = PuppetBones::new(names, puppet.puppet.bone_parents());
+            state.rest = (0..state.names.len())
+                .map(|i| puppet.puppet.rest_world(i).unwrap_or(Mat4::IDENTITY))
+                .collect();
+            state.attachments = puppet
+                .mdl
+                .attachments
+                .iter()
+                .map(|a| crate::bones::Attachment {
+                    name: a.name.clone(),
+                    bone: a.bone,
+                    transform: a.transform,
+                })
+                .collect();
+            state.blend_weights = vec![0.0; puppet.puppet.blend_shape_count()];
+            state.blend_names = puppet.puppet.blend_shape_names().to_vec();
+            state.animations = puppet
+                .mdl
+                .animations
+                .iter()
+                .map(|a| (a.name.clone(), a.id))
+                .collect();
+            bones.register(*layer, state);
         }
     }
 
@@ -366,9 +434,21 @@ impl Binding {
                 step,
                 motion,
                 parallax,
+                attach,
             } => {
-                let mut model =
-                    motion.transform_at(|a: &Animation| clocks.time_of(*layer, a, scene_time));
+                let time = |a: &Animation| clocks.time_of(*layer, a, scene_time);
+                let pose = attach.as_ref().and_then(|(parent, name)| {
+                    let puppet = bones.puppets.get(parent)?;
+                    puppet.attachment_pose(puppet.attachment(name)?)
+                });
+                let mut model = match pose {
+                    Some(pose) => Motion {
+                        parent: motion.parent * pose,
+                        ..motion.clone()
+                    }
+                    .transform_at(time),
+                    None => motion.transform_at(time),
+                };
                 if let Some(p) = parallax {
                     model =
                         Mat4::from_translation(p.offset(motion.position(), frame.pointer)) * model;
@@ -407,29 +487,67 @@ impl Binding {
                 layer,
                 step,
                 puppet,
+                uv_scale,
+                morphed,
             } => {
                 let mut matrices = Vec::new();
-                let state = bones.puppets.get_mut(layer);
-                let offsets: Vec<glam::Vec3> = state
-                    .as_ref()
-                    .map(|s| (0..s.names.len()).map(|i| s.offset(i)).collect())
-                    .unwrap_or_default();
-                puppet.puppet.pose_bones(
-                    |i, params| match clocks.get(*layer, &clock::layer_key(i)) {
-                        Some(c) => wpe_mdl::LayerPose {
-                            time: c.seconds() as f64,
-                            blend: c.blend as f64,
-                            visible: c.visible,
-                        },
-                        None => wpe_mdl::LayerPose {
-                            time: scene_time as f64 * params.rate,
-                            blend: params.blend,
-                            visible: params.visible,
-                        },
+                let mut state = bones.puppets.get_mut(layer);
+                let parents = puppet.puppet.bone_parents();
+                let layer_pose = |i: usize, params: &wpe_mdl::AnimationLayer| match clocks
+                    .get(*layer, &clock::layer_key(i))
+                {
+                    Some(c) => wpe_mdl::LayerPose {
+                        time: c.seconds() as f64,
+                        blend: c.blend as f64,
+                        visible: c.visible,
                     },
-                    |i, world| match offsets.get(i) {
-                        Some(&o) if o != glam::Vec3::ZERO => Mat4::from_translation(o) * world,
-                        _ => world,
+                    None => wpe_mdl::LayerPose {
+                        time: scene_time as f64 * params.rate,
+                        blend: params.blend,
+                        visible: params.visible,
+                    },
+                };
+                if puppet.puppet.blend_shape_count() > 0 {
+                    let base: Vec<f32> = state
+                        .as_ref()
+                        .map(|s| s.blend_weights.clone())
+                        .unwrap_or_default();
+                    let mut weights = Vec::new();
+                    puppet
+                        .puppet
+                        .morph_weights_with(layer_pose, &base, &mut weights);
+                    let mut morphed = morphed.borrow_mut();
+                    let unchanged = if morphed.is_empty() {
+                        weights.iter().all(|&w| w == 0.0)
+                    } else {
+                        *morphed == weights
+                    };
+                    if !unchanged {
+                        renderer.set_mesh(*step, puppet.morphed_mesh(*uv_scale, &weights));
+                        morphed.clone_from(&weights);
+                    }
+                    if let Some(s) = state.as_deref_mut() {
+                        s.current_weights = weights;
+                    }
+                }
+                // Final bone worlds so far, for children of adjusted bones.
+                let done = std::cell::RefCell::new(Vec::<Mat4>::with_capacity(parents.len()));
+                puppet.puppet.pose_bones(
+                    layer_pose,
+                    |i, world| {
+                        let mut done = done.borrow_mut();
+                        let parent = parents
+                            .get(i)
+                            .copied()
+                            .flatten()
+                            .and_then(|p| done.get(p).copied())
+                            .unwrap_or(Mat4::IDENTITY);
+                        let world = match &state {
+                            Some(s) => s.adjust(i, world, parent),
+                            None => world,
+                        };
+                        done.push(world);
+                        world
                     },
                     &mut matrices,
                 );
@@ -989,6 +1107,7 @@ impl<'a> FrameBuilder<'a> {
                 draws,
                 motion: layer.motion.clone(),
                 simulated: 0.0,
+                paused: false,
             });
         }
     }
@@ -1097,12 +1216,14 @@ impl<'a> FrameBuilder<'a> {
     }
 
     /// Upload the puppet's bones into the draw just pushed, every frame.
-    fn bind_puppet(&mut self, puppet: Option<Arc<LayerPuppet>>) {
+    fn bind_puppet(&mut self, puppet: Option<Arc<LayerPuppet>>, uv_scale: Vec2) {
         if let Some(puppet) = puppet.filter(|p| p.puppet.bone_count() > 0) {
             self.bindings.push(Binding::Bones {
                 layer: self.building.unwrap_or(-1),
                 step: self.steps.len() - 1,
                 puppet,
+                uv_scale,
+                morphed: Default::default(),
             });
         }
     }
@@ -1122,12 +1243,18 @@ impl<'a> FrameBuilder<'a> {
             steps.model.push(step);
         }
         let parallax = self.layer_parallax(layer);
-        if layer.motion.is_transform_animated() || parallax.is_some() {
+        let attach = layer
+            .attachment
+            .clone()
+            .zip(layer.parent)
+            .map(|(a, p)| (p, a));
+        if layer.motion.is_transform_animated() || parallax.is_some() || attach.is_some() {
             self.bindings.push(Binding::Model {
                 layer: layer.id,
                 step,
                 motion: layer.motion.clone(),
                 parallax,
+                attach,
             });
         }
     }
@@ -1179,6 +1306,7 @@ impl<'a> FrameBuilder<'a> {
         match self.resolve_with(&label, &layer.material, &HashMap::new(), &combos) {
             Some(mut r) => {
                 Self::layer_constants(layer, &mut r.constants, false);
+                let uv_scale = r.uv_scale;
                 let mesh = match &puppet {
                     Some(p) => p.mesh(r.uv_scale),
                     None => CardMesh {
@@ -1207,7 +1335,7 @@ impl<'a> FrameBuilder<'a> {
                     ),
                 }
                 self.bind_layer(layer, offscreen.is_none(), false);
-                self.bind_puppet(puppet);
+                self.bind_puppet(puppet, uv_scale);
             }
             None if offscreen.is_none() => self.fallback(layer),
             None => {}
@@ -1292,9 +1420,10 @@ impl<'a> FrameBuilder<'a> {
             (Camera::Fixed(ortho), Mat4::IDENTITY, mesh)
         };
         let base_blend = blend_mode(&layer.material.blending);
+        let uv_scale = base.uv_scale;
         self.current_pass = Some((None, 0));
         self.push_draw(prev, base, model, mesh, base_blend, camera);
-        self.bind_puppet(puppet);
+        self.bind_puppet(puppet, uv_scale);
         self.bind_layer(layer, layer.compose && !layer.fullscreen, false);
 
         let mut last_output: Option<usize> = None;
@@ -1318,6 +1447,26 @@ impl<'a> FrameBuilder<'a> {
                     target_format(fbo.format.as_deref()),
                 );
                 names.insert(format!("_rt_{}", fbo.name), t);
+            }
+            if let Some(index) = scene_effect {
+                for (name, function) in &effect.functions {
+                    if function.action != "clear" {
+                        tracing::debug!("effect function {name}: {} unsupported", function.action);
+                        continue;
+                    }
+                    let targets = function
+                        .fbos
+                        .iter()
+                        .filter_map(|f| {
+                            names
+                                .get(&format!("_rt_{}", f.trim_start_matches("_rt_")))
+                                .copied()
+                        })
+                        .collect();
+                    if let Some(steps) = self.current_steps() {
+                        steps.functions.insert((index, name.clone()), targets);
+                    }
+                }
             }
             let fbo = |name: &str| {
                 if name == "previous" {

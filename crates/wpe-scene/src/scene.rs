@@ -104,6 +104,10 @@ pub struct ImageLayer {
     /// Index of each of `effects` in the object's `effects` (hidden ones are
     /// left out of `effects`).
     pub effect_indices: Vec<usize>,
+    /// Parent object, and the parent puppet's attachment point this layer
+    /// follows (`attachment`).
+    pub parent: Option<i32>,
+    pub attachment: Option<String>,
     /// For text layers, the object whose rendered text is the layer's image
     /// (see [`text_texture_name`]); its size and anchoring are known once rendered.
     pub text: Option<Box<TextObject>>,
@@ -363,6 +367,8 @@ impl Scene {
                         .filter(|(_, fx)| props.flag(&fx.visible))
                         .map(|(i, _)| i)
                         .collect(),
+                    parent: common.parent,
+                    attachment: img.attachment.clone().filter(|a| !a.is_empty()),
                     text: None,
                     particle: None,
                     puppet: loaded.puppet,
@@ -471,6 +477,8 @@ fn text_layer(nodes: &HashMap<i32, Node>, props: &UserProperties, text: &TextObj
             .filter(|fx| props.flag(&fx.visible))
             .cloned()
             .collect(),
+        parent: common.parent,
+        attachment: None,
         effect_indices: text
             .effects
             .iter()
@@ -522,6 +530,8 @@ fn particle_layer(
         color_blend_mode: 0,
         effects: Vec::new(),
         effect_indices: Vec::new(),
+        parent: common.parent,
+        attachment: None,
         text: None,
         particle: Some(ParticleSource {
             path: p.particle.clone(),

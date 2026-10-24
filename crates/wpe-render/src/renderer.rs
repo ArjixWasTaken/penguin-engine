@@ -78,6 +78,8 @@ pub struct SceneRenderer {
     placeholders: Placeholders,
     /// Uniforms written into every material draw that declares them.
     globals: std::collections::HashMap<String, Vec<f32>>,
+    /// Targets to zero before the next frame's passes ([`Self::clear_target`]).
+    pending_clears: Vec<TargetId>,
     pub clear_color: wgpu::Color,
 }
 
@@ -142,6 +144,7 @@ impl SceneRenderer {
             hidden: Vec::new(),
             placeholders: Placeholders::new(gpu),
             globals: Default::default(),
+            pending_clears: Vec::new(),
             clear_color: wgpu::Color::BLACK,
         }
     }
@@ -210,6 +213,14 @@ impl SceneRenderer {
     }
 
     /// Set a uniform for every material draw (e.g. the audio spectrum).
+    /// Zero `target` before the next frame draws (effect `clear` functions
+    /// on targets that carry over between frames).
+    pub fn clear_target(&mut self, target: TargetId) {
+        if !self.pending_clears.contains(&target) {
+            self.pending_clears.push(target);
+        }
+    }
+
     pub fn set_global_uniform(&mut self, name: &str, values: &[f32]) {
         match self.globals.get_mut(name) {
             Some(v) => {
@@ -405,6 +416,24 @@ impl SceneRenderer {
             }
         }
 
+        for target in std::mem::take(&mut self.pending_clears) {
+            if target.0 >= self.targets.len() {
+                continue;
+            }
+            encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: Some("clear"),
+                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                    view: &self.targets.get(target).view,
+                    depth_slice: None,
+                    resolve_target: None,
+                    ops: wgpu::Operations {
+                        load: wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT),
+                        store: wgpu::StoreOp::Store,
+                    },
+                })],
+                ..Default::default()
+            });
+        }
         let mut written = vec![false; self.targets.len()];
         let mut i = 0;
         while i < self.steps.len() {

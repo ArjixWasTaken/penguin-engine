@@ -4,7 +4,7 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use glam::{Mat4, Vec2, Vec3};
+use glam::{EulerRot, Mat4, Quat, Vec2, Vec3};
 use serde_json::Value;
 use wpe_assets::scene::{SceneObject, TextObject};
 use wpe_scene::{ImageLayer, Motion};
@@ -279,6 +279,19 @@ fn config_numbers(v: &Value) -> Vec<f64> {
     }
 }
 
+/// Layer angles (degrees, applied Z then Y then X as scene transforms do)
+/// of a rotation.
+pub fn euler_degrees(rotation: Quat) -> Vec3 {
+    let (z, y, x) = rotation.to_euler(EulerRot::ZYX);
+    Vec3::new(x, y, z) * (180.0 / std::f32::consts::PI)
+}
+
+/// The rotation of layer angles in degrees.
+pub fn rotation_of(angles: Vec3) -> Quat {
+    let a = angles * (std::f32::consts::PI / 180.0);
+    Quat::from_euler(EulerRot::ZYX, a.z, a.y, a.x)
+}
+
 /// A script value as it's written in scene JSON (vectors as `"x y z"`).
 fn scene_json(v: &ScriptValue) -> Value {
     match v {
@@ -365,6 +378,10 @@ pub enum ParticleCommand {
     /// The whole `instanceoverride` object to use from now on.
     Override(Value),
     Emit(u32),
+    /// Pause or resume the simulation.
+    Playing(bool),
+    /// Clear the system and pause it.
+    Stop,
 }
 
 /// The [`SceneHost`] scripts run against.
@@ -383,6 +400,19 @@ pub struct ScriptHost {
     pub general: Value,
     /// `localStorage` contents changed since the runtime last took them.
     pub storage: Option<Value>,
+    /// `usershortcut` properties the user bound at runtime, by name.
+    pub user_shortcuts: HashMap<String, Value>,
+    /// Scene time of the current frame.
+    pub time: f64,
+    /// Particle layers paused by scripts.
+    pub particles_paused: std::collections::HashSet<i32>,
+    /// Animation layers created with `playSingleAnimation`, removed when
+    /// they finish: layer and animation layer index.
+    pub single_layers: Vec<(i32, usize)>,
+    /// Camera centre and zoom scripts set (`setCameraTransforms`).
+    pub camera: Option<(Vec2, f32)>,
+    /// Render targets scripts asked to clear (effect functions).
+    pub clears: Vec<wpe_render::TargetId>,
     /// Id for the next created layer.
     pub next_id: i32,
     /// A group's visibility changed: descendants must be re-evaluated.
@@ -413,6 +443,12 @@ impl ScriptHost {
             general: Value::Null,
             groups_dirty: false,
             storage: None,
+            user_shortcuts: HashMap::new(),
+            time: 0.0,
+            particles_paused: Default::default(),
+            single_layers: Vec::new(),
+            camera: None,
+            clears: Vec::new(),
             next_id: 1,
             sounds: HashMap::new(),
             sound_commands: Vec::new(),
@@ -454,10 +490,13 @@ impl ScriptHost {
         let model = self.layer(layer)?.motion_now().transform_at(0.0);
         let mut bones = self.bones.borrow_mut();
         let puppet = bones.puppets.get_mut(&layer)?;
-        let bone = || {
-            let i = args.first()?.as_f64()?;
-            (i >= 0.0 && (i as usize) < puppet.names.len()).then_some(i as usize)
+        // Bones and attachments go by name or index.
+        let key = |v: Option<&ScriptValue>| match v? {
+            ScriptValue::String(s) => Some(s.clone()),
+            v => Some((v.as_f64()? as i64).to_string()),
         };
+        let bone = || puppet.bone(&key(args.first())?);
+        let attachment = || puppet.attachment(&key(args.first())?);
         // A `Mat4` arrives as its 16 numbers, column-major.
         let matrix = |v: &ScriptValue| -> Option<Mat4> {
             let ScriptValue::Json(Value::Array(a)) = v else {
@@ -477,6 +516,31 @@ impl ScriptHost {
         let vector = |v: Option<&ScriptValue>| to_vec3(v?);
         Some(match method {
             "getBoneCount" => ScriptValue::Number(puppet.names.len() as f64),
+            // Blend shapes go by name or index too (files store no names).
+            "getBlendShapeIndex" => {
+                let name = key(args.first())?;
+                let i = puppet.blend_shape(&name);
+                ScriptValue::Number(i.map_or(-1.0, |i| i as f64))
+            }
+            "getBlendShapeWeight" => {
+                let i = puppet.blend_shape(&key(args.first())?)?;
+                let weight = puppet
+                    .current_weights
+                    .get(i)
+                    .or(puppet.blend_weights.get(i))
+                    .copied()?;
+                ScriptValue::Number(weight as f64)
+            }
+            "setBlendShapeWeight" => {
+                let i = puppet.blend_shape(&key(args.first())?)?;
+                let weight = args.get(1)?.as_f64()? as f32;
+                puppet.blend_weights[i] = weight;
+                // Read back right away, before the next frame draws it.
+                if let Some(w) = puppet.current_weights.get_mut(i) {
+                    *w = weight;
+                }
+                return None;
+            }
             "getBoneIndex" => {
                 let name = args.first().and_then(|v| match v {
                     ScriptValue::String(s) => Some(s.as_str()),
@@ -495,6 +559,33 @@ impl ScriptHost {
                 let parent = puppet.parents[i].map_or(Mat4::IDENTITY, |p| puppet.worlds[p]);
                 json(parent.inverse() * puppet.worlds[i])
             }
+            "getLocalBoneAngles" => {
+                let i = bone()?;
+                let parent = puppet.parents[i].map_or(Mat4::IDENTITY, |p| puppet.worlds[p]);
+                let (_, rotation, _) =
+                    (parent.inverse() * puppet.worlds[i]).to_scale_rotation_translation();
+                vec3(euler_degrees(rotation))
+            }
+            "setLocalBoneAngles" => {
+                let i = bone()?;
+                let angles = vector(args.get(1))?;
+                puppet.rotate(i, Some(rotation_of(angles)));
+                return None;
+            }
+            "getAttachmentIndex" => {
+                let i = attachment();
+                ScriptValue::Number(i.map_or(-1.0, |i| i as f64))
+            }
+            "getAttachmentMatrix" => json(model * puppet.attachment_pose(attachment()?)?),
+            "getAttachmentOrigin" => vec3(
+                (model * puppet.attachment_pose(attachment()?)?)
+                    .w_axis
+                    .truncate(),
+            ),
+            "getAttachmentAngles" => {
+                let m = model * puppet.attachment_pose(attachment()?)?;
+                vec3(euler_degrees(m.to_scale_rotation_translation().1))
+            }
             "getLocalBoneOrigin" => {
                 let i = bone()?;
                 let parent = puppet.parents[i].map_or(Mat4::IDENTITY, |p| puppet.worlds[p]);
@@ -510,7 +601,11 @@ impl ScriptHost {
                 let i = bone()?;
                 let local = match method {
                     "setLocalBoneOrigin" => vector(args.get(1))?,
-                    _ => matrix(args.get(1)?)?.w_axis.truncate(),
+                    _ => {
+                        let m = matrix(args.get(1)?)?;
+                        puppet.rotate(i, Some(m.to_scale_rotation_translation().1));
+                        m.w_axis.truncate()
+                    }
                 };
                 let parent = puppet.parents[i].map_or(Mat4::IDENTITY, |p| puppet.worlds[p]);
                 puppet.place(i, parent.transform_point3(local));
@@ -602,6 +697,260 @@ impl ScriptHost {
         }
     }
 
+    /// `transformAttachmentToTexture(layer, attachment)` on `layer`: where an
+    /// attachment of another (puppet) layer is in `layer`'s texture, as a 2D
+    /// affine matrix from attachment space to UV.
+    fn attachment_to_texture(&self, layer: i32, args: &[ScriptValue]) -> Option<ScriptValue> {
+        let other = args.first()?.as_f64()? as i32;
+        let name = match args.get(1)? {
+            ScriptValue::String(s) => s.clone(),
+            v => v.as_f64()?.to_string(),
+        };
+        let this = self.layer(layer)?;
+        let pose = {
+            let bones = self.bones.borrow();
+            let puppet = bones.puppets.get(&other)?;
+            puppet.attachment_pose(puppet.attachment(&name)?)?
+        };
+        let other_model = self.layer(other)?.motion_now().transform_at(0.0);
+        let to_local = this.motion_now().transform_at(0.0).inverse() * other_model * pose;
+        // Layer space (pixels, Y up, centred) to UV (0..1, Y down).
+        let size = this.size.max(Vec2::ONE);
+        let to_uv = glam::Mat3::from_cols(
+            Vec3::new(1.0 / size.x, 0.0, 0.0),
+            Vec3::new(0.0, -1.0 / size.y, 0.0),
+            Vec3::new(0.5, 0.5, 1.0),
+        );
+        let affine = glam::Mat3::from_cols(
+            to_local.x_axis.truncate().truncate().extend(0.0),
+            to_local.y_axis.truncate().truncate().extend(0.0),
+            to_local.w_axis.truncate().truncate().extend(1.0),
+        );
+        let m = (to_uv * affine).to_cols_array();
+        Some(ScriptValue::Json(
+            m.iter().map(|&v| v as f64).collect::<Vec<_>>().into(),
+        ))
+    }
+
+    /// `rotateObjectSpace(angles)`, `lookAt(center, up)` and
+    /// `lookAtYaw(center, up)`: change the layer's angles.
+    fn orient(&mut self, layer: i32, method: &str, args: &[ScriptValue]) {
+        let Some(l) = self.layer_mut(layer) else {
+            return;
+        };
+        let Some(v) = args.first().and_then(to_vec3) else {
+            return;
+        };
+        let angles = match method {
+            "rotateObjectSpace" => euler_degrees(rotation_of(l.angles) * rotation_of(v)),
+            _ => {
+                let up = args.get(1).and_then(to_vec3).unwrap_or(Vec3::Y);
+                let dir = v - l.origin;
+                if dir.length_squared() < 1e-12 {
+                    return;
+                }
+                if method == "lookAtYaw" {
+                    let yaw = dir.x.atan2(dir.z).to_degrees();
+                    Vec3::new(l.angles.x, yaw, l.angles.z)
+                } else {
+                    // The layer's +Z faces the target, its +Y as close to `up` as can be.
+                    let z = dir.normalize();
+                    let x = up.cross(z).try_normalize().unwrap_or(Vec3::X);
+                    let y = z.cross(x);
+                    euler_degrees(Quat::from_mat3(&glam::Mat3::from_cols(x, y, z)))
+                }
+            }
+        };
+        l.dirty_transform |= angles != l.angles;
+        l.touched.transform = true;
+        l.angles = angles;
+    }
+
+    /// A particle system's `play`, `pause`, `stop`, `isPlaying` and
+    /// `emitParticles(count)`.
+    fn particle_call(
+        &mut self,
+        layer: i32,
+        method: &str,
+        args: &[ScriptValue],
+    ) -> Option<ScriptValue> {
+        let command = match method {
+            "isPlaying" => {
+                return Some(ScriptValue::Bool(!self.particles_paused.contains(&layer)));
+            }
+            "emitParticles" => {
+                let count = args.first().and_then(ScriptValue::as_f64).unwrap_or(1.0);
+                ParticleCommand::Emit(count.clamp(0.0, 100_000.0) as u32)
+            }
+            "play" => {
+                self.particles_paused.remove(&layer);
+                ParticleCommand::Playing(true)
+            }
+            "pause" => {
+                self.particles_paused.insert(layer);
+                ParticleCommand::Playing(false)
+            }
+            "stop" => {
+                self.particles_paused.insert(layer);
+                ParticleCommand::Stop
+            }
+            _ => {
+                self.unhandled("invoke", &format!("particles.{method}"));
+                return None;
+            }
+        };
+        self.particle_commands.push((layer, command));
+        None
+    }
+
+    /// Remove animation layer `index` of puppet `layer`, as
+    /// `destroyAnimationLayer` does.
+    pub(super) fn destroy_animation_layer(&mut self, layer: i32, index: usize) {
+        self.animation_layers_call(
+            layer,
+            "destroyAnimationLayer",
+            &[ScriptValue::Number(index as f64)],
+        );
+    }
+
+    /// `getAnimationLayerCount`, `createAnimationLayer` (also
+    /// `playSingleAnimation`) and `destroyAnimationLayer` on a puppet.
+    fn animation_layers_call(
+        &mut self,
+        layer: i32,
+        method: &str,
+        args: &[ScriptValue],
+    ) -> Option<ScriptValue> {
+        let animations = {
+            let bones = self.bones.borrow();
+            bones
+                .puppets
+                .get(&layer)
+                .map(|p| p.animations.clone())
+                .unwrap_or_default()
+        };
+        let single = method == "playSingleAnimation";
+        let l = self.layer_mut(layer)?;
+        let list = l
+            .config
+            .as_object_mut()?
+            .entry("animationlayers")
+            .or_insert_with(|| Value::Array(Vec::new()));
+        if !list.is_array() {
+            *list = Value::Array(Vec::new());
+        }
+        let list = list.as_array_mut()?;
+        let result = match method {
+            "getAnimationLayerCount" => return Some(ScriptValue::Number(list.len() as f64)),
+            "createAnimationLayer" | "playSingleAnimation" => {
+                let (name, mut entry) = match args.first()? {
+                    ScriptValue::String(name) => {
+                        let id = animations
+                            .iter()
+                            .find(|(n, _)| n == name)
+                            .map(|&(_, id)| id)?;
+                        (
+                            name.clone(),
+                            serde_json::json!({ "animation": id, "name": name }),
+                        )
+                    }
+                    ScriptValue::Json(config) => {
+                        let name = config.get("name").and_then(Value::as_str);
+                        (name.unwrap_or_default().to_owned(), config.clone())
+                    }
+                    other => {
+                        let id = other.as_f64()? as i32;
+                        (String::new(), serde_json::json!({ "animation": id }))
+                    }
+                };
+                if let (Some(ScriptValue::Json(Value::Object(extra))), Some(map)) =
+                    (args.get(1), entry.as_object_mut())
+                {
+                    for (k, v) in extra {
+                        map.insert(k.clone(), v.clone());
+                    }
+                }
+                let index = list.len();
+                list.push(entry);
+                if single {
+                    self.single_layers.push((layer, index));
+                }
+                let key = if name.is_empty() {
+                    index.to_string()
+                } else {
+                    name
+                };
+                ScriptValue::String(key)
+            }
+            "destroyAnimationLayer" => {
+                let index = match args.first()? {
+                    ScriptValue::String(key) => key.parse().ok().or_else(|| {
+                        list.iter()
+                            .position(|e| e.get("name").and_then(Value::as_str) == Some(key))
+                    }),
+                    v => v.as_f64().map(|i| i as usize),
+                }?;
+                if index >= list.len() {
+                    return Some(ScriptValue::Bool(false));
+                }
+                list.remove(index);
+                self.clocks.borrow_mut().remove_layer_clock(layer, index);
+                self.single_layers
+                    .retain(|&(l, i)| (l, i) != (layer, index));
+                for (l, i) in &mut self.single_layers {
+                    if *l == layer && *i > index {
+                        *i -= 1;
+                    }
+                }
+                ScriptValue::Bool(true)
+            }
+            _ => return None,
+        };
+        let value = self.layer(layer)?.config["animationlayers"].clone();
+        self.edits.push(SceneEdit::Set {
+            id: layer,
+            key: "animationlayers".to_owned(),
+            value,
+        });
+        Some(result)
+    }
+
+    /// An effect's `materialCount` and `executeMaterialFunction(name)`.
+    fn effect_call(
+        &mut self,
+        layer: i32,
+        effect: usize,
+        method: &str,
+        args: &[ScriptValue],
+    ) -> Option<ScriptValue> {
+        let l = self.layer(layer)?;
+        match method {
+            "materialCount" => {
+                let count = l
+                    .steps
+                    .passes
+                    .iter()
+                    .filter(|p| p.effect == Some(effect))
+                    .map(|p| p.pass + 1)
+                    .max()
+                    .unwrap_or(1);
+                Some(ScriptValue::Number(count as f64))
+            }
+            "executeMaterialFunction" => {
+                let ScriptValue::String(name) = args.first()? else {
+                    return None;
+                };
+                let targets = l.steps.functions.get(&(effect, name.clone()))?.clone();
+                self.clears.extend(targets);
+                None
+            }
+            _ => {
+                self.unhandled("invoke", &format!("effect.{method}"));
+                None
+            }
+        }
+    }
+
     fn is_particles(&self, layer: i32) -> bool {
         self.layer(layer)
             .is_some_and(|l| l.info.kind == LayerKind::Particle)
@@ -679,6 +1028,12 @@ impl ScriptHost {
         args: &[ScriptValue],
     ) -> Option<ScriptValue> {
         let mut clocks = self.clocks.borrow_mut();
+        // `thisScene.getAnimation(name)`: whichever layer has it.
+        let layer = match (&key, layer) {
+            (Some(k), -1) => clocks.find_layer(k).unwrap_or(-1),
+            _ => layer,
+        };
+        let time = self.time as f32;
         let Some(clock) = key.and_then(|k| clocks.get_mut(layer, &k)) else {
             drop(clocks);
             self.unhandled("invoke", &format!("{target}.{method} (no such animation)"));
@@ -695,6 +1050,11 @@ impl ScriptHost {
             }
             "pause" => clock.playing = false,
             "stop" => clock.stop(),
+            // Back in step with the scene's time.
+            "join" => {
+                clock.frame = time * clock.fps;
+                clock.playing = true;
+            }
             "isPlaying" => return Some(ScriptValue::Bool(clock.playing)),
             "getFrame" => return number(clock.current_frame().floor()),
             "setFrame" => clock.frame = arg()?.max(0.0),
@@ -983,15 +1343,23 @@ impl SceneHost for ScriptHost {
                 video_call(self.videos.get(&layer)?, method, args)
             }
             "" if self.sounds.contains_key(&layer) => self.sound_call(layer, method),
-            "" if method == "emitParticles" && self.is_particles(layer) => {
-                let count = args.first().and_then(ScriptValue::as_f64).unwrap_or(1.0);
-                let count = count.clamp(0.0, 100_000.0) as u32;
-                self.particle_commands
-                    .push((layer, ParticleCommand::Emit(count)));
+            "" if method == "transformAttachmentToTexture" => {
+                self.attachment_to_texture(layer, args)
+            }
+            "" if matches!(method, "rotateObjectSpace" | "lookAt" | "lookAtYaw") => {
+                self.orient(layer, method, args);
                 None
+            }
+            "" if self.is_particles(layer) => self.particle_call(layer, method, args),
+            "" if method.contains("AnimationLayer") => {
+                self.animation_layers_call(layer, method, args)
             }
             "" if self.bones.borrow().puppets.contains_key(&layer) => {
                 self.bone_call(layer, method, args)
+            }
+            _ if target.starts_with("effect:") => {
+                let effect: usize = target["effect:".len()..].parse().ok()?;
+                self.effect_call(layer, effect, method, args)
             }
             "textureAnimation" | "animation" => {
                 let key = match target {
@@ -1059,12 +1427,31 @@ impl SceneHost for ScriptHost {
         }
     }
 
-    fn set_parent(&mut self, layer: i32, parent: Option<i32>) {
+    fn set_parent(
+        &mut self,
+        layer: i32,
+        parent: Option<i32>,
+        attachment: Option<&str>,
+        adjust: bool,
+    ) {
+        let new_parent_world = parent
+            .and_then(|p| self.layer(p))
+            .map_or(Mat4::IDENTITY, |p| p.motion_now().transform_at(0.0));
         let Some(l) = self.layer_mut(layer) else {
             return;
         };
-        if l.info.parent == parent {
+        let current = l.config.get("attachment").and_then(Value::as_str);
+        if l.info.parent == parent && current == attachment {
             return;
+        }
+        if adjust {
+            // Keep the layer where it is in the world under its new parent.
+            let world = l.motion_now().transform_at(0.0);
+            let local = new_parent_world.inverse() * world;
+            let (scale, rotation, origin) = local.to_scale_rotation_translation();
+            (l.origin, l.scale, l.angles) = (origin, scale, euler_degrees(rotation));
+            l.touched.transform = true;
+            l.dirty_transform = true;
         }
         l.info.parent = parent;
         if let Some(map) = l.config.as_object_mut() {
@@ -1072,11 +1459,69 @@ impl SceneHost for ScriptHost {
                 Some(p) => map.insert("parent".to_owned(), p.into()),
                 None => map.remove("parent"),
             };
+            match attachment {
+                Some(a) => map.insert("attachment".to_owned(), a.into()),
+                None => map.remove("attachment"),
+            };
         }
         self.edits.push(SceneEdit::Parent { id: layer, parent });
+        self.edits.push(SceneEdit::Set {
+            id: layer,
+            key: "attachment".to_owned(),
+            value: attachment.map_or(Value::Null, Value::from),
+        });
+    }
+
+    fn open_user_shortcut(&mut self, name: &str) -> bool {
+        // Only shortcuts the user bound (through the settings) open; a
+        // wallpaper's own defaults never launch anything.
+        let Some(shortcut) = self.user_shortcuts.get(name) else {
+            return false;
+        };
+        let target = shortcut
+            .get("file")
+            .and_then(Value::as_str)
+            .or_else(|| shortcut.as_str())
+            .filter(|f| !f.is_empty());
+        let bound = shortcut
+            .get("isbound")
+            .and_then(Value::as_bool)
+            .unwrap_or(true);
+        let Some(target) = target.filter(|_| bound) else {
+            return false;
+        };
+        std::process::Command::new("xdg-open")
+            .arg(target)
+            .spawn()
+            .inspect_err(|e| tracing::warn!("opening {target}: {e}"))
+            .is_ok()
+    }
+
+    fn hit_box(&self, layer: i32, world: [f32; 2]) -> Option<String> {
+        let model = self.layer(layer)?.motion_now().transform_at(0.0);
+        let bones = self.bones.borrow();
+        let puppet = bones.puppets.get(&layer)?;
+        let local = model
+            .inverse()
+            .transform_point3(Vec2::from_array(world).extend(0.0));
+        let bone = puppet.nearest(local)?;
+        Some(match puppet.names[bone].as_str() {
+            "" => bone.to_string(),
+            name => name.to_owned(),
+        })
     }
 
     fn scene_get(&self, property: &str) -> Option<ScriptValue> {
+        if property == "cameratransforms" {
+            let half = Vec2::from_array(self.canvas) / 2.0;
+            let (center, zoom) = self.camera.unwrap_or((half, 1.0));
+            return Some(ScriptValue::Json(serde_json::json!({
+                "eye": [center.x, center.y, 1.0],
+                "center": [center.x, center.y, 0.0],
+                "up": [0.0, 1.0, 0.0],
+                "zoom": zoom,
+            })));
+        }
         let Some(v) = self.general.get(property) else {
             self.unhandled("scene_get", property);
             return None;
@@ -1087,7 +1532,23 @@ impl SceneHost for ScriptHost {
 
     fn scene_set(&mut self, property: &str, value: ScriptValue) {
         if property == "cameratransforms" {
-            self.unhandled("scene_set", property);
+            // A flat scene's camera: where it looks and how far it zooms in.
+            let ScriptValue::Json(t) = &value else { return };
+            let vector = |key: &str| -> Option<Vec2> {
+                let v = t.get(key)?;
+                let n = |k: &str| v.get(k).and_then(Value::as_f64);
+                match (n("x"), n("y")) {
+                    (Some(x), Some(y)) => Some(Vec2::new(x as f32, y as f32)),
+                    _ => match config_numbers(v)[..] {
+                        [x, y, ..] => Some(Vec2::new(x as f32, y as f32)),
+                        _ => None,
+                    },
+                }
+            };
+            let half = Vec2::from_array(self.canvas) / 2.0;
+            let center = vector("center").unwrap_or(half);
+            let zoom = t.get("zoom").and_then(Value::as_f64).unwrap_or(1.0) as f32;
+            self.camera = Some((center, zoom.max(1e-3)));
             return;
         }
         let json = scene_json(&value);

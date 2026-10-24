@@ -27,6 +27,19 @@ pub struct Effect {
     /// Files the effect ships with (materials, shaders, textures).
     #[serde(deserialize_with = "null_default")]
     pub dependencies: Vec<String>,
+    /// Named actions scripts run (`executeMaterialFunction`).
+    #[serde(deserialize_with = "null_default")]
+    pub functions: std::collections::BTreeMap<String, EffectFunction>,
+}
+
+/// An effect function: `{"action": "clear", "fbos": [...]}`.
+#[derive(Debug, Clone, Default, PartialEq, Deserialize)]
+#[serde(default)]
+pub struct EffectFunction {
+    #[serde(deserialize_with = "lenient_string")]
+    pub action: String,
+    #[serde(deserialize_with = "null_default")]
+    pub fbos: Vec<String>,
 }
 
 /// A framebuffer an effect allocates for its passes.

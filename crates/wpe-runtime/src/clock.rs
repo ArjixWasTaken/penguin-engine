@@ -34,6 +34,10 @@ pub struct Clock {
     /// Puppet animation layers: weight and visibility.
     pub blend: f32,
     pub visible: bool,
+    /// Named events at frames, for scripts' `animationEvent`.
+    pub events: Vec<(f32, String)>,
+    /// Events passed since the last [`Clocks::take_events`]: name and frame.
+    fired: Vec<(String, f32)>,
     /// Reached the end since the last [`Clocks::take_ended`].
     ended: bool,
 }
@@ -49,24 +53,55 @@ impl Clock {
             rate: 1.0,
             blend: 1.0,
             visible: true,
+            events: Vec::new(),
+            fired: Vec::new(),
             ended: false,
         }
     }
 
     pub fn for_animation(a: &Animation) -> Self {
-        Self::new(
+        let mut clock = Self::new(
             a.fps,
             a.length,
             a.mode == AnimationMode::Single,
             !a.start_paused,
-        )
+        );
+        clock.events = a.events.clone();
+        clock
+    }
+
+    /// Record the events between frames `from` (exclusive) and `to`.
+    fn pass_events(&mut self, from: f32, to: f32) {
+        if self.events.is_empty() || to <= from {
+            return;
+        }
+        let looping = self.frames > 0.0 && !self.single;
+        for (frame, name) in &self.events {
+            let crossed = if looping {
+                // Event positions repeat every loop.
+                let first = frame + ((from - frame) / self.frames).floor() * self.frames;
+                let next = if first <= from {
+                    first + self.frames
+                } else {
+                    first
+                };
+                next <= to
+            } else {
+                *frame > from && *frame <= to
+            };
+            if crossed {
+                self.fired.push((name.clone(), *frame));
+            }
+        }
     }
 
     fn advance(&mut self, dt: f32) {
         if !self.playing || self.fps <= 0.0 {
             return;
         }
+        let before = self.frame;
         self.frame += dt * self.fps * self.rate;
+        self.pass_events(before, self.frame);
         if self.single && self.frames > 0.0 && self.frame >= self.frames {
             self.frame = self.frames;
             self.playing = false;
@@ -124,6 +159,26 @@ impl Clocks {
         self.clocks.get_mut(&(layer, key.to_owned()))
     }
 
+    /// Forget animation layer `index` of `layer`, moving later layers' clocks
+    /// down to their new indices.
+    pub fn remove_layer_clock(&mut self, layer: i32, index: usize) {
+        self.clocks.remove(&(layer, layer_key(index)));
+        let mut i = index + 1;
+        while let Some(clock) = self.clocks.remove(&(layer, layer_key(i))) {
+            self.clocks.insert((layer, layer_key(i - 1)), clock);
+            i += 1;
+        }
+    }
+
+    /// The layer with a clock `key` (`thisScene.getAnimation(name)`).
+    pub fn find_layer(&self, key: &str) -> Option<i32> {
+        self.clocks
+            .keys()
+            .filter(|(_, k)| k == key)
+            .map(|&(l, _)| l)
+            .min()
+    }
+
     /// The key of `layer`'s first keyframe animation (`getAnimation()`).
     pub fn first_animation(&self, layer: i32) -> Option<String> {
         let mut keys: Vec<&String> = self
@@ -146,17 +201,34 @@ impl Clocks {
         dt
     }
 
-    /// Layers with a clock that reached its end since the last call.
-    pub fn take_ended(&mut self) -> Vec<i32> {
-        let mut ended = Vec::new();
-        for ((layer, _), clock) in &mut self.clocks {
-            if std::mem::take(&mut clock.ended) {
-                ended.push(*layer);
-            }
-        }
-        ended.sort_unstable();
-        ended.dedup();
+    /// Clocks that reached their end since the last call: layer and key.
+    pub fn take_ended(&mut self) -> Vec<(i32, String)> {
+        let mut ended: Vec<(i32, String)> = self
+            .clocks
+            .iter_mut()
+            .filter(|(_, clock)| clock.ended)
+            .map(|((layer, key), clock)| {
+                clock.ended = false;
+                (*layer, key.clone())
+            })
+            .collect();
+        ended.sort();
         ended
+    }
+
+    /// Animation events passed since the last call: layer, name and frame.
+    pub fn take_events(&mut self) -> Vec<(i32, String, f32)> {
+        let mut events: Vec<(i32, String, f32)> = self
+            .clocks
+            .iter_mut()
+            .flat_map(|((layer, _), clock)| {
+                std::mem::take(&mut clock.fired)
+                    .into_iter()
+                    .map(|(name, frame)| (*layer, name, frame))
+            })
+            .collect();
+        events.sort_by(|a, b| a.0.cmp(&b.0).then(a.2.total_cmp(&b.2)));
+        events
     }
 
     /// Seconds into `animation` of `layer`, by its clock (scene semantics
@@ -175,6 +247,22 @@ mod tests {
     use super::*;
 
     #[test]
+    fn events_fire_as_frames_pass_and_on_every_loop() {
+        let mut clocks = Clocks::default();
+        let mut clock = Clock::new(10.0, 20.0, false, true);
+        clock.events = vec![(5.0, "step".into()), (15.0, "land".into())];
+        clocks.register(1, "a".into(), clock);
+        clocks.advance(0.4);
+        assert!(clocks.take_events().is_empty());
+        clocks.advance(1.0);
+        assert_eq!(clocks.take_events(), [(1, "step".to_owned(), 5.0)]);
+        clocks.advance(2.6); // frames 10 -> 26: land, then step again in the next loop
+        let names: Vec<String> = clocks.take_events().into_iter().map(|e| e.1).collect();
+        assert_eq!(names.len(), 2);
+        assert!(names.contains(&"land".to_owned()) && names.contains(&"step".to_owned()));
+    }
+
+    #[test]
     fn clocks_play_pause_and_end() {
         let mut clocks = Clocks::default();
         clocks.register(1, "a".into(), Clock::new(10.0, 20.0, true, true));
@@ -189,7 +277,7 @@ mod tests {
         assert!(!clocks.get(1, "a").unwrap().playing);
         assert_eq!(clocks.get(2, "b").unwrap().frame, 30.0);
         assert_eq!(clocks.get(2, "b").unwrap().current_frame(), 10.0, "loops");
-        assert_eq!(clocks.take_ended(), [1]);
+        assert_eq!(clocks.take_ended(), [(1, "a".to_owned())]);
         assert!(clocks.take_ended().is_empty());
     }
 }
