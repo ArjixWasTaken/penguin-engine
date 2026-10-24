@@ -18,7 +18,11 @@ pub async fn load(preview: PathBuf) -> Option<Handle> {
     let _permit = WORKERS.clone().acquire_owned().await.ok()?;
     tokio::task::spawn_blocking(move || {
         let rgba = wpe_library::thumbs::rgba(&preview)?;
-        Some(Handle::from_rgba(rgba.width(), rgba.height(), rgba.into_raw()))
+        Some(Handle::from_rgba(
+            rgba.width(),
+            rgba.height(),
+            rgba.into_raw(),
+        ))
     })
     .await
     .ok()
@@ -64,7 +68,11 @@ impl Thumbs {
         self.clock += 1;
         self.handles.insert(id, (handle, self.clock));
         if self.handles.len() > KEEP {
-            let mut by_age: Vec<_> = self.handles.iter().map(|(k, (_, t))| (*t, k.clone())).collect();
+            let mut by_age: Vec<_> = self
+                .handles
+                .iter()
+                .map(|(k, (_, t))| (*t, k.clone()))
+                .collect();
             by_age.sort_unstable();
             for (_, id) in by_age.into_iter().take(self.handles.len() - KEEP) {
                 self.handles.remove(&id);

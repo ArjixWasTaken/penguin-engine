@@ -15,8 +15,9 @@ mod view;
 fn main() -> iced::Result {
     tracing_subscriber::fmt()
         .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| "info,wgpu_core=warn,wgpu_hal=warn,iced_wgpu=warn,naga=warn".into()),
+            tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| {
+                "info,wgpu_core=warn,wgpu_hal=warn,iced_wgpu=warn,naga=warn".into()
+            }),
         )
         .init();
 

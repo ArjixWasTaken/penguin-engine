@@ -55,7 +55,13 @@ impl Default for Filters {
         Self {
             query: String::new(),
             kinds: [Kind::Scene, Kind::Video, Kind::Web, Kind::Preset].into(),
-            ratings: [Rating::Everyone, Rating::Questionable, Rating::Mature, Rating::Unknown].into(),
+            ratings: [
+                Rating::Everyone,
+                Rating::Questionable,
+                Rating::Mature,
+                Rating::Unknown,
+            ]
+            .into(),
             sources: [Source::Workshop, Source::Projects, Source::User].into(),
             audio_only: false,
         }
@@ -242,7 +248,9 @@ impl App {
                 self.loading = false;
                 self.refilter();
                 // For screenshots: select the n-th visible item.
-                if let Some(n) = std::env::var("WPE_UI_SELECT").ok().and_then(|n| n.parse::<usize>().ok())
+                if let Some(n) = std::env::var("WPE_UI_SELECT")
+                    .ok()
+                    .and_then(|n| n.parse::<usize>().ok())
                     && let Some(&i) = self.visible.get(n)
                 {
                     return self.update(Message::Select(self.items[i].id.clone()));
@@ -283,7 +291,9 @@ impl App {
                 if self.thumbs.shown(&id)
                     && let Some(preview) = self.item(&id).and_then(|i| i.preview.clone())
                 {
-                    return Task::perform(thumbs::load(preview), move |h| Message::Thumb(id.clone(), h));
+                    return Task::perform(thumbs::load(preview), move |h| {
+                        Message::Thumb(id.clone(), h)
+                    });
                 }
                 if self.item(&id).is_some_and(|i| i.preview.is_none()) {
                     self.thumbs.loaded(id, None);
@@ -320,7 +330,10 @@ impl App {
                 }
             }
             Message::Apply(id) => {
-                let Some(path) = self.item(&id).map(|i| i.path.to_string_lossy().into_owned()) else {
+                let Some(path) = self
+                    .item(&id)
+                    .map(|i| i.path.to_string_lossy().into_owned())
+                else {
                     return Task::none();
                 };
                 self.applying = Some(id.clone());
@@ -557,9 +570,15 @@ impl App {
             .collect();
         match self.sort {
             Sort::Title => {}
-            Sort::Updated => self.visible.sort_by_key(|&i| std::cmp::Reverse(items[i].updated)),
-            Sort::Installed => self.visible.sort_by_key(|&i| std::cmp::Reverse(items[i].installed)),
-            Sort::Size => self.visible.sort_by_key(|&i| std::cmp::Reverse(items[i].size)),
+            Sort::Updated => self
+                .visible
+                .sort_by_key(|&i| std::cmp::Reverse(items[i].updated)),
+            Sort::Installed => self
+                .visible
+                .sort_by_key(|&i| std::cmp::Reverse(items[i].installed)),
+            Sort::Size => self
+                .visible
+                .sort_by_key(|&i| std::cmp::Reverse(items[i].size)),
         }
     }
 }
@@ -638,7 +657,11 @@ fn status() -> Task<Message> {
 async fn load_preview(path: std::path::PathBuf) -> Option<Handle> {
     tokio::task::spawn_blocking(move || {
         let image = image::open(&path).ok()?.into_rgba8();
-        Some(Handle::from_rgba(image.width(), image.height(), image.into_raw()))
+        Some(Handle::from_rgba(
+            image.width(),
+            image.height(),
+            image.into_raw(),
+        ))
     })
     .await
     .ok()
@@ -652,21 +675,23 @@ fn screenshot(path: std::path::PathBuf) -> Task<Message> {
         .ok()
         .and_then(|s| s.parse().ok())
         .unwrap_or(4.0);
-    Task::future(tokio::time::sleep(std::time::Duration::from_secs_f64(delay)))
-        .then(|_| iced::window::latest())
-        .and_then(iced::window::screenshot)
-        .then(move |shot| {
-            let size = shot.size;
-            match image::RgbaImage::from_raw(size.width, size.height, shot.rgba.to_vec()) {
-                Some(img) => {
-                    if let Err(e) = img.save(&path) {
-                        tracing::error!("saving {}: {e}", path.display());
-                    }
+    Task::future(tokio::time::sleep(std::time::Duration::from_secs_f64(
+        delay,
+    )))
+    .then(|_| iced::window::latest())
+    .and_then(iced::window::screenshot)
+    .then(move |shot| {
+        let size = shot.size;
+        match image::RgbaImage::from_raw(size.width, size.height, shot.rgba.to_vec()) {
+            Some(img) => {
+                if let Err(e) = img.save(&path) {
+                    tracing::error!("saving {}: {e}", path.display());
                 }
-                None => tracing::error!("bad screenshot"),
             }
-            iced::exit()
-        })
+            None => tracing::error!("bad screenshot"),
+        }
+        iced::exit()
+    })
 }
 
 async fn pick(directory: bool) -> Option<String> {

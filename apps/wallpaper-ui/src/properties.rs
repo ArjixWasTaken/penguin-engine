@@ -5,9 +5,7 @@
 
 use std::collections::{HashMap, HashSet};
 
-use iced::widget::{
-    button, column, pick_list, row, slider, text, text_input, toggler,
-};
+use iced::widget::{button, column, pick_list, row, slider, text, text_input, toggler};
 use iced::{Alignment, Color, Element, Fill, Task};
 use serde_json::Value;
 use wpe_ipc::{PropertyInfo, Request};
@@ -248,9 +246,13 @@ impl Form {
                 rows = rows.push(row);
             }
         }
-        let reset = button(row![icons::reset(12.0), text("Reset").size(13)].spacing(6).align_y(Alignment::Center))
-            .style(button::secondary)
-            .on_press(Message::Edit(Edit::Reset));
+        let reset = button(
+            row![icons::reset(12.0), text("Reset").size(13)]
+                .spacing(6)
+                .align_y(Alignment::Center),
+        )
+        .style(button::secondary)
+        .on_press(Message::Edit(Edit::Reset));
         let mut content = column![
             row![
                 text("PROPERTIES").size(11).color(theme::MUTED).width(Fill),
@@ -274,10 +276,12 @@ impl Form {
         let mut column = column![].spacing(6);
         if !names.is_empty() {
             column = column.push(
-                pick_list(names, None::<String>, |name| Message::Edit(Edit::LoadPreset(name)))
-                    .placeholder("Load a preset…")
-                    .text_size(13)
-                    .width(Fill),
+                pick_list(names, None::<String>, |name| {
+                    Message::Edit(Edit::LoadPreset(name))
+                })
+                .placeholder("Load a preset…")
+                .text_size(13)
+                .width(Fill),
             );
         }
         let save = button(text("Save").size(13))
@@ -294,7 +298,11 @@ impl Form {
         ]
         .spacing(6)
         .align_y(Alignment::Center);
-        if let Some(existing) = self.presets.iter().find(|p| p.name == self.preset_name.trim()) {
+        if let Some(existing) = self
+            .presets
+            .iter()
+            .find(|p| p.name == self.preset_name.trim())
+        {
             line = line.push(
                 button(text("Delete").size(13))
                     .style(button::danger)
@@ -307,7 +315,11 @@ impl Form {
     fn field<'a>(&'a self, p: &'a PropertyInfo) -> Option<Element<'a, Message>> {
         let name = p.name.clone();
         let value = self.values.get(&p.name).unwrap_or(&p.value);
-        let label = self.labels.get(&p.name).cloned().unwrap_or_else(|| p.name.clone());
+        let label = self
+            .labels
+            .get(&p.name)
+            .cloned()
+            .unwrap_or_else(|| p.name.clone());
         let kind = p.kind.to_ascii_lowercase();
         let row: Element<'a, Message> = match kind.as_str() {
             "bool" => toggler(truthy(value))
@@ -328,9 +340,16 @@ impl Form {
                     format!("{current:.2}")
                 };
                 column![
-                    row![text(label).size(13).width(Fill), text(shown).size(13).color(theme::MUTED)],
+                    row![
+                        text(label).size(13).width(Fill),
+                        text(shown).size(13).color(theme::MUTED)
+                    ],
                     slider(min..=max, current, move |v| {
-                        let v = if integer { Value::from(v.round() as i64) } else { Value::from(v) };
+                        let v = if integer {
+                            Value::from(v.round() as i64)
+                        } else {
+                            Value::from(v)
+                        };
                         Message::Edit(Edit::Set(name.clone(), v))
                     })
                     .step(step),
@@ -351,7 +370,10 @@ impl Form {
                         value: o.value.clone(),
                     })
                     .collect();
-                let selected = options.iter().find(|o| loosely_equal(&o.value, value)).cloned();
+                let selected = options
+                    .iter()
+                    .find(|o| loosely_equal(&o.value, value))
+                    .cloned();
                 column![
                     text(label).size(13),
                     pick_list(options, selected, move |c: Choice| {
@@ -376,7 +398,9 @@ impl Form {
                     .on_press(Message::Edit(Edit::Pick(p.name.clone())))
                     .style(move |_, _| button::Style {
                         background: Some(color.into()),
-                        border: iced::border::rounded(theme::RADIUS).color(theme::MUTED).width(1),
+                        border: iced::border::rounded(theme::RADIUS)
+                            .color(theme::MUTED)
+                            .width(1),
                         ..Default::default()
                     });
                 let line = row![
@@ -404,7 +428,10 @@ impl Form {
                 }
             }
             "textinput" => {
-                let current = value.as_str().map(ToOwned::to_owned).unwrap_or_else(|| value.to_string());
+                let current = value
+                    .as_str()
+                    .map(ToOwned::to_owned)
+                    .unwrap_or_else(|| value.to_string());
                 column![
                     text(label).size(13),
                     text_input("", &current)
@@ -415,7 +442,10 @@ impl Form {
                 .into()
             }
             "text" => text(label).size(13).color(theme::MUTED).into(),
-            "group" => text(label.to_uppercase()).size(11).color(theme::MUTED).into(),
+            "group" => text(label.to_uppercase())
+                .size(11)
+                .color(theme::MUTED)
+                .into(),
             "file" | "scenetexture" | "directory" => {
                 let current = value.as_str().filter(|s| !s.is_empty()).unwrap_or("None");
                 column![
@@ -427,7 +457,10 @@ impl Form {
                             .on_press(Message::PickFile(p.name.clone(), kind == "directory")),
                         button(text("Clear").size(12))
                             .style(button::text)
-                            .on_press(Message::Edit(Edit::Set(p.name.clone(), Value::String(String::new())))),
+                            .on_press(Message::Edit(Edit::Set(
+                                p.name.clone(),
+                                Value::String(String::new())
+                            ))),
                     ]
                     .spacing(6)
                     .align_y(Alignment::Center),
@@ -452,9 +485,6 @@ impl std::fmt::Display for Choice {
         f.write_str(&self.label)
     }
 }
-
-
-
 
 fn truthy(v: &Value) -> bool {
     match v {
@@ -490,7 +520,11 @@ fn parse_color(v: &Value) -> Option<Color> {
         .filter_map(|s| s.parse().ok())
         .collect();
     let [r, g, b] = parts.get(..3)?.try_into().ok()?;
-    let scale = if r > 1.0 || g > 1.0 || b > 1.0 { 255.0 } else { 1.0 };
+    let scale = if r > 1.0 || g > 1.0 || b > 1.0 {
+        255.0
+    } else {
+        1.0
+    };
     Some(Color::from_rgb(r / scale, g / scale, b / scale))
 }
 
@@ -528,7 +562,6 @@ mod tests {
         assert_eq!(hex(parse_color(&json!("255 128 0")).unwrap()), "#ff8000");
         assert_eq!(color_value(parse_hex("#ff0000").unwrap()), "1 0 0");
     }
-
 
     #[test]
     fn loose_values() {

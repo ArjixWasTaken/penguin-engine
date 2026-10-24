@@ -33,7 +33,12 @@ fn top_bar(app: &App) -> Element<'_, Message> {
 
     let mut targets = vec![Target::All];
     if let Some(status) = app.status() {
-        targets.extend(status.outputs.iter().map(|o| Target::Output(o.name.clone())));
+        targets.extend(
+            status
+                .outputs
+                .iter()
+                .map(|o| Target::Output(o.name.clone())),
+        );
     }
     let target = pick_list(targets, Some(app.target.clone()), Message::Target).padding([6, 10]);
 
@@ -46,15 +51,19 @@ fn top_bar(app: &App) -> Element<'_, Message> {
     });
     let pause = button(
         row![
-            if paused { icons::play(14.0) } else { icons::pause(14.0) },
+            if paused {
+                icons::play(14.0)
+            } else {
+                icons::pause(14.0)
+            },
             text(if paused { "Resume" } else { "Pause" }).size(14)
         ]
         .spacing(6)
         .align_y(Alignment::Center),
     )
-        .padding([6, 12])
-        .style(button::secondary)
-        .on_press_maybe(app.status().map(|_| Message::Pause(!paused)));
+    .padding([6, 12])
+    .style(button::secondary)
+    .on_press_maybe(app.status().map(|_| Message::Pause(!paused)));
 
     let settings = app.status().map(|s| &s.settings);
     let sound_on = settings.is_some_and(|s| s.audio);
@@ -63,15 +72,26 @@ fn top_bar(app: &App) -> Element<'_, Message> {
         .draft
         .or(settings.map(|s| s.volume))
         .unwrap_or(100);
-    let sound = button(if sound_on { icons::volume(16.0) } else { icons::muted(16.0) })
-        .padding([6, 8])
-        .style(button::text)
-        .on_press_maybe(settings.map(|_| Message::Sound(!sound_on)));
+    let sound = button(if sound_on {
+        icons::volume(16.0)
+    } else {
+        icons::muted(16.0)
+    })
+    .padding([6, 8])
+    .style(button::text)
+    .on_press_maybe(settings.map(|_| Message::Sound(!sound_on)));
     let sound = iced::widget::tooltip(
         sound,
-        container(text(if sound_on { "Sound on: click to mute" } else { "Sound off: click to turn on" }).size(12))
-            .padding([4, 8])
-            .style(container::rounded_box),
+        container(
+            text(if sound_on {
+                "Sound on: click to mute"
+            } else {
+                "Sound off: click to turn on"
+            })
+            .size(12),
+        )
+        .padding([4, 8])
+        .style(container::rounded_box),
         iced::widget::tooltip::Position::Bottom,
     );
     let mut slider = iced::widget::slider(0..=100u32, volume, Message::Volume).width(110);
@@ -82,7 +102,10 @@ fn top_bar(app: &App) -> Element<'_, Message> {
             style
         });
     }
-    let volume_text = text(format!("{volume}%")).size(13).color(theme::MUTED).width(36);
+    let volume_text = text(format!("{volume}%"))
+        .size(13)
+        .color(theme::MUTED)
+        .width(36);
 
     let bar = row![
         text("Wallpapers").size(18),
@@ -111,7 +134,11 @@ fn top_bar(app: &App) -> Element<'_, Message> {
 
 fn banner(app: &App) -> Option<Element<'_, Message>> {
     if let Some(notice) = &app.notice {
-        let color = if notice.error { theme::DANGER } else { theme::SUCCESS };
+        let color = if notice.error {
+            theme::DANGER
+        } else {
+            theme::SUCCESS
+        };
         let content = row![
             text(&notice.text).size(14).width(Fill),
             button(text("Dismiss").size(13))
@@ -131,9 +158,11 @@ fn banner(app: &App) -> Option<Element<'_, Message>> {
         return None;
     };
     let content = row![
-        text(format!("Not connected: {error}. Wallpapers can't be applied until it runs."))
-            .size(14)
-            .width(Fill),
+        text(format!(
+            "Not connected: {error}. Wallpapers can't be applied until it runs."
+        ))
+        .size(14)
+        .width(Fill),
         button(text("Retry").size(13))
             .style(button::secondary)
             .on_press(Message::RefreshStatus),
@@ -286,26 +315,21 @@ fn tile<'a>(app: &'a App, item: &'a Item) -> Element<'a, Message> {
     if let Some((label, color)) = rating_badge(item.rating) {
         badges = badges.push(badge(label, color));
     }
-    let title = container(
-        text(&item.title)
-            .size(13)
-            .wrapping(text::Wrapping::None),
-    )
-    .padding([14, 8])
-    .width(Fill)
-    .clip(true)
-    .style(theme::title_shade);
+    let title = container(text(&item.title).size(13).wrapping(text::Wrapping::None))
+        .padding([14, 8])
+        .width(Fill)
+        .clip(true)
+        .style(theme::title_shade);
     let overlay = column![
         row![space::horizontal(), badges].padding(6),
         space::vertical(),
         title,
     ];
-    let frame = container(space().width(Fill).height(Fill))
-        .style(move |_| {
-            let mut style = theme::tile(selected, hovered);
-            style.background = None;
-            style
-        });
+    let frame = container(space().width(Fill).height(Fill)).style(move |_| {
+        let mut style = theme::tile(selected, hovered);
+        style.background = None;
+        style
+    });
     let base = container(space().width(Fill).height(Fill)).style(|_| theme::tile(false, false));
 
     let card = mouse_area(stack![base, picture, overlay, frame])
@@ -381,7 +405,9 @@ fn detail(app: &App) -> Element<'_, Message> {
     };
     badges = badges.push(badge(kind.0, kind.1));
     match item.rating {
-        Rating::Everyone => badges = badges.push(badge("EVERYONE", Color::from_rgb8(0x3f, 0x8f, 0x50))),
+        Rating::Everyone => {
+            badges = badges.push(badge("EVERYONE", Color::from_rgb8(0x3f, 0x8f, 0x50)))
+        }
         Rating::Questionable => badges = badges.push(badge("QUESTIONABLE", theme::WARNING)),
         Rating::Mature => badges = badges.push(badge("MATURE", theme::DANGER)),
         Rating::Unknown => {}
@@ -444,29 +470,33 @@ fn detail(app: &App) -> Element<'_, Message> {
         .padding([8, 12])
         .style(button::primary)
         .on_press_maybe(
-            (playable && !applying && app.status().is_some()).then(|| Message::Apply(item.id.clone())),
+            (playable && !applying && app.status().is_some())
+                .then(|| Message::Apply(item.id.clone())),
         );
 
     let mut links = row![].spacing(8);
     if let Some(id) = &item.workshop_id {
         links = links.push(
-            button(row![icons::external(13.0), text("Workshop page").size(13)].spacing(6).align_y(Alignment::Center))
-                .style(button::secondary)
-                .on_press(Message::OpenWorkshop(id.clone())),
+            button(
+                row![icons::external(13.0), text("Workshop page").size(13)]
+                    .spacing(6)
+                    .align_y(Alignment::Center),
+            )
+            .style(button::secondary)
+            .on_press(Message::OpenWorkshop(id.clone())),
         );
     }
     links = links.push(
-        button(row![icons::folder(13.0), text("Open folder").size(13)].spacing(6).align_y(Alignment::Center))
-            .style(button::secondary)
-            .on_press(Message::OpenFolder(item.id.clone())),
+        button(
+            row![icons::folder(13.0), text("Open folder").size(13)]
+                .spacing(6)
+                .align_y(Alignment::Center),
+        )
+        .style(button::secondary)
+        .on_press(Message::OpenFolder(item.id.clone())),
     );
 
-    let mut content = column![
-        preview,
-        text(&item.title).size(18),
-        badges,
-    ]
-    .spacing(10);
+    let mut content = column![preview, text(&item.title).size(18), badges,].spacing(10);
     if !playing.is_empty() {
         content = content.push(
             text(format!("Showing on {}", playing.join(", ")))

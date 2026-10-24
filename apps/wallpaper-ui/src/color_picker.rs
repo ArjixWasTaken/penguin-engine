@@ -48,7 +48,10 @@ impl<Message> Picker<'_, Message> {
 }
 
 fn zones(bounds: Size) -> (Rectangle, Rectangle) {
-    let square = Rectangle::new(Point::ORIGIN, Size::new(bounds.width - HUE_BAR - GAP, bounds.height));
+    let square = Rectangle::new(
+        Point::ORIGIN,
+        Size::new(bounds.width - HUE_BAR - GAP, bounds.height),
+    );
     let hue = Rectangle::new(
         Point::new(bounds.width - HUE_BAR, 0.0),
         Size::new(HUE_BAR, bounds.height),
@@ -112,13 +115,19 @@ impl<Message> canvas::Program<Message> for Picker<'_, Message> {
         let [h, s, v] = self.hsv(state);
 
         let pure = hsv_to_rgb([h, 1.0, 1.0]);
-        let across = gradient::Linear::new(square.position(), Point::new(square.x + square.width, square.y))
-            .add_stop(0.0, Color::WHITE)
-            .add_stop(1.0, pure);
+        let across = gradient::Linear::new(
+            square.position(),
+            Point::new(square.x + square.width, square.y),
+        )
+        .add_stop(0.0, Color::WHITE)
+        .add_stop(1.0, pure);
         frame.fill_rectangle(square.position(), square.size(), across);
-        let down = gradient::Linear::new(square.position(), Point::new(square.x, square.y + square.height))
-            .add_stop(0.0, Color::TRANSPARENT)
-            .add_stop(1.0, Color::BLACK);
+        let down = gradient::Linear::new(
+            square.position(),
+            Point::new(square.x, square.y + square.height),
+        )
+        .add_stop(0.0, Color::TRANSPARENT)
+        .add_stop(1.0, Color::BLACK);
         frame.fill_rectangle(square.position(), square.size(), down);
 
         let mut bar = gradient::Linear::new(hue.position(), Point::new(hue.x, hue.y + hue.height));
@@ -128,21 +137,36 @@ impl<Message> canvas::Program<Message> for Picker<'_, Message> {
         }
         frame.fill_rectangle(hue.position(), hue.size(), bar);
 
-        let marker = Point::new(square.x + s * square.width, square.y + (1.0 - v) * square.height);
-        let ring = if v > 0.5 && s < 0.5 { Color::BLACK } else { Color::WHITE };
+        let marker = Point::new(
+            square.x + s * square.width,
+            square.y + (1.0 - v) * square.height,
+        );
+        let ring = if v > 0.5 && s < 0.5 {
+            Color::BLACK
+        } else {
+            Color::WHITE
+        };
         frame.stroke(
             &Path::circle(marker, 6.0),
             Stroke::default().with_color(ring).with_width(2.0),
         );
         let y = hue.y + h / 360.0 * hue.height;
         frame.stroke(
-            &Path::rectangle(Point::new(hue.x - 2.0, y - 3.0), Size::new(HUE_BAR + 4.0, 6.0)),
+            &Path::rectangle(
+                Point::new(hue.x - 2.0, y - 3.0),
+                Size::new(HUE_BAR + 4.0, 6.0),
+            ),
             Stroke::default().with_color(Color::WHITE).with_width(2.0),
         );
         vec![frame.into_geometry()]
     }
 
-    fn mouse_interaction(&self, _: &State, bounds: Rectangle, cursor: mouse::Cursor) -> mouse::Interaction {
+    fn mouse_interaction(
+        &self,
+        _: &State,
+        bounds: Rectangle,
+        cursor: mouse::Cursor,
+    ) -> mouse::Interaction {
         if cursor.is_over(bounds) {
             mouse::Interaction::Crosshair
         } else {
@@ -195,7 +219,15 @@ mod tests {
 
     #[test]
     fn hsv_round_trips() {
-        for rgb in [[255, 0, 0], [0, 255, 0], [0, 0, 255], [255, 128, 0], [10, 20, 30], [255, 255, 255], [0, 0, 0]] {
+        for rgb in [
+            [255, 0, 0],
+            [0, 255, 0],
+            [0, 0, 255],
+            [255, 128, 0],
+            [10, 20, 30],
+            [255, 255, 255],
+            [0, 0, 0],
+        ] {
             let c = Color::from_rgb8(rgb[0], rgb[1], rgb[2]);
             assert!(same(hsv_to_rgb(rgb_to_hsv(c)), c), "{rgb:?}");
         }

@@ -11,15 +11,18 @@ use tauri::{AppHandle, Manager, State};
 use tauri_plugin_opener::OpenerExt;
 use tokio::sync::RwLock;
 use wpe_ipc::{Client, PropertyInfo, Request, Response};
-use wpe_library::locale::{self, Locale};
 use wpe_library::folders::{self, Folder};
+use wpe_library::locale::{self, Locale};
 use wpe_library::presets::{self, Preset};
 use wpe_library::{Item, Sources, steam};
 
 /// The scanned library and Wallpaper Engine's UI strings, loaded on first
 /// use.
 #[derive(Default)]
-pub struct Library(RwLock<Option<Arc<Loaded>>>, tokio::sync::OnceCell<Arc<Resolutions>>);
+pub struct Library(
+    RwLock<Option<Arc<Loaded>>>,
+    tokio::sync::OnceCell<Arc<Resolutions>>,
+);
 
 /// Wallpaper sizes by item id, for those whose size is known.
 type Resolutions = HashMap<String, (u32, u32)>;
@@ -85,7 +88,10 @@ fn scan() -> Arc<Loaded> {
 /// Every wallpaper. Previews are at `thumb://localhost/<id>` (a small
 /// still) and `preview://localhost/<id>` (the original, animated).
 #[tauri::command]
-pub async fn library(state: State<'_, Library>, refresh: Option<bool>) -> Result<Vec<Item>, String> {
+pub async fn library(
+    state: State<'_, Library>,
+    refresh: Option<bool>,
+) -> Result<Vec<Item>, String> {
     Ok(state.loaded(refresh.unwrap_or(false)).await.items.clone())
 }
 
@@ -230,7 +236,10 @@ pub async fn resolutions(state: State<'_, Library>) -> Result<Arc<Resolutions>, 
 
 /// A wallpaper's size in pixels, if known (reads its files).
 #[tauri::command]
-pub async fn resolution(state: State<'_, Library>, id: String) -> Result<Option<(u32, u32)>, String> {
+pub async fn resolution(
+    state: State<'_, Library>,
+    id: String,
+) -> Result<Option<(u32, u32)>, String> {
     let loaded = state.loaded(false).await;
     let item = loaded.item(&id)?.clone();
     tauri::async_runtime::spawn_blocking(move || wpe_library::resolution(&item))

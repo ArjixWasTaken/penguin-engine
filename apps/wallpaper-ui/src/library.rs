@@ -52,7 +52,11 @@ pub fn labels(locale: &Locale, dir: PathBuf, props: &[PropertyInfo]) -> HashMap<
         .map(|p| {
             let text = p.text.as_deref().unwrap_or(&p.name);
             let label = locale::plain(&locale.label(text, localization.as_ref()));
-            let label = if label.trim().is_empty() { p.name.clone() } else { label };
+            let label = if label.trim().is_empty() {
+                p.name.clone()
+            } else {
+                label
+            };
             (p.name.clone(), label)
         })
         .collect()

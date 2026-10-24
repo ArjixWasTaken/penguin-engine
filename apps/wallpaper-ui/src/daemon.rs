@@ -70,7 +70,10 @@ fn follow(tx: &tokio::sync::mpsc::UnboundedSender<Feed>) {
                         return;
                     }
                 }
-                if tx.send(Feed::Down("the wallpaper daemon stopped".into())).is_err() {
+                if tx
+                    .send(Feed::Down("the wallpaper daemon stopped".into()))
+                    .is_err()
+                {
                     return;
                 }
             }

@@ -16,14 +16,22 @@ type Make = fn(&std::path::Path) -> Option<(Vec<u8>, &'static str)>;
 /// Thumbnails made at once; the rest wait their turn.
 static WORKERS: LazyLock<Arc<Semaphore>> = LazyLock::new(|| Arc::new(Semaphore::new(4)));
 
-pub fn thumb<R: Runtime>(ctx: UriSchemeContext<'_, R>, request: Request<Vec<u8>>, responder: UriSchemeResponder) {
+pub fn thumb<R: Runtime>(
+    ctx: UriSchemeContext<'_, R>,
+    request: Request<Vec<u8>>,
+    responder: UriSchemeResponder,
+) {
     serve(ctx, request, responder, |preview| {
         let file = wpe_library::thumbs::ensure(preview)?;
         Some((std::fs::read(file).ok()?, "image/png"))
     });
 }
 
-pub fn preview<R: Runtime>(ctx: UriSchemeContext<'_, R>, request: Request<Vec<u8>>, responder: UriSchemeResponder) {
+pub fn preview<R: Runtime>(
+    ctx: UriSchemeContext<'_, R>,
+    request: Request<Vec<u8>>,
+    responder: UriSchemeResponder,
+) {
     serve(ctx, request, responder, |preview| {
         Some((std::fs::read(preview).ok()?, mime(preview)))
     });
@@ -56,7 +64,9 @@ fn serve<R: Runtime>(
                 .header(header::CONTENT_TYPE, mime)
                 .header(header::CACHE_CONTROL, "max-age=3600")
                 .body(bytes),
-            None => Response::builder().status(StatusCode::NOT_FOUND).body(Vec::new()),
+            None => Response::builder()
+                .status(StatusCode::NOT_FOUND)
+                .body(Vec::new()),
         };
         responder.respond(response.expect("a valid response"));
     });
