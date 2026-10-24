@@ -32,6 +32,20 @@ behaviour comes from
 - **App UI:** [Preact](https://preactjs.com) and zustand, in a WebKitGTK webview.
 - **Scene viewer:** winit.
 
+## Installation
+
+On Arch Linux, from the AUR:
+
+- [penguin-engine](https://aur.archlinux.org/packages/penguin-engine): the latest release
+- [penguin-engine-git](https://aur.archlinux.org/packages/penguin-engine-git): the latest commit
+
+```sh
+paru -S penguin-engine   # or yay, or makepkg
+systemctl --user enable --now penguin-engine.socket penguin-engine.service
+```
+
+Elsewhere, build from source (see [The app](#the-app) and [systemd](#systemd)).
+
 ## Requirements
 
 Rendering needs the stock assets shipped with Wallpaper Engine (shaders, effects, materials).
