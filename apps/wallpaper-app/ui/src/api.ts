@@ -34,6 +34,55 @@ export interface Settings {
   fill: Fill;
   layer: Layer;
   passthrough: boolean;
+  /** Percent of the particles wallpapers ask for. */
+  particles: number;
+  rules: Rule[];
+}
+
+/** What a wallpaper does while a rule holds, mildest first. */
+export type Playback = "run" | "mute" | "pause" | "stop";
+export type WindowState = "open" | "focused" | "maximized" | "fullscreen";
+
+export type Condition =
+  | { if: "window"; state: WindowState; app?: string }
+  | { if: "audio"; app?: string }
+  | { if: "battery"; below?: number }
+  | { if: "idle"; seconds: number };
+
+export interface Rule {
+  enabled?: boolean;
+  when: Condition;
+  playback?: Playback;
+  fps?: number;
+  particles?: number;
+  all_outputs?: boolean;
+}
+
+/** What the rules holding make of an output's wallpaper. */
+export interface Limits {
+  playback?: Playback;
+  fps?: number;
+  particles?: number;
+  because?: string[];
+}
+
+export interface WindowInfo {
+  app: string;
+  process?: string;
+  title: string;
+  output?: string;
+  focused?: boolean;
+  maximized?: boolean;
+  fullscreen?: boolean;
+  minimized?: boolean;
+}
+
+/** What the daemon sees of the session. */
+export interface Signals {
+  windows?: WindowInfo[];
+  audio?: string[];
+  battery?: { discharging: boolean; percent?: number };
+  idle?: number;
 }
 
 export interface WallpaperInfo {
@@ -56,6 +105,7 @@ export interface OutputStatus {
   fps: number;
   fill: Fill;
   loading: string | null;
+  limits?: Limits;
 }
 
 export interface Status {
@@ -104,7 +154,8 @@ export type Request =
   | { cmd: "set-properties"; output?: string; values: Values }
   | { cmd: "reset-properties"; output?: string }
   | { cmd: "pause" | "resume"; output?: string }
-  | { cmd: "settings"; fps?: number; audio?: boolean; volume?: number; fill?: Fill; layer?: Layer; passthrough?: boolean }
+  | { cmd: "settings"; fps?: number; audio?: boolean; volume?: number; fill?: Fill; layer?: Layer; passthrough?: boolean; particles?: number; rules?: Rule[] }
+  | { cmd: "signals" }
   | { cmd: "wallpaper-volume"; output?: string; volume: number }
   | { cmd: "fill"; output?: string; fill: Fill };
 
@@ -114,6 +165,7 @@ export interface Response {
   status?: Status;
   properties?: { output: string; wallpaper: string; properties: Property[] }[];
   version?: { protocol: number; daemon: string; features: string[] };
+  signals?: Signals;
 }
 
 export type DaemonEvent =

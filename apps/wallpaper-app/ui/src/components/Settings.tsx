@@ -5,6 +5,7 @@ import { useEffect, useMemo, useState } from "preact/hooks";
 import { api, thumbUrl, type Fill, type Settings as DaemonSettings } from "../api";
 import { Throttled } from "../props";
 import { request, toast, useApp, type SettingsTab } from "../store";
+import { Rules } from "./Rules";
 import { Segments, Toggle } from "./ui";
 import { VERSION } from "./TitleBar";
 
@@ -117,26 +118,52 @@ function Performance({ settings }: { settings: DaemonSettings }) {
   const throttle = useMemo(() => new Throttled((v) => patch({ fps: v })), []);
   useEffect(() => setFps(null), [settings.fps]);
   const v = fps ?? settings.fps;
+  const [particles, setParticles] = useState<number | null>(null);
+  const throttleParticles = useMemo(() => new Throttled((v) => patch({ particles: v })), []);
+  useEffect(() => setParticles(null), [settings.particles]);
+  const p = particles ?? settings.particles ?? 100;
   return (
-    <label class="setting-col">
-      <div class="head">
-        <span>Frame rate limit</span>
-        <span class="mono muted">{v === 0 ? "display rate" : `${v} fps`}</span>
-      </div>
-      <input
-        type="range"
-        min={0}
-        max={240}
-        step={5}
-        value={v}
-        onInput={(e) => {
-          const n = +(e.target as HTMLInputElement).value;
-          setFps(n);
-          throttle.set(n);
-        }}
-      />
-      <div class="hint">0 follows the display's refresh rate.</div>
-    </label>
+    <>
+      <label class="setting-col">
+        <div class="head">
+          <span>Frame rate limit</span>
+          <span class="mono muted">{v === 0 ? "display rate" : `${v} fps`}</span>
+        </div>
+        <input
+          type="range"
+          min={0}
+          max={240}
+          step={5}
+          value={v}
+          onInput={(e) => {
+            const n = +(e.target as HTMLInputElement).value;
+            setFps(n);
+            throttle.set(n);
+          }}
+        />
+        <div class="hint">0 follows the display's refresh rate.</div>
+      </label>
+      <label class="setting-col">
+        <div class="head">
+          <span>Particles</span>
+          <span class="mono muted">{p}%</span>
+        </div>
+        <input
+          type="range"
+          min={0}
+          max={100}
+          step={5}
+          value={p}
+          onInput={(e) => {
+            const n = +(e.target as HTMLInputElement).value;
+            setParticles(n);
+            throttleParticles.set(n);
+          }}
+        />
+        <div class="hint">Of what wallpapers ask for: fewer particles cost less.</div>
+      </label>
+      <Rules rules={settings.rules ?? []} />
+    </>
   );
 }
 

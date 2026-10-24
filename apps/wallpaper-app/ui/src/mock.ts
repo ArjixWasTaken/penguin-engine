@@ -44,9 +44,17 @@ const props: Property[] = [
 ];
 
 const status: Status = {
-  settings: { fps: 60, audio: true, volume: 80, fill: "auto", layer: "background", passthrough: false },
+  settings: {
+    fps: 60, audio: true, volume: 80, fill: "auto", layer: "background", passthrough: false, particles: 100,
+    rules: [
+      { when: { if: "window", state: "fullscreen" }, playback: "pause" },
+      { when: { if: "audio", app: "spotify" }, playback: "mute" },
+      { when: { if: "battery" }, fps: 30, particles: 50 },
+      { enabled: false, when: { if: "idle", seconds: 600 }, playback: "stop" },
+    ],
+  },
   outputs: [
-    { name: "DP-1", width: 2560, height: 1440, scale: 1, wallpaper: { path: items[4].path, workshop_id: items[4].id, title: items[4].title, type: "scene", sound: true, volume: 70 }, paused: false, fps: 60, fill: "auto", loading: null },
+    { name: "DP-1", width: 2560, height: 1440, scale: 1, wallpaper: { path: items[4].path, workshop_id: items[4].id, title: items[4].title, type: "scene", sound: true, volume: 70 }, paused: true, fps: 0, fill: "auto", loading: null, limits: { playback: "pause", because: ["org.mozilla.firefox is fullscreen"] } },
     { name: "HDMI-A-1", width: 1080, height: 1920, scale: 1, wallpaper: { path: items[9].path, workshop_id: items[9].id, title: items[9].title, type: "video" }, paused: false, fps: 30, fill: "auto", loading: null },
   ],
 };
@@ -77,6 +85,13 @@ export function installMock() {
           if (r.cmd === "status") return { ok: true, status };
           if (r.cmd === "version") return { ok: true, version: { protocol: 2, daemon: "0.1.0", features: [] } };
           if (r.cmd === "properties") return { ok: true, properties: [] };
+          if (r.cmd === "signals")
+            return { ok: true, signals: { windows: [{ app: "org.mozilla.firefox", process: "firefox", title: "Video", output: "DP-1", fullscreen: true, focused: true }], audio: ["firefox"], idle: 0 } };
+          if (r.cmd === "settings") {
+            const { cmd: _, ...patch } = r as Record<string, unknown>;
+            Object.assign(status.settings, patch);
+            setTimeout(() => emit("daemon-event", { event: "status", status: structuredClone(status) }), 50);
+          }
           return { ok: true };
         }
         case "properties":

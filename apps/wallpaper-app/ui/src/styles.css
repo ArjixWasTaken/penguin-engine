@@ -263,6 +263,23 @@ input[type="checkbox"] { accent-color: var(--accent); margin: 0; }
 .setting-col { display: flex; flex-direction: column; gap: 8px; }
 .setting-col .head { display: flex; justify-content: space-between; }
 .setting-col .hint { text-align: left; }
+/* Rules (Settings → Performance) */
+.rules { display: flex; flex-direction: column; gap: 8px; }
+.rule {
+  display: flex; flex-direction: column; gap: 8px; padding: 10px 12px; border-radius: 8px;
+  background: var(--raised); border: 1px solid var(--line-2);
+}
+.rule.off .line > :not(.toggle):not(.delete) { opacity: .5; }
+.rule .line { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+.rule .line.then { padding-left: 46px; }
+.rule select.field { height: 30px; }
+.rule .field.app { height: 30px; flex: 1 1 120px; min-width: 0; }
+.rule .field.num { height: 30px; width: 64px; flex: none; padding: 0 8px; }
+.rule .line > select.field { flex: 0 1 auto; min-width: 0; }
+.rule .unit { display: flex; align-items: center; gap: 6px; color: var(--text-2); font-size: 12px; }
+.rule .delete { margin-left: auto; width: 28px; height: 28px; }
+.rule .delete:hover { color: var(--danger); }
+.rule-now { font-size: 12px; padding: 6px 10px; border-radius: 6px; background: var(--accent-soft); color: var(--text); }
 .displays { display: flex; gap: 14px; justify-content: center; align-items: flex-end; padding: 10px 0; flex-wrap: wrap; }
 .display { display: flex; flex-direction: column; align-items: center; gap: 8px; cursor: pointer; border: none; background: none; }
 .display .screen {
