@@ -37,6 +37,10 @@ struct Args {
     /// clicking across the scene now and then (exercises scripts).
     #[arg(long, default_value_t = 1)]
     frames: u32,
+    /// With --screenshot, the pointer for the final frame: `x,y`, 0..1 over
+    /// the output with Y down.
+    #[arg(long, value_parser = parse_pointer)]
+    pointer: Option<glam::Vec2>,
     /// Play sound layers, a video wallpaper's sound, and react to system audio.
     #[arg(long)]
     audio: bool,
@@ -50,6 +54,12 @@ struct Args {
     /// as JSON (`true`, `0.5`, `"1 0 0"`) or else a string. Repeatable.
     #[arg(long = "property", value_name = "NAME=VALUE", value_parser = parse_property)]
     properties: Vec<(String, serde_json::Value)>,
+}
+
+fn parse_pointer(s: &str) -> Result<glam::Vec2, String> {
+    let (x, y) = s.split_once(',').ok_or("expected X,Y")?;
+    let n = |v: &str| v.trim().parse::<f32>().map_err(|e| e.to_string());
+    Ok(glam::Vec2::new(n(x)?, n(y)?))
 }
 
 fn parse_property(s: &str) -> Result<(String, serde_json::Value), String> {
@@ -171,6 +181,9 @@ fn screenshot(args: &Args, assets: &std::path::Path, out: &std::path::Path) -> R
         }
     }
     wallpaper.time_override = Some(args.time + args.frames.saturating_sub(1) as f32 / 30.0);
+    if let Some(pointer) = args.pointer {
+        wallpaper.set_pointer(pointer);
+    }
     let pixels = wallpaper.capture(&gpu, args.size);
     image::RgbaImage::from_raw(args.size.0, args.size.1, pixels)
         .context("capture size mismatch")?

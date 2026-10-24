@@ -240,6 +240,8 @@ pub struct Wallpaper {
     pointer_target: Vec2,
     /// The pointer camera parallax follows this frame.
     parallax_pointer: Vec2,
+    /// The size of the output last rendered to, which the pointer is over.
+    output_size: (u32, u32),
     /// Wall-clock time of the last frame, for pointer smoothing.
     last_frame: Option<Instant>,
     parallax_delay: f32,
@@ -536,6 +538,7 @@ impl PreparedWallpaper {
             pointer: Vec2::splat(0.5),
             pointer_target: Vec2::splat(0.5),
             parallax_pointer: Vec2::splat(0.5),
+            output_size: (1920, 1080),
             last_frame: None,
             parallax_delay: 0.0,
             shake: None,
@@ -1097,10 +1100,11 @@ impl Wallpaper {
         if let Some(scripts) = &mut self.scripts {
             if self.script_pointer != Some(self.pointer_target) {
                 self.script_pointer = Some(self.pointer_target);
-                scripts.cursor_moved(self.pointer_target);
+                scripts.cursor_moved(cursor(&self.camera, size, self.fill, self.pointer_target));
             }
             let screen = [size.0 as f32, size.1 as f32];
-            scripts.update(time, self.pointer, screen, self.spectrum);
+            let pointer = cursor(&self.camera, size, self.fill, self.pointer);
+            scripts.update(time, pointer, screen, self.spectrum);
         }
         self.sync_scripts(gpu, time);
     }
@@ -1209,7 +1213,13 @@ impl Wallpaper {
             web.page.input(wpe_web::Input::Button(button, down, x, y));
         }
         if let Some(scripts) = &mut self.scripts {
-            scripts.mouse_button(self.pointer_target, down);
+            let at = cursor(
+                &self.camera,
+                self.output_size,
+                self.fill,
+                self.pointer_target,
+            );
+            scripts.mouse_button(at, down);
         }
     }
 
@@ -1244,8 +1254,9 @@ impl Wallpaper {
             self.renderer.set_sprite_time(step, time);
         }
         drop(clocks);
-        let scene = self.camera.scene_size;
-        let cursor = Vec2::new(self.pointer.x, 1.0 - self.pointer.y) * scene;
+        let cursor = self
+            .camera
+            .world_point(self.output_size, self.fill, self.pointer);
         for particles in &mut self.particles {
             particles.advance(&mut self.renderer, time, Some(cursor.extend(0.0)));
         }
@@ -1374,6 +1385,7 @@ impl Wallpaper {
         self.upload_video_frames(gpu);
         self.smooth_pointer();
         self.advance_camera_path();
+        self.output_size = size;
         self.parallax_pointer = self.parallax_pointer(size);
         let globals = self.globals(size);
         self.animate(globals.time);
@@ -1396,6 +1408,7 @@ impl Wallpaper {
         self.advance_camera_path();
         // No wall clock to smooth over: the pointer is where it was put.
         self.pointer = self.pointer_target;
+        self.output_size = size;
         self.parallax_pointer = self.parallax_pointer(size);
         let globals = self.globals(size);
         self.animate(globals.time);
@@ -1405,5 +1418,13 @@ impl Wallpaper {
         self.feed_web_audio();
         self.run_scripts(gpu, globals.time, size);
         self.renderer.capture(gpu, globals, size)
+    }
+}
+
+/// The pointer at `p` (0..1 over an output of `size`, Y down) for scripts.
+fn cursor(camera: &OrthoCamera, size: (u32, u32), fill: FillMode, p: Vec2) -> script::Cursor {
+    script::Cursor {
+        output: p,
+        world: camera.world_point(size, fill, p),
     }
 }

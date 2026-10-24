@@ -335,6 +335,35 @@ impl SceneRenderer {
         }
     }
 
+    /// Give effect passes the matrix from their layer's texture to the
+    /// output, through the camera and transform the layer is drawn with now.
+    fn link_effects(&mut self, globals: &FrameGlobals) {
+        for i in 0..self.steps.len() {
+            let Some(PreparedStep::Material(_, d)) = self.steps.get(i) else {
+                continue;
+            };
+            let Some((step, half)) = d.draw.effect_of else {
+                continue;
+            };
+            let Some(PreparedStep::Material(_, layer)) = self.steps.get(step) else {
+                continue;
+            };
+            let matrix = layer.draw.camera.resolve(globals).view_proj
+                * layer.draw.model
+                * Mat4::from_scale(half.extend(1.0));
+            if let Some(PreparedStep::Material(_, d)) = self.steps.get_mut(i) {
+                d.overrides.insert(
+                    "g_EffectTextureProjectionMatrix".to_owned(),
+                    matrix.to_cols_array().to_vec(),
+                );
+                d.overrides.insert(
+                    "g_EffectTextureProjectionMatrixInverse".to_owned(),
+                    matrix.inverse().to_cols_array().to_vec(),
+                );
+            }
+        }
+    }
+
     /// Replace the model matrix of the draw at `step` (its index in the
     /// list given to [`Self::set_frame`]).
     pub fn set_model(&mut self, step: usize, model: Mat4) {
@@ -669,6 +698,7 @@ impl SceneRenderer {
                 }
             }
         }
+        self.link_effects(&globals);
         let bindables = Bindables {
             placeholders: &self.placeholders,
             targets: &self.targets,
@@ -932,6 +962,7 @@ mod tests {
                 camera: Camera::Fixed(Mat4::IDENTITY),
                 sprites: Vec::new(),
                 raster,
+                effect_of: None,
             }),
         }
     }

@@ -560,17 +560,17 @@ pub enum Camera {
 }
 
 /// A draw's camera resolved for one frame.
-struct View {
+pub(crate) struct View {
     view: Mat4,
     proj: Mat4,
-    view_proj: Mat4,
+    pub(crate) view_proj: Mat4,
     eye: Vec3,
 }
 
 impl Camera {
     /// Orthographic cameras have no separate view: it is the identity and
     /// the projection is the whole matrix.
-    fn resolve(self, globals: &FrameGlobals) -> View {
+    pub(crate) fn resolve(self, globals: &FrameGlobals) -> View {
         let flat = |m: Mat4| View {
             view: Mat4::IDENTITY,
             proj: m,
@@ -693,6 +693,11 @@ pub struct MaterialDraw {
     pub sprites: Vec<SpriteAnimation>,
     /// Depth testing/writing and face culling.
     pub raster: RasterState,
+    /// For a layer's effect passes: the step that draws the layer onto the
+    /// output and half the size of its card. `g_EffectTextureProjectionMatrix`
+    /// then maps the layer's texture (-1..1, Y up) to the output, so effects
+    /// find the pointer on the layer; without it, it is the identity.
+    pub effect_of: Option<(usize, Vec2)>,
 }
 
 pub(crate) struct PreparedMaterialDraw {

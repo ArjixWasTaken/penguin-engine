@@ -57,6 +57,13 @@ impl OrthoCamera {
         }
     }
 
+    /// The world point (scene pixels, Y up) shown at `p`, 0..1 over the
+    /// output with Y down.
+    pub fn world_point(&self, output: (u32, u32), fill: FillMode, p: Vec2) -> Vec2 {
+        let extent = self.extent(output, fill);
+        self.scene_size / 2.0 + Vec2::new(p.x - 0.5, 0.5 - p.y) * extent
+    }
+
     /// The mode `fill` amounts to on `output` (`Auto` resolved).
     pub fn fill_for(&self, output: (u32, u32), fill: FillMode) -> FillMode {
         let out_aspect = output.0.max(1) as f32 / output.1.max(1) as f32;
@@ -221,6 +228,31 @@ mod tests {
         assert_eq!(
             wide.extent((1080, 1920), FillMode::Auto),
             wide.extent((1080, 1920), FillMode::Fit)
+        );
+    }
+
+    #[test]
+    fn pointer_maps_through_the_visible_extent() {
+        let portrait = OrthoCamera {
+            scene_size: Vec2::new(1080.0, 1920.0),
+            zoom: 1.0,
+        };
+        let out = (1920, 1080);
+        let at = |x, y| portrait.world_point(out, FillMode::Fit, Vec2::new(x, y));
+        assert_eq!(at(0.5, 0.5), Vec2::new(540.0, 960.0));
+        // The visible area is 1920 * 16/9 wide; the scene's left edge is at
+        // its middle minus 540.
+        let left_edge = 0.5 - 540.0 / (1920.0 * 16.0 / 9.0);
+        assert!((at(left_edge, 1.0) - Vec2::ZERO).length() < 1e-3);
+        assert!(at(0.0, 0.5).x < 0.0);
+        // Shown exactly, the output and the scene coincide.
+        let same = OrthoCamera {
+            scene_size: Vec2::new(1920.0, 1080.0),
+            zoom: 1.0,
+        };
+        assert_eq!(
+            same.world_point(out, FillMode::Auto, Vec2::new(0.25, 0.25)),
+            Vec2::new(480.0, 810.0)
         );
     }
 

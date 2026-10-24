@@ -1230,6 +1230,7 @@ impl<'a> FrameBuilder<'a> {
                 camera,
                 sprites: resolved.sprites,
                 raster,
+                effect_of: None,
             }),
         });
     }
@@ -2134,6 +2135,7 @@ impl<'a> FrameBuilder<'a> {
         self.bind_puppet(puppet, uv_scale);
         self.bind_layer(layer, layer.compose && !layer.fullscreen, false);
 
+        let first_effect = self.steps.len();
         let mut last_output: Option<usize> = None;
         for (effect, overrides, scene_effect) in effects {
             let scene_effect = *scene_effect;
@@ -2286,6 +2288,28 @@ impl<'a> FrameBuilder<'a> {
         }
         *target = TargetId::DEFAULT;
         draw.blend = Self::final_blend(layer);
+        // The passes find the layer on the output through its final draw.
+        let half = if layer.fullscreen {
+            Vec2::ONE
+        } else {
+            layer.size / 2.0
+        };
+        for step in &mut self.steps[first_effect..] {
+            if let Step::Draw {
+                draw: Draw::Material(d),
+                ..
+            } = step
+            {
+                d.effect_of = Some((index, half));
+            }
+        }
+        let Step::Draw {
+            draw: Draw::Material(draw),
+            ..
+        } = &mut self.steps[index]
+        else {
+            return;
+        };
         if !layer.fullscreen {
             draw.camera = layer_camera(layer);
             draw.model = layer.transform;

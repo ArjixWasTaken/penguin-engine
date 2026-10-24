@@ -54,6 +54,16 @@ impl SceneView<'_> {
 }
 
 /// A wallpaper's scripts and the state they drive.
+/// Where the pointer is, for scripts.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Cursor {
+    /// 0..1 over the output, Y down.
+    pub output: Vec2,
+    /// The scene point under it (scene pixels, Y up): off the scene where
+    /// the output shows more than the scene (fitted).
+    pub world: Vec2,
+}
+
 pub struct Scripts {
     runtime: ScriptRuntime,
     host: ScriptHost,
@@ -196,11 +206,11 @@ impl Scripts {
         })
     }
 
-    fn cursor_state(&self, pointer: Vec2) -> CursorState {
-        let (c, s) = (self.host.canvas, self.host.screen_resolution());
+    fn cursor_state(&self, cursor: Cursor) -> CursorState {
+        let s = self.host.screen_resolution();
         CursorState {
-            world: [pointer.x * c[0], (1.0 - pointer.y) * c[1]],
-            screen: [pointer.x * s[0], pointer.y * s[1]],
+            world: cursor.world.to_array(),
+            screen: [cursor.output.x * s[0], cursor.output.y * s[1]],
             left_down: self.pressed,
         }
     }
@@ -212,7 +222,7 @@ impl Scripts {
     pub fn update(
         &mut self,
         time: f32,
-        pointer: Vec2,
+        cursor: Cursor,
         screen: [f32; 2],
         spectrum: Option<wpe_audio::AudioSpectrum>,
     ) {
@@ -266,7 +276,7 @@ impl Scripts {
             self.runtime
                 .animation_event(&mut self.host, layer, &name, frame as f64);
         }
-        let cursor = self.cursor_state(pointer);
+        let cursor = self.cursor_state(cursor);
         self.runtime.update(&mut self.host, time, dt, Some(cursor));
     }
 
@@ -354,25 +364,25 @@ impl Scripts {
         }
     }
 
-    /// Deliver a mouse button press or release at `pointer`.
-    pub fn mouse_button(&mut self, pointer: Vec2, down: bool) {
+    /// Deliver a mouse button press or release at `cursor`.
+    pub fn mouse_button(&mut self, cursor: Cursor, down: bool) {
         self.pressed = down;
         let kind = if down {
             CursorEventKind::Down
         } else {
             CursorEventKind::Up
         };
-        self.cursor_event(kind, pointer);
+        self.cursor_event(kind, cursor);
     }
 
-    /// The pointer moved to `pointer` (0..1 over the output, Y down):
-    /// `cursorMove`, `cursorEnter` and `cursorLeave` handlers run.
-    pub fn cursor_moved(&mut self, pointer: Vec2) {
-        self.cursor_event(CursorEventKind::Move, pointer);
+    /// The pointer moved to `cursor`: `cursorMove`, `cursorEnter` and
+    /// `cursorLeave` handlers run.
+    pub fn cursor_moved(&mut self, cursor: Cursor) {
+        self.cursor_event(CursorEventKind::Move, cursor);
     }
 
-    fn cursor_event(&mut self, kind: CursorEventKind, pointer: Vec2) {
-        let state = self.cursor_state(pointer);
+    fn cursor_event(&mut self, kind: CursorEventKind, cursor: Cursor) {
+        let state = self.cursor_state(cursor);
         let world = Vec2::from_array(state.world);
         // Topmost (last drawn) first.
         let mut hits: Vec<i32> = self
