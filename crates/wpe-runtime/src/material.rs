@@ -47,6 +47,13 @@ impl TextureStore {
             .clone()
     }
 
+    /// Make the placeholder `alias` resolve to the texture `name`, or with
+    /// `None` to nothing again.
+    pub fn alias(&mut self, vfs: &Vfs, alias: &str, name: Option<&str>) {
+        let texture = name.and_then(|n| self.get(vfs, n));
+        self.textures.insert(alias.to_owned(), texture);
+    }
+
     /// Make `name` resolve to `texture` (generated images such as text).
     pub fn insert(&mut self, name: impl Into<String>, texture: Texture) {
         self.textures.insert(name.into(), Some(Arc::new(texture)));
@@ -182,6 +189,13 @@ pub fn prepare(
         .map(|(k, v)| (k.to_ascii_uppercase(), v.0.to_string()))
         .collect();
     combos.extend(extra_combos.iter().map(|(k, v)| (k.clone(), v.clone())));
+    // Materials whose "Fog" option (the `FOG` combo, on by default) is off
+    // ignore the scene's fog.
+    if combos.get("FOG").is_some_and(|v| v == "0") {
+        for fog in ["FOG_DIST", "FOG_HEIGHT", "FOG_COMPUTED"] {
+            combos.remove(fog);
+        }
+    }
 
     let shader = wpe_shader::compile(
         vfs,

@@ -126,12 +126,20 @@ pub const GEOMETRY: &str = "\n";
 /// through the `g_LFeature_*` arrays. Spot lights and directional cascades
 /// share `g_LFeature_ShadowProjection*`: spots first, then three cascades
 /// per directional light.
+///
+/// With `LIGHTS_COOKIE` (on its own too) it is the generated version as
+/// well: the spot light with a cookie (the first one when it is shadowed,
+/// `LIGHTS_SPOT_SHADOW_COOKIE`, else the one after the shadowed ones,
+/// `LIGHTS_SPOT_COOKIE`) is coloured by `COOKIE_SAMPLER` projected through
+/// its `g_LFeature_ShadowProjection` instead of the cone's falloff, as the
+/// `colorCookie` lines of WE's generated code do. Its projection follows the
+/// shadowed spots', ahead of the cascades.
 pub const LIGHTING_V1: &str = "
 vec3 ComputePBRLightShadow(vec3 N, vec3 L, vec3 V, vec3 albedo, vec3 lightColor,
     float radius, float exponent, vec3 specularTint, vec3 baseReflectance,
     float roughness, float metallic, float shadowFactor);
 
-#if LIGHTS_SHADOW_MAPPING
+#if LIGHTS_SHADOW_MAPPING || LIGHTS_COOKIE
 #ifndef LIGHTS_POINT
 #define LIGHTS_POINT 0
 #endif
@@ -153,9 +161,25 @@ vec3 ComputePBRLightShadow(vec3 N, vec3 L, vec3 V, vec3 albedo, vec3 lightColor,
 #ifndef LIGHTS_DIRECTIONAL_SHADOW
 #define LIGHTS_DIRECTIONAL_SHADOW 0
 #endif
+#ifndef LIGHTS_SPOT_COOKIE
+#define LIGHTS_SPOT_COOKIE 0
+#endif
+#ifndef LIGHTS_SPOT_SHADOW_COOKIE
+#define LIGHTS_SPOT_SHADOW_COOKIE 0
+#endif
 
 vec3 ComputePBRLightShadowInfinite(vec3 N, vec3 L, vec3 V, vec3 albedo, vec3 lightColor,
     vec3 specularTint, vec3 baseReflectance, float roughness, float metallic, float shadowFactor);
+// Defined by common_pbr_2.h, which some shaders include after this
+// (genericparticle hoists it ahead).
+vec3 PointSegmentDelta(vec3 pos, vec3 segmentA, vec3 segmentB);
+vec3 CalculateProjectedCoords(vec3 worldPos, mat4 shadowViewProjection);
+#if LIGHTS_SHADOW_MAPPING
+float PerformShadowMapping(vec3 projectedCoords, vec4 atlasTransform);
+float PerformPointShadowMapping(vec4 shadowMapCoords);
+vec4 CalculateProjectedCoordsCascades(vec3 worldPos, mat4 shadowViewProjection);
+vec4 CalculateProjectedCoordsPoint(vec3 worldPos, vec3 lightOrigin, vec4 projectionInfo, vec4 atlasTransform);
+#endif
 
 #if LIGHTS_POINT
 uniform vec4 g_LPoint_Color[LIGHTS_POINT];
@@ -180,9 +204,9 @@ uniform vec4 g_LDirectional_Direction[LIGHTS_DIRECTIONAL];
 uniform vec4 g_LFeature_ShadowPointProjection[LIGHTS_POINT_SHADOW];
 uniform vec4 g_LFeature_ShadowPointProjectionTransform[LIGHTS_POINT_SHADOW];
 #endif
-#if LIGHTS_SPOT_SHADOW || LIGHTS_DIRECTIONAL_SHADOW
-uniform mat4 g_LFeature_ShadowProjection[LIGHTS_SPOT_SHADOW + 3 * LIGHTS_DIRECTIONAL_SHADOW];
-uniform vec4 g_LFeature_ShadowProjectionTransform[LIGHTS_SPOT_SHADOW + 3 * LIGHTS_DIRECTIONAL_SHADOW];
+#if LIGHTS_SPOT_SHADOW || LIGHTS_SPOT_COOKIE || LIGHTS_DIRECTIONAL_SHADOW
+uniform mat4 g_LFeature_ShadowProjection[LIGHTS_SPOT_SHADOW + LIGHTS_SPOT_COOKIE + 3 * LIGHTS_DIRECTIONAL_SHADOW];
+uniform vec4 g_LFeature_ShadowProjectionTransform[LIGHTS_SPOT_SHADOW + LIGHTS_SPOT_COOKIE + 3 * LIGHTS_DIRECTIONAL_SHADOW];
 #endif
 
 vec3 PerformLighting_V1(vec3 worldPos, vec3 color, vec3 normal, vec3 viewVector,
@@ -210,6 +234,15 @@ vec3 PerformLighting_V1(vec3 worldPos, vec3 color, vec3 normal, vec3 viewVector,
         vec3 lightDelta = g_LSpot_Origin[i].xyz - worldPos;
         float spotCookie = -dot(normalize(lightDelta), g_LSpot_Direction[i].xyz);
         spotCookie = smoothstep(g_LSpot_Direction[i].w, g_LSpot_Origin[i].w, spotCookie);
+        vec3 spotColor = g_LSpot_Color[i].rgb * spotCookie;
+#if LIGHTS_COOKIE && (LIGHTS_SPOT_COOKIE || LIGHTS_SPOT_SHADOW_COOKIE)
+        if (i < LIGHTS_SPOT_SHADOW_COOKIE
+            || (i >= LIGHTS_SPOT_SHADOW && i < LIGHTS_SPOT_SHADOW + LIGHTS_SPOT_COOKIE)) {
+            vec3 cookieCoords = CalculateProjectedCoords(worldPos, g_LFeature_ShadowProjection[i]);
+            vec3 colorCookie = texSample2D(COOKIE_SAMPLER, cookieCoords.xy).rgb;
+            spotColor = g_LSpot_Color[i].rgb * colorCookie;
+        }
+#endif
         float shadowFactor = 1.0;
 #if LIGHTS_SPOT_SHADOW
         if (i < LIGHTS_SPOT_SHADOW) {
@@ -218,7 +251,7 @@ vec3 PerformLighting_V1(vec3 worldPos, vec3 color, vec3 normal, vec3 viewVector,
         }
 #endif
         light += ComputePBRLightShadow(normal, lightDelta, viewVector, color,
-            g_LSpot_Color[i].rgb * spotCookie, g_LSpot_Color[i].w, g_LSpot_Exponent[i].x,
+            spotColor, g_LSpot_Color[i].w, g_LSpot_Exponent[i].x,
             specularTint, ambient, roughness, metallic, shadowFactor);
     }
 #endif
@@ -234,7 +267,7 @@ vec3 PerformLighting_V1(vec3 worldPos, vec3 color, vec3 normal, vec3 viewVector,
         float shadowFactor = 1.0;
 #if LIGHTS_DIRECTIONAL_SHADOW
         if (i < LIGHTS_DIRECTIONAL_SHADOW) {
-            int p1 = LIGHTS_SPOT_SHADOW + 3 * i;
+            int p1 = LIGHTS_SPOT_SHADOW + LIGHTS_SPOT_COOKIE + 3 * i;
             int p2 = p1 + 1;
             int p3 = p1 + 2;
             vec4 projectedCoords1 = CalculateProjectedCoordsCascades(worldPos, g_LFeature_ShadowProjection[p1]);

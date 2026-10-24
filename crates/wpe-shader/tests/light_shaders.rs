@@ -154,3 +154,124 @@ fn volumetric_passes_compile() {
     )
     .expect("volumetricsback");
 }
+
+fn compile_with(vfs: &Vfs, shader: &str, pairs: &[(&str, &str)]) -> wpe_shader::CompiledShader {
+    let c = combos(pairs);
+    let slots = slots(4);
+    compile(
+        vfs,
+        ShaderRequest {
+            name: shader,
+            combos: &c,
+            slots: &slots,
+            formats: &[],
+        },
+    )
+    .unwrap_or_else(|e| panic!("{shader} {pairs:?}: {e}"))
+}
+
+#[test]
+fn cookie_lights_compile() {
+    let Some(vfs) = assets() else {
+        eprintln!("no Wallpaper Engine assets; skipped");
+        return;
+    };
+    // A cookie light on its own, and shadowed alongside the other shadows.
+    let alone: &[(&str, &str)] = &[
+        ("LIGHTS_COOKIE", "1"),
+        ("LIGHTS_SHADOW_MAPPING", "0"),
+        ("LIGHTS_SPOT", "2"),
+        ("LIGHTS_SPOT_COOKIE", "1"),
+        ("LIGHTS_SPOT_SHADOW_COOKIE", "0"),
+    ];
+    let mut shadowed = SHADOWS.to_vec();
+    shadowed.extend([
+        ("LIGHTS_COOKIE", "1"),
+        ("LIGHTS_SPOT_COOKIE", "0"),
+        ("LIGHTS_SPOT_SHADOW_COOKIE", "1"),
+    ]);
+    for (shader, cookie, extra) in [
+        ("generic4", "g_Texture7", &[("LIGHTING", "1")][..]),
+        ("genericimage4", "g_Texture7", &[("LIGHTING", "1")][..]),
+        ("genericparticle", "g_Texture5", &[("LIGHTING", "1")][..]),
+    ] {
+        for (set, projections) in [(alone, 1), (&shadowed[..], 4)] {
+            let mut pairs = set.to_vec();
+            pairs.extend_from_slice(extra);
+            let r = compile_with(&vfs, shader, &pairs).reflection;
+            assert_eq!(
+                r.textures.get(cookie).map(|t| t.kind),
+                Some(TextureKind::Filterable),
+                "{shader}"
+            );
+            assert_eq!(
+                r.uniforms["g_LFeature_ShadowProjection"].ty.count, projections,
+                "{shader}"
+            );
+            assert!(r.uniforms.contains_key("g_LSpot_Color"), "{shader}");
+        }
+    }
+}
+
+#[test]
+fn fog_compiles() {
+    let Some(vfs) = assets() else {
+        eprintln!("no Wallpaper Engine assets; skipped");
+        return;
+    };
+    let fog = [
+        ("FOG_DIST", "1"),
+        ("FOG_HEIGHT", "1"),
+        ("FOG_COMPUTED", "1"),
+    ];
+    for (shader, extra) in [
+        ("generic4", &[("LIGHTING", "1")][..]),
+        ("genericimage4", &[][..]),
+        ("genericparticle", &[][..]),
+        (
+            "volumetricsfront",
+            &[("QUALITY", "2"), ("POINTLIGHT", "1")][..],
+        ),
+    ] {
+        let mut pairs = fog.to_vec();
+        pairs.extend_from_slice(extra);
+        let r = compile_with(&vfs, shader, &pairs).reflection;
+        for name in [
+            "g_FogDistanceColor",
+            "g_FogDistanceParams",
+            "g_FogHeightColor",
+            "g_FogHeightParams",
+        ] {
+            assert!(r.uniforms.contains_key(name), "{shader}: {name}");
+        }
+    }
+}
+
+#[test]
+fn spot_volumetrics_compile() {
+    let Some(vfs) = assets() else {
+        eprintln!("no Wallpaper Engine assets; skipped");
+        return;
+    };
+    for (shadow, cookie) in [("1", false), ("0", true), ("1", true)] {
+        let mut pairs = vec![
+            ("QUALITY", "2"),
+            ("POINTLIGHT", "0"),
+            ("FULLSCREEN", "0"),
+            ("SHADOW", shadow),
+        ];
+        if cookie {
+            pairs.push(("COOKIE", "1"));
+        }
+        let r = compile_with(&vfs, "volumetricsfront", &pairs).reflection;
+        assert!(r.uniforms.contains_key("g_AltModelMatrix"));
+        assert_eq!(
+            r.textures.get("g_Texture0").map(|t| t.kind),
+            (shadow == "1").then_some(TextureKind::Comparison)
+        );
+        assert_eq!(
+            r.textures.get("g_Texture2").map(|t| t.kind),
+            cookie.then_some(TextureKind::Filterable)
+        );
+    }
+}

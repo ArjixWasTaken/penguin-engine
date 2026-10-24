@@ -33,7 +33,8 @@ dialect to SPIR-V and run through wgpu:
 - puppet warp (`.mdl` skinned meshes, bone animations, blend shapes)
 - 3D: model objects (`.mdl` meshes with depth testing and culling), perspective scenes and
   perspective layers, camera paths, reflections, point/spot/tube/directional lights with
-  shadow maps and volumetrics
+  shadow maps and volumetrics (shadowed too), spot light cookies (projected textures),
+  distance and height fog
 - SceneScript (QuickJS) on any scene value, with the engine services scripts use:
   - layers: transforms, colour, visibility (groups included), text and layout properties,
     `createLayer` / `destroyLayer` / `sortLayer` / `setParent` (the frame is rebuilt)
@@ -51,8 +52,7 @@ dialect to SPIR-V and run through wgpu:
     changes (`Wallpaper::set_user_property`, `scene-viewer --property name=value`),
     `openUserShortcut` (only shortcuts the user bound), `applyGeneralSettings`
 
-Not yet: light cookies, desktop background (wallpaper) mode and the wallpaper
-picker UI.
+Not yet: desktop background (wallpaper) mode and the wallpaper picker UI.
 
 Debugging aids: `WPE_SCRIPT_AUDIT=<file>` records script requests the runtime doesn't
 handle, `WPE_FAKE_AUDIO=1` feeds a synthetic spectrum, `scene-viewer --frames N` runs N

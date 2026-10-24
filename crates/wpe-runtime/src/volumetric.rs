@@ -12,6 +12,12 @@
 //! fullscreen quad (`FULLSCREEN`) marches from the camera instead. The
 //! buffer is blurred with `blur_k3` both ways and added over the frame
 //! with `passthrough`.
+//!
+//! Shadow-casting lights march through their shadow maps (`SHADOW`): point
+//! lights through their cube tile, spot lights through their projection
+//! (`g_AltModelMatrix`) and tile (`g_RenderVar0`). The cookie spot light
+//! (`COOKIE`) colours its scattering with the cookie (`g_Texture2`) seen
+//! through the same projection.
 
 use std::collections::{BTreeMap, HashMap};
 
@@ -19,7 +25,8 @@ use glam::{Mat4, Vec3};
 use wpe_assets::material::{Blending, MaterialPass};
 use wpe_render::{
     BlendMode, Camera, CardMesh, CullMode, Mesh, MeshData, RasterState, SceneRenderer,
-    ShadowLights, TargetId, TargetSize, TexRef, point_projection_info, wgpu,
+    ShadowLights, SpotShadow, TargetId, TargetSize, TexRef, point_projection_info, spot_view_proj,
+    wgpu,
 };
 use wpe_scene::{LightKind, LightsByKind, SceneLight};
 
@@ -38,9 +45,11 @@ struct VolumetricLight {
     back: usize,
     front: usize,
     fullscreen: usize,
-    /// Index among the shadow-casting point lights, when its scattering is
-    /// shadowed.
+    /// Index among the shadow-casting lights of its kind (point or spot),
+    /// when its scattering is shadowed.
     shadow: Option<usize>,
+    /// The scene's cookie light: its scattering samples the cookie.
+    cookie: bool,
     /// Centre and radius of its proxy sphere, as last updated.
     sphere: (Vec3, f32),
 }
@@ -149,11 +158,36 @@ fn quality(postprocessing: Option<&str>) -> u32 {
     }
 }
 
+/// `volumetricsfront` maps a spot light's projection to UVs with
+/// `xy · 0.525 + 0.5` ("Increase UV to hide border inconsistencies") where
+/// the lit shaders use `xy · 0.5 + 0.5`. Shrinking the projection's x and
+/// y by this makes the scattering sample the same texels the lit surfaces
+/// do. Whether Wallpaper Engine compensates likewise is a guess.
+const SPOT_UV_SCALE: f32 = 0.5 / 0.525;
+
+/// The `g_AltModelMatrix` of a shadowed or cookie spot light's scattering.
+fn spot_volume_projection(l: &SceneLight) -> Mat4 {
+    Mat4::from_scale(Vec3::new(SPOT_UV_SCALE, SPOT_UV_SCALE, 1.0))
+        * spot_view_proj(&SpotShadow {
+            origin: l.position,
+            direction: l.direction,
+            outer_cone: l.outer_cone,
+            radius: l.radius,
+        })
+}
+
 impl FrameBuilder<'_> {
     /// Whether the scene's lit materials sample shadow maps.
     pub(super) fn shadow_mapping(&self) -> bool {
         self.light_combos
             .get("LIGHTS_SHADOW_MAPPING")
+            .is_some_and(|v| v == "1")
+    }
+
+    /// Whether the scene's lit materials sample a light cookie.
+    pub(super) fn light_cookie(&self) -> bool {
+        self.light_combos
+            .get("LIGHTS_COOKIE")
             .is_some_and(|v| v == "1")
     }
 
@@ -181,15 +215,28 @@ impl FrameBuilder<'_> {
         };
         let by_kind = LightsByKind::new(lights);
         let shadowed_points = LightsByKind::shadowed(&by_kind.points);
+        let shadowed_spots = LightsByKind::shadowed(&by_kind.spots);
+        let cookie_texture = wpe_scene::cookie_light(lights)
+            .and_then(|l| l.cookie.as_deref())
+            .and_then(|name| self.cache.store.get(self.vfs, name))
+            .map(|t| self.upload(&t, "volumetrics cookie"));
         let sphere = proxy_sphere();
         let quality = quality(postprocessing).to_string();
 
         for (i, light) in casting.into_iter().enumerate() {
             let point = light.kind != LightKind::Spot;
-            let shadow = point
-                .then(|| shadowed_points.iter().position(|l| l.id == light.id))
-                .flatten()
+            let shadowed = if point {
+                &shadowed_points
+            } else {
+                &shadowed_spots
+            };
+            let shadow = shadowed
+                .iter()
+                .position(|l| l.id == light.id)
                 .filter(|_| self.shadow_mapping());
+            let cookie = cookie_texture
+                .clone()
+                .filter(|_| !point && by_kind.cookie == Some(light.id));
             // The back faces' depth lands in this target's depth buffer.
             let back_target = self.target(
                 format!("_rt_volumetricsBack{i}"),
@@ -212,7 +259,7 @@ impl FrameBuilder<'_> {
             };
             let mut fronts = Vec::new();
             for fullscreen in [false, true] {
-                let combos: BTreeMap<String, String> = [
+                let mut combos: BTreeMap<String, String> = [
                     ("QUALITY", quality.as_str()),
                     ("POINTLIGHT", if point { "1" } else { "0" }),
                     ("FULLSCREEN", if fullscreen { "1" } else { "0" }),
@@ -222,6 +269,10 @@ impl FrameBuilder<'_> {
                 .into_iter()
                 .map(|(k, v)| (k.to_owned(), v.to_owned()))
                 .collect();
+                // Tested with `#ifdef`: only defined for the cookie light.
+                if cookie.is_some() {
+                    combos.insert("COOKIE".to_owned(), "1".to_owned());
+                }
                 let Some(mut r) = self.resolve_with(
                     &label,
                     &pass("volumetricsfront", Blending::Additive),
@@ -237,6 +288,9 @@ impl FrameBuilder<'_> {
                     r.textures[0] = Some(TexRef::ShadowAtlas);
                 }
                 r.textures[1] = Some(TexRef::Depth(back_target));
+                if let Some(cookie) = &cookie {
+                    r.textures[2] = Some(TexRef::Asset(cookie.clone()));
+                }
                 r.textures[3] = Some(TexRef::Depth(TargetId::DEFAULT));
                 fronts.push(r);
             }
@@ -290,6 +344,7 @@ impl FrameBuilder<'_> {
                 front: front_step,
                 fullscreen: fullscreen_step,
                 shadow,
+                cookie: cookie.is_some(),
                 sphere: (light.position, light.radius),
             });
         }
@@ -381,8 +436,19 @@ impl Volumetrics {
             let point = l.kind != LightKind::Spot;
             let shadow = v.shadow.zip(layout.as_ref());
             let cos = |deg: f32| deg.to_radians().cos();
+            if !point && (v.shadow.is_some() || v.cookie) {
+                let projection = spot_volume_projection(l).to_cols_array().to_vec();
+                for step in [v.front, v.fullscreen] {
+                    renderer.set_uniform(step, "g_AltModelMatrix", projection.clone());
+                }
+            }
             let vars: [[f32; 4]; 5] = [
-                shadow.map_or([0.0; 4], |(k, layout)| layout.point_transform(k)),
+                match shadow {
+                    Some((k, layout)) if point => layout.point_transform(k),
+                    // Shadowed spots' tiles follow the shadowed points'.
+                    Some((k, layout)) => layout.spot_transform(shadows.points.len() + k),
+                    None => [0.0; 4],
+                },
                 if point {
                     [l.radius, 0.0, 0.0, l.intensity]
                 } else {

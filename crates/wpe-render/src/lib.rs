@@ -17,7 +17,7 @@ pub use material::{
 pub use renderer::{Draw, ImageDraw, SceneRenderer, Step};
 pub use shadow::{
     DirectionalShadow, PointShadow, ShadowLayout, ShadowLights, SpotShadow, point_compensation,
-    point_projection_info,
+    point_projection_info, spot_view_proj,
 };
 pub use targets::{DEFAULT_FORMAT, HDR_FORMAT, TargetDesc, TargetId, TargetSize};
 pub use texture::{GpuTexture, upload_texture};

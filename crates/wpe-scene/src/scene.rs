@@ -55,6 +55,8 @@ pub struct Scene {
     /// `general.ambientcolor` and `general.skylightcolor`.
     pub ambient_color: Vec3,
     pub skylight_color: Vec3,
+    /// `general.fogdistance*` / `general.fogheight*`.
+    pub fog: crate::Fog,
 }
 
 /// One entry of [`Scene::draw_order`].
@@ -592,6 +594,7 @@ impl Scene {
             lights,
             ambient_color: vec3(*props.value(&general.ambientcolor)),
             skylight_color: vec3(*props.value(&general.skylightcolor)),
+            fog: crate::Fog::from_general(general, props),
         }
     }
 
@@ -753,6 +756,7 @@ fn scene_light(nodes: &HashMap<i32, Node>, props: &UserProperties, l: &LightObje
         density: 1.0,
         volumetrics_exponent: 1.0,
         cascades: crate::light::DEFAULT_CASCADES,
+        cookie: None,
     };
     crate::light::apply_light_extras(&mut light, &l.extra, props);
     light.set_transform(light.motion.transform_at(0.0));

@@ -340,8 +340,23 @@ impl Wallpaper {
             &mut self.text,
         );
 
+        // The lit shaders' cookie sampler shows the cookie light's texture.
+        cache.store.alias(
+            vfs,
+            wpe_scene::COOKIE_ALIAS,
+            wpe_scene::cookie_light(&scene.lights).and_then(|l| l.cookie.as_deref()),
+        );
+
         let mut builder = FrameBuilder::new(gpu, vfs, cache);
         builder.set_hdr(scene.hdr);
+        builder.set_scene_combos(
+            scene
+                .fog
+                .combos()
+                .into_iter()
+                .map(|(k, v)| (k, v.to_string()))
+                .collect(),
+        );
         builder.set_parallax(scene.parallax, scene.camera.scene_size);
         let lights = scene.light_uniforms();
         builder.set_models(
@@ -395,7 +410,7 @@ impl Wallpaper {
         for (step, name, scale) in &frame.texel_uniforms {
             self.renderer.set_texel_uniform(*step, name, *scale);
         }
-        for (name, values) in &lights.uniforms {
+        for (name, values) in lights.uniforms.iter().chain(&scene.fog.uniforms()) {
             self.renderer.set_global_uniform(name, values);
         }
         let casters = shadow::casters(&objects(&self.scene_json), &self.props, &frame.layer_steps);

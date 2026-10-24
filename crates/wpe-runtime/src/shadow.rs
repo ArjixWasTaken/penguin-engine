@@ -16,6 +16,12 @@ use crate::frame::{LayerSteps, Volumetrics};
 /// cascades follow its perspective camera.
 pub(crate) fn shadow_lights(lights: &[SceneLight], perspective: bool) -> ShadowLights {
     let by_kind = LightsByKind::new(lights);
+    let spot = |l: &SceneLight| SpotShadow {
+        origin: l.position,
+        direction: l.direction,
+        outer_cone: l.outer_cone,
+        radius: l.radius,
+    };
     ShadowLights {
         points: LightsByKind::shadowed(&by_kind.points)
             .iter()
@@ -26,13 +32,9 @@ pub(crate) fn shadow_lights(lights: &[SceneLight], perspective: bool) -> ShadowL
             .collect(),
         spots: LightsByKind::shadowed(&by_kind.spots)
             .iter()
-            .map(|l| SpotShadow {
-                origin: l.position,
-                direction: l.direction,
-                outer_cone: l.outer_cone,
-                radius: l.radius,
-            })
+            .map(|l| spot(l))
             .collect(),
+        cookie: by_kind.unshadowed_cookie().map(spot),
         directionals: LightsByKind::shadowed(&by_kind.directionals)
             .iter()
             .map(|l| DirectionalShadow {

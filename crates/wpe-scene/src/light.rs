@@ -13,6 +13,14 @@ pub const MAX_LIGHTS_PER_KIND: usize = 4;
 pub const SHADOW_QUALITY: i32 = 3;
 /// `cascadedistance0..2` when a light has none (the editor's values).
 pub const DEFAULT_CASCADES: [f32; 3] = [700.0, 1500.0, 2800.0];
+/// A light's `cookie` texture when it has `usecookie` but no `cookie`: the
+/// string next to them in `wallpaper64.exe` (`materials/cookie/` holds
+/// `flashlight1..4`).
+pub const DEFAULT_COOKIE: &str = "cookie/flashlight1";
+/// The texture name the lit shaders' cookie sampler defaults to
+/// (`COOKIE_SAMPLER`, `"default":"_alias_lightCookie"`); it stands for the
+/// scene's cookie light's texture.
+pub const COOKIE_ALIAS: &str = "_alias_lightCookie";
 
 /// A light object's `light` string.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -78,6 +86,9 @@ pub struct SceneLight {
     /// `cascadedistance0..2`: how far from the camera a directional light's
     /// shadow cascades reach.
     pub cascades: [f32; 3],
+    /// `cookie` texture of a spot light with `usecookie`: projected through
+    /// the cone, it colours the light instead of the cone's falloff.
+    pub cookie: Option<String>,
 }
 
 impl SceneLight {
@@ -105,6 +116,12 @@ impl SceneLight {
             )
     }
 
+    /// Whether the light projects a cookie texture (spot lights only, like
+    /// the lighting code's `spotcookie` / `spotshadowcookie` variants).
+    pub fn has_cookie(&self) -> bool {
+        self.visible && self.kind == LightKind::Spot && self.cookie.is_some()
+    }
+
     pub fn color_intensity(&self) -> Vec3 {
         self.color * self.intensity
     }
@@ -124,11 +141,11 @@ impl SceneLight {
     }
 }
 
-/// Read a light object's shadow and volumetric settings (`castshadow`,
-/// `castvolumetrics`, `density`, `volumetricsexponent`,
-/// `cascadedistance0..2`) from its otherwise unparsed keys. Absent keys
-/// keep `light`'s values; Wallpaper Engine leaves `castvolumetrics` out
-/// unless it is on.
+/// Read a light object's shadow, volumetric and cookie settings
+/// (`castshadow`, `castvolumetrics`, `density`, `volumetricsexponent`,
+/// `cascadedistance0..2`, `usecookie`, `cookie`) from its otherwise
+/// unparsed keys. Absent keys keep `light`'s values; Wallpaper Engine
+/// leaves `castvolumetrics` out unless it is on.
 pub fn apply_light_extras(
     light: &mut SceneLight,
     extra: &serde_json::Map<String, serde_json::Value>,
@@ -159,11 +176,35 @@ pub fn apply_light_extras(
             *cascade = v;
         }
     }
+    if let Some(v) = flag("usecookie") {
+        light.cookie = v.then(|| {
+            let texture = extra.get("cookie").and_then(|c| {
+                let d = Dynamic::<String>::from_value(c.clone()).ok()?;
+                Some(props.value(&d))
+            });
+            texture
+                .filter(|t| !t.is_empty())
+                .unwrap_or_else(|| DEFAULT_COOKIE.to_owned())
+        });
+    }
+}
+
+/// The scene's cookie light: the first visible spot light with a cookie.
+/// Wallpaper Engine allows one at a time (its editor: "Only {{limit}} spot
+/// light with a projected texture can be used at the same time. Others will
+/// be reverted to normal lights"), and the lit shaders have one
+/// `COOKIE_SAMPLER`.
+pub fn cookie_light(lights: &[SceneLight]) -> Option<&SceneLight> {
+    lights.iter().find(|l| l.has_cookie())
 }
 
 /// The visible lights the per-kind arrays hold, by kind, in array order:
 /// scene order with shadow-casting lights first (the lit shaders sample
 /// shadow maps for the first `LIGHTS_<KIND>_SHADOW` lights of a kind).
+/// Spot lights go: shadowed with the cookie (`LIGHTS_SPOT_SHADOW_COOKIE`),
+/// other shadowed ones (together `LIGHTS_SPOT_SHADOW`), the unshadowed
+/// cookie light (`LIGHTS_SPOT_COOKIE`), the rest; the shadowed and cookie
+/// spots' projections lead `g_LFeature_ShadowProjection` in that order.
 #[derive(Debug, Default)]
 pub struct LightsByKind<'a> {
     /// `point` and `lpoint` lights.
@@ -171,25 +212,40 @@ pub struct LightsByKind<'a> {
     pub spots: Vec<&'a SceneLight>,
     pub tubes: Vec<&'a SceneLight>,
     pub directionals: Vec<&'a SceneLight>,
+    /// Id of the cookie light ([`cookie_light`]), when it is among `spots`.
+    pub cookie: Option<i32>,
 }
 
 impl<'a> LightsByKind<'a> {
     pub fn new(lights: &'a [SceneLight]) -> Self {
+        let cookie = cookie_light(lights).map(|l| l.id);
         let of_kind = |kinds: &[LightKind]| -> Vec<&SceneLight> {
             let mut ls: Vec<&SceneLight> = lights
                 .iter()
                 .filter(|l| l.visible && kinds.contains(&l.kind))
                 .collect();
-            ls.sort_by_key(|l| !l.casts_shadow());
+            ls.sort_by_key(|l| (!l.casts_shadow(), Some(l.id) != cookie));
             ls.truncate(MAX_LIGHTS_PER_KIND);
             ls
         };
+        let spots = of_kind(&[LightKind::Spot]);
+        let cookie = cookie.filter(|id| spots.iter().any(|l| l.id == *id));
         Self {
             points: of_kind(&[LightKind::Point, LightKind::LPoint]),
-            spots: of_kind(&[LightKind::Spot]),
+            spots,
             tubes: of_kind(&[LightKind::Tube]),
             directionals: of_kind(&[LightKind::Directional]),
+            cookie,
         }
+    }
+
+    /// The cookie light, when it is unshadowed (the shadowed one has its
+    /// projection among the shadow maps').
+    pub fn unshadowed_cookie(&self) -> Option<&'a SceneLight> {
+        self.spots
+            .iter()
+            .copied()
+            .find(|l| Some(l.id) == self.cookie && !l.casts_shadow())
     }
 
     /// The shadow-casting lights among `lights` (a kind's list).
@@ -257,7 +313,10 @@ impl LightUniforms {
 /// their kind's arrays (see [`LightsByKind`]), `LIGHTS_POINT_SHADOW`,
 /// `LIGHTS_SPOT_SHADOW` and `LIGHTS_DIRECTIONAL_SHADOW` count them and
 /// `LIGHTS_SHADOW_MAPPING_QUALITY` is [`SHADOW_QUALITY`]; the shadow maps'
-/// own uniforms come from the renderer.
+/// own uniforms come from the renderer. With a cookie light
+/// `LIGHTS_COOKIE` is 1 and `LIGHTS_SPOT_SHADOW_COOKIE` or
+/// `LIGHTS_SPOT_COOKIE` (names from `wallpaper64.exe`) place it in the spot
+/// arrays; its projection is the renderer's too.
 pub fn light_uniforms(lights: &[SceneLight], ambient: Vec3, skylight: Vec3) -> LightUniforms {
     let visible: Vec<&SceneLight> = lights.iter().filter(|l| l.visible).collect();
 
@@ -359,6 +418,18 @@ pub fn light_uniforms(lights: &[SceneLight], ambient: Vec3, skylight: Vec3) -> L
     .into_iter()
     .map(|(n, v)| (n.to_owned(), v))
     .collect();
+    if let Some(id) = by_kind.cookie {
+        let shadowed = spots.iter().any(|l| l.id == id && l.casts_shadow());
+        out.combos.retain(|(n, _)| n != "LIGHTS_COOKIE");
+        out.combos.extend(
+            [
+                ("LIGHTS_COOKIE", 1),
+                ("LIGHTS_SPOT_SHADOW_COOKIE", shadowed as i32),
+                ("LIGHTS_SPOT_COOKIE", !shadowed as i32),
+            ]
+            .map(|(n, v)| (n.to_owned(), v)),
+        );
+    }
     if shadows {
         out.combos.extend(
             [
@@ -400,6 +471,7 @@ mod tests {
             density: 1.0,
             volumetrics_exponent: 1.0,
             cascades: DEFAULT_CASCADES,
+            cookie: None,
         };
         l.set_transform(Mat4::from_translation(position));
         l
@@ -533,6 +605,63 @@ mod tests {
         assert_eq!((l.density, l.volumetrics_exponent), (2.5, 3.0));
         assert_eq!(l.cascades, [700.0, 900.0, 2800.0]);
         assert!(l.casts_volumetrics() && l.casts_shadow());
+    }
+
+    #[test]
+    fn cookie_lights() {
+        let mut extra = serde_json::json!({"usecookie": true});
+        let mut a = light(LightKind::Spot, Vec3::ZERO);
+        apply_light_extras(
+            &mut a,
+            extra.as_object().unwrap(),
+            &UserProperties::default(),
+        );
+        assert_eq!(a.cookie.as_deref(), Some(DEFAULT_COOKIE));
+        extra["cookie"] = "cookie/flashlight3".into();
+        let mut b = light(LightKind::Spot, Vec3::ONE);
+        b.id = 1;
+        apply_light_extras(
+            &mut b,
+            extra.as_object().unwrap(),
+            &UserProperties::default(),
+        );
+        assert_eq!(b.cookie.as_deref(), Some("cookie/flashlight3"));
+        let mut plain = light(LightKind::Spot, Vec3::splat(2.0));
+        plain.id = 2;
+
+        // Only the first cookie light counts; it leads the unshadowed spots.
+        let lights = [plain.clone(), a.clone(), b.clone()];
+        assert_eq!(cookie_light(&lights).map(|l| l.id), Some(0));
+        let u = light_uniforms(&lights, Vec3::ZERO, Vec3::ZERO);
+        assert_eq!(u.combo("LIGHTS_COOKIE"), Some(1));
+        assert_eq!(u.combo("LIGHTS_SPOT_COOKIE"), Some(1));
+        assert_eq!(u.combo("LIGHTS_SPOT_SHADOW_COOKIE"), Some(0));
+        assert_eq!(&u.uniform("g_LSpot_Origin").unwrap()[..3], [0.0; 3]);
+        assert_eq!(&u.uniform("g_LSpot_Origin").unwrap()[4..7], [2.0; 3]);
+        assert_eq!(
+            u.combos
+                .iter()
+                .filter(|(n, _)| n == "LIGHTS_COOKIE")
+                .count(),
+            1
+        );
+
+        // Shadowed spots come first, the shadowed cookie light leading.
+        let mut a2 = a.clone();
+        a2.cast_shadow = true;
+        let mut shadowed = plain.clone();
+        shadowed.cast_shadow = true;
+        let lights = [shadowed, plain, a2];
+        let by_kind = LightsByKind::new(&lights);
+        assert_eq!(
+            by_kind.spots.iter().map(|l| l.id).collect::<Vec<_>>(),
+            [0, 2, 2]
+        );
+        assert!(by_kind.unshadowed_cookie().is_none());
+        let u = light_uniforms(&lights, Vec3::ZERO, Vec3::ZERO);
+        assert_eq!(u.combo("LIGHTS_SPOT_SHADOW_COOKIE"), Some(1));
+        assert_eq!(u.combo("LIGHTS_SPOT_COOKIE"), Some(0));
+        assert_eq!(u.combo("LIGHTS_SPOT_SHADOW"), Some(2));
     }
 
     #[test]

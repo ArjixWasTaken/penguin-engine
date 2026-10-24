@@ -21,6 +21,12 @@
 //!
 //! Atlas size, tile resolution, the near planes and the depth bias are not
 //! fixed by the shaders; they are this module's choices.
+//!
+//! The scene's cookie spot light projects its texture through the same kind
+//! of view-projection (the generated lighting code samples `COOKIE_SAMPLER`
+//! at `CalculateProjectedCoords(worldPos, g_LFeature_ShadowProjection[i])`);
+//! unshadowed, it has no tile and its projection follows the shadowed
+//! spots'.
 
 use std::collections::HashMap;
 
@@ -69,6 +75,9 @@ pub struct ShadowLights {
     pub points: Vec<PointShadow>,
     pub spots: Vec<SpotShadow>,
     pub directionals: Vec<DirectionalShadow>,
+    /// The unshadowed cookie spot light (`LIGHTS_SPOT_COOKIE`), which needs
+    /// a projection but no shadow map.
+    pub cookie: Option<SpotShadow>,
     /// `LIGHTS_SHADOW_MAPPING_QUALITY`, 1 to 4.
     pub quality: u32,
     /// Cascades follow the perspective camera (3D scenes) rather than the
@@ -226,6 +235,12 @@ impl ShadowLayout {
         self.uv(self.point_tile(k))
     }
 
+    /// `g_LFeature_ShadowProjectionTransform` of the spot light in `block`
+    /// (shadowed spots follow the shadowed point lights' blocks).
+    pub fn spot_transform(&self, block: usize) -> [f32; 4] {
+        self.uv(self.spot_tile(block))
+    }
+
     /// `g_Texture<N>Texel` of the atlas.
     pub fn texel(&self) -> [f32; 4] {
         let (w, h) = (self.size.0 as f32, self.size.1 as f32);
@@ -241,8 +256,9 @@ pub(crate) struct ShadowView {
     pub view_proj: Mat4,
 }
 
-/// A spot light's view-projection.
-fn spot_view_proj(s: &SpotShadow) -> Mat4 {
+/// A spot light's view-projection: its outer cone fills a square
+/// (`g_LFeature_ShadowProjection`, and the cookie's projection).
+pub fn spot_view_proj(s: &SpotShadow) -> Mat4 {
     let dir = s.direction.normalize_or(-Vec3::Z);
     let up = if dir.y.abs() > 0.99 { Vec3::Z } else { Vec3::Y };
     let view = glam::camera::rh::view::look_to_mat4(s.origin, dir, up);
@@ -342,6 +358,7 @@ pub(crate) fn frame_views(
         transform.extend(layout.uv(rect));
         block += 1;
     }
+    cookie_projection(lights, &mut projection, &mut transform);
     let (camera, camera_proj) = if lights.perspective {
         (globals.perspective, globals.perspective_proj)
     } else {
@@ -376,6 +393,28 @@ pub(crate) fn frame_views(
         uniforms.push(("g_LFeature_ShadowProjectionTransform".to_owned(), transform));
     }
     (uniforms, views)
+}
+
+/// Append the unshadowed cookie light's projection (its tile transform is
+/// unused).
+fn cookie_projection(lights: &ShadowLights, projection: &mut Vec<f32>, transform: &mut Vec<f32>) {
+    if let Some(c) = &lights.cookie {
+        projection.extend(spot_view_proj(c).to_cols_array());
+        transform.extend([0.0; 4]);
+    }
+}
+
+/// The uniforms of a cookie light without any shadow maps.
+fn cookie_uniforms(lights: &ShadowLights) -> Vec<(String, Vec<f32>)> {
+    let (mut projection, mut transform) = (Vec::new(), Vec::new());
+    cookie_projection(lights, &mut projection, &mut transform);
+    if projection.is_empty() {
+        return Vec::new();
+    }
+    vec![
+        ("g_LFeature_ShadowProjection".to_owned(), projection),
+        ("g_LFeature_ShadowProjectionTransform".to_owned(), transform),
+    ]
 }
 
 const SHADER: &str = r#"
@@ -693,7 +732,7 @@ impl ShadowMaps {
         self.allocate(gpu);
         let Some(layout) = &self.layout else {
             self.frame_views.clear();
-            return Vec::new();
+            return cookie_uniforms(&self.lights);
         };
         let (mut uniforms, views) = frame_views(&self.lights, layout, globals);
         uniforms.push(("g_Texture6Texel".to_owned(), layout.texel().to_vec()));
@@ -1083,6 +1122,30 @@ mod tests {
         };
         let (uniforms, views) = frame_views(&lights, &layout, &globals);
         assert_eq!(views.len(), 4);
+        // A cookie light's projection goes between the spots' and the
+        // cascades'.
+        let cookie = SpotShadow {
+            origin: Vec3::new(4.0, 10.0, 0.0),
+            ..lights.spots[0]
+        };
+        let with_cookie = ShadowLights {
+            cookie: Some(cookie),
+            ..lights.clone()
+        };
+        let (u2, views2) = frame_views(&with_cookie, &layout, &globals);
+        assert_eq!(views2.len(), 4);
+        let p2 = &u2
+            .iter()
+            .find(|(n, _)| n == "g_LFeature_ShadowProjection")
+            .unwrap()
+            .1;
+        assert_eq!(p2.len(), 16 * 5);
+        assert_eq!(p2[16..32], spot_view_proj(&cookie).to_cols_array());
+        let alone = cookie_uniforms(&ShadowLights {
+            cookie: Some(cookie),
+            ..Default::default()
+        });
+        assert_eq!(alone[0].1, spot_view_proj(&cookie).to_cols_array());
         let get = |name: &str| &uniforms.iter().find(|(n, _)| n == name).unwrap().1;
         assert_eq!(get("g_LFeature_ShadowProjection").len(), 16 * 4);
         assert_eq!(get("g_LFeature_ShadowProjectionTransform").len(), 4 * 4);

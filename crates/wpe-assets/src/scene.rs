@@ -108,6 +108,21 @@ pub struct SceneGeneral {
     pub windstrength: Dynamic<f32>,
     /// Light quality settings (kept raw).
     pub lightconfig: Option<Value>,
+    /// Distance fog (the editor's scene options "Distance Fog": enabled,
+    /// start, end, color, start density, end density).
+    pub fogdistance: Dynamic<bool>,
+    pub fogdistancestart: Dynamic<f32>,
+    pub fogdistanceend: Dynamic<f32>,
+    pub fogdistancecolor: Dynamic<Vec3>,
+    pub fogdistancestartdensity: Dynamic<f32>,
+    pub fogdistanceenddensity: Dynamic<f32>,
+    /// Height fog, the same settings along the world Y axis.
+    pub fogheight: Dynamic<bool>,
+    pub fogheightstart: Dynamic<f32>,
+    pub fogheightend: Dynamic<f32>,
+    pub fogheightcolor: Dynamic<Vec3>,
+    pub fogheightstartdensity: Dynamic<f32>,
+    pub fogheightenddensity: Dynamic<f32>,
 }
 
 impl Default for SceneGeneral {
@@ -149,6 +164,20 @@ impl Default for SceneGeneral {
             windenabled: d(false),
             windstrength: d(1.0),
             lightconfig: None,
+            // Fog defaults are guesses: off, fading in from nothing to
+            // fully fogged over the range.
+            fogdistance: d(false),
+            fogdistancestart: d(0.0),
+            fogdistanceend: d(1000.0),
+            fogdistancecolor: d(VecN::splat(1.0)),
+            fogdistancestartdensity: d(0.0),
+            fogdistanceenddensity: d(1.0),
+            fogheight: d(false),
+            fogheightstart: d(0.0),
+            fogheightend: d(100.0),
+            fogheightcolor: d(VecN::splat(1.0)),
+            fogheightstartdensity: d(1.0),
+            fogheightenddensity: d(0.0),
         }
     }
 }

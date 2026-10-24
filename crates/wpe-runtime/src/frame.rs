@@ -688,6 +688,8 @@ pub struct FrameBuilder<'a> {
     /// Model materials' light combos (`LIGHTS_*`), script geometry, and
     /// whether every model draws in perspective (3D scenes).
     light_combos: BTreeMap<String, String>,
+    /// Combos every material gets: the scene's fog (`FOG_DIST`, ...).
+    scene_combos: BTreeMap<String, String>,
     model_data: SharedModelDatas,
     is_3d: bool,
     /// `_rt_Reflection` and its blur buffer, when the scene renders planar
@@ -755,6 +757,7 @@ impl<'a> FrameBuilder<'a> {
             bindings: Vec::new(),
             parallax: None,
             light_combos: BTreeMap::new(),
+            scene_combos: BTreeMap::new(),
             model_data: Default::default(),
             is_3d: false,
             reflection: None,
@@ -888,17 +891,23 @@ impl<'a> FrameBuilder<'a> {
         targets: &HashMap<String, TargetId>,
         combos: &BTreeMap<String, String>,
     ) -> Option<Resolved> {
-        // With shadow mapping on, every lit material samples the shadow
-        // atlas, image layers included: they all get the light combos.
-        let shadowed;
-        let combos = if self.shadow_mapping() {
-            shadowed = self
-                .light_combos
-                .clone()
+        // With shadow mapping or a cookie light on, every lit material
+        // samples the shadow atlas or the cookie, image layers included:
+        // they all get the light combos. Every material gets the fog's.
+        let lit = self.shadow_mapping() || self.light_cookie();
+        let merged: BTreeMap<String, String>;
+        let combos = if lit || !self.scene_combos.is_empty() {
+            let light = if lit {
+                self.light_combos.clone()
+            } else {
+                BTreeMap::new()
+            };
+            merged = light
                 .into_iter()
+                .chain(self.scene_combos.clone())
                 .chain(combos.clone())
                 .collect();
-            &shadowed
+            &merged
         } else {
             combos
         };
@@ -1130,6 +1139,11 @@ impl<'a> FrameBuilder<'a> {
         self.light_combos = light_combos;
         self.model_data = model_data;
         self.is_3d = is_3d;
+    }
+
+    /// Combos every material gets (the scene's fog).
+    pub fn set_scene_combos(&mut self, combos: BTreeMap<String, String>) {
+        self.scene_combos = combos;
     }
 
     /// Add every layer and model in draw order (see [`Self::layers`]).
