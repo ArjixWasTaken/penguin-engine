@@ -193,7 +193,10 @@ impl State {
     /// Output `name`'s own entry, made from what it shows (`wallpaper`,
     /// with the last one's properties when it is that one) if it has none.
     fn entry(&mut self, name: &str, wallpaper: &Path) -> &mut SavedOutput {
-        let last = self.last.as_ref().filter(|last| last.wallpaper == wallpaper);
+        let last = self
+            .last
+            .as_ref()
+            .filter(|last| last.wallpaper == wallpaper);
         let inherited = last.map(|last| last.properties.clone()).unwrap_or_default();
         let volume = last.and_then(|last| last.volume);
         self.outputs

@@ -432,8 +432,9 @@ impl App {
             self.state
                 .set_wallpaper(&spec.name, &spec.path, spec.properties.clone());
         }
+        self.stopped.retain(|s| s.output != spec.output);
         self.apply_audio();
-        self.apply_volumes();
+        self.apply_rules();
         self.update_status();
         if let Some(i) = self.screen_for(&spec.output) {
             self.emit_properties(i);

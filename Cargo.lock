@@ -12578,6 +12578,7 @@ dependencies = [
  "clap",
  "dirs",
  "glam 0.34.1",
+ "libpulse-binding",
  "pollster 1.0.1",
  "raw-window-handle",
  "sd-notify",
@@ -14104,6 +14105,7 @@ version = "0.1.0"
 dependencies = [
  "serde",
  "serde_json",
+ "toml 1.1.8+spec-1.1.0",
 ]
 
 [[package]]

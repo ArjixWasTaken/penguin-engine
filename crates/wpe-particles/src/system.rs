@@ -129,6 +129,8 @@ pub struct Subsystem {
     time_scale: f32,
     rate_scale: f32,
     over: InstanceOverride,
+    /// Quality multiplier of the budget and emission rates.
+    density: f32,
     /// Extra particles to emit at the next step (`emitParticles`).
     burst: u32,
     pub(crate) instances: Vec<Instance>,
@@ -283,12 +285,27 @@ impl Subsystem {
             }
         }
         self.cp_defs = cp_defs;
-        let count = if over.count > 0.0 { over.count } else { 1.0 };
+        self.time_scale = over.time_scale();
+        self.over = over.clone();
+        self.apply_budget();
+    }
+
+    /// Scale the particle budget and emission rates by `density`.
+    pub(crate) fn set_density(&mut self, density: f32) {
+        self.density = density;
+        self.apply_budget();
+    }
+
+    /// The budget and rate scale from the override's count and the density.
+    fn apply_budget(&mut self) {
+        let count = if self.over.count > 0.0 {
+            self.over.count
+        } else {
+            1.0
+        } * self.density;
         self.max_count =
             ((self.def.max_count as f32 * count).ceil() as u32).clamp(1, MAX_PARTICLES);
-        self.time_scale = over.time_scale();
         self.rate_scale = count;
-        self.over = over.clone();
     }
 
     pub(crate) fn add_burst(&mut self, count: u32) {
@@ -339,6 +356,7 @@ pub(crate) fn load_tree(
         time_scale: over.time_scale(),
         rate_scale: count,
         over: over.clone(),
+        density: 1.0,
         burst: 0,
         instances: Vec::new(),
         time: 0.0,

@@ -8,3 +8,6 @@ description = "Control protocol of the wallpaper daemon (line-delimited JSON ove
 [dependencies]
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.154"
+
+[dev-dependencies]
+toml = "1.1.8"

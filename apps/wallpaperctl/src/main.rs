@@ -7,7 +7,10 @@ use std::process::ExitCode;
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 use serde_json::Value;
-use wpe_ipc::{Client, Fill, OutputProperties, Request, Response, Status, Values, VersionInfo};
+use wpe_ipc::{
+    Client, Fill, OutputProperties, Request, Response, SettingsPatch, Signals, Status, Values,
+    VersionInfo,
+};
 
 #[derive(Parser)]
 #[command(about = "Control the wallpaper daemon")]
@@ -86,6 +89,14 @@ enum Command {
     },
     /// Frame rate cap (0 follows the display).
     Fps { fps: u32 },
+    /// Particles, in percent of what wallpapers ask for.
+    Particles {
+        #[arg(value_parser = clap::value_parser!(u32).range(0..=100))]
+        percent: u32,
+    },
+    /// What the rules see: other applications' windows, sound, the battery,
+    /// time without input.
+    Signals,
     /// How wallpapers fill the outputs: auto (crop, but fit a portrait
     /// wallpaper on a landscape output and the reverse), crop, fit or stretch.
     Fill {
@@ -170,6 +181,13 @@ fn request(command: Command) -> Request {
         Command::Volume { volume } => Request::Volume { volume },
         Command::WallpaperVolume { output, volume } => Request::WallpaperVolume { output, volume },
         Command::Fps { fps } => Request::Fps { fps },
+        Command::Particles { percent } => Request::Settings {
+            patch: SettingsPatch {
+                particles: Some(percent),
+                ..Default::default()
+            },
+        },
+        Command::Signals => Request::Signals,
         Command::Fill { output, fill } => Request::Fill { output, fill },
         Command::Reload => Request::ReloadSettings,
         Command::Quit => Request::Quit,
@@ -197,12 +215,14 @@ fn print_status(status: &Status) {
         n => n.to_string(),
     };
     println!(
-        "settings: fps {fps}, audio {}, volume {}%, fill {}, layer {}, passthrough {}",
+        "settings: fps {fps}, audio {}, volume {}%, fill {}, layer {}, passthrough {}, particles {}%, {} rules",
         if s.audio { "on" } else { "off" },
         s.volume,
         s.fill,
         s.layer,
-        s.passthrough
+        s.passthrough,
+        s.particles,
+        s.rules.iter().filter(|r| r.enabled).count()
     );
     if status.outputs.is_empty() {
         println!("no outputs");
@@ -229,6 +249,67 @@ fn print_status(status: &Status) {
             }
             None => println!("  no wallpaper"),
         }
+        let l = &o.limits;
+        if !l.is_none() {
+            let mut held = vec![format!("{:?}", l.playback).to_lowercase()];
+            held.extend(l.fps.map(|f| format!("{f} fps")));
+            held.extend(l.particles.map(|p| format!("{p}% particles")));
+            println!("  held: {} ({})", held.join(", "), l.because.join(", "));
+        }
+    }
+}
+
+fn print_signals(s: &Signals) {
+    match &s.windows {
+        None => println!("windows: unknown (the compositor doesn't tell)"),
+        Some(windows) if windows.is_empty() => println!("windows: none"),
+        Some(windows) => {
+            println!("windows:");
+            for w in windows {
+                let mut state = Vec::new();
+                for (on, name) in [
+                    (w.focused, "focused"),
+                    (w.maximized, "maximized"),
+                    (w.fullscreen, "fullscreen"),
+                    (w.minimized, "minimized"),
+                ] {
+                    if on {
+                        state.push(name);
+                    }
+                }
+                let process = w.process.as_deref().unwrap_or("?");
+                let output = w.output.as_deref().unwrap_or("hidden");
+                println!(
+                    "  {} ({process}) on {output}{}{}: {}",
+                    w.app,
+                    if state.is_empty() { "" } else { ", " },
+                    state.join(", "),
+                    w.title
+                );
+            }
+        }
+    }
+    match &s.audio {
+        None => println!("sound: unknown (no sound server)"),
+        Some(apps) if apps.is_empty() => println!("sound: none playing"),
+        Some(apps) => println!("sound: {}", apps.join(", ")),
+    }
+    match s.battery {
+        None => println!("battery: none"),
+        Some(b) => println!(
+            "battery: {}{}",
+            if b.discharging {
+                "discharging"
+            } else {
+                "plugged in"
+            },
+            b.percent.map(|p| format!(", {p}%")).unwrap_or_default()
+        ),
+    }
+    match s.idle {
+        None => println!("idle: unknown"),
+        Some(0) => println!("idle: no"),
+        Some(seconds) => println!("idle: {seconds} s or more"),
     }
 }
 
@@ -334,6 +415,9 @@ fn main() -> ExitCode {
         }
         if let Some(version) = &response.version {
             print_version(version);
+        }
+        if let Some(signals) = &response.signals {
+            print_signals(signals);
         }
     }
     match response.into_result() {

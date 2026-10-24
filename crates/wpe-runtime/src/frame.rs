@@ -155,6 +155,11 @@ impl ParticleInstance {
         self.system.set_override(&over);
     }
 
+    /// Keep and emit `density` (0..1) of the particles asked for.
+    pub fn set_density(&mut self, density: f32) {
+        self.system.set_density(density);
+    }
+
     pub fn emit(&mut self, count: u32) {
         self.system.emit(count);
     }

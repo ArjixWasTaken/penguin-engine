@@ -232,6 +232,8 @@ pub struct Wallpaper {
     paused_videos: Vec<Arc<video::VideoStream>>,
     /// Master volume of sound layers and a video wallpaper's sound, 0..1.
     volume: f32,
+    /// Particle quality, 0..1 of what the scene asks for.
+    particle_density: f32,
     /// `project.json`.
     project: wpe_assets::Project,
     /// Smoothed cursor over the output, 0..1 with Y down.
@@ -534,6 +536,7 @@ impl PreparedWallpaper {
             paused_at: None,
             paused_videos: Vec::new(),
             volume: 1.0,
+            particle_density: 1.0,
             project: self.project,
             pointer: Vec2::splat(0.5),
             pointer_target: Vec2::splat(0.5),
@@ -814,6 +817,11 @@ impl Wallpaper {
         self.is_3d = build.is_3d;
         self.bindings = build.bindings;
         self.particles = build.particles;
+        if self.particle_density < 1.0 {
+            for particles in &mut self.particles {
+                particles.set_density(self.particle_density);
+            }
+        }
         self.parallax_delay = build.parallax_delay;
         self.shake = build.shake;
         build.built
@@ -986,6 +994,18 @@ impl Wallpaper {
         !self.sounds.is_empty()
             || self.is_web()
             || (self.video_wallpaper && self.videos().iter().any(|(_, s)| s.has_audio_track()))
+    }
+
+    /// Keep and emit `density` (0..1) of the particles the scene asks for.
+    pub fn set_particle_density(&mut self, density: f32) {
+        let density = density.clamp(0.0, 1.0);
+        if density == self.particle_density {
+            return;
+        }
+        self.particle_density = density;
+        for particles in &mut self.particles {
+            particles.set_density(density);
+        }
     }
 
     /// Master volume (0..1) of the sound layers and a video wallpaper's sound.

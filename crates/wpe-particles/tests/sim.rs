@@ -82,6 +82,19 @@ fn maxcount_caps_population() {
 }
 
 #[test]
+fn density_scales_budget_and_rate() {
+    let mut capped = system(base(1000.0, 100.0, 40), None);
+    capped.set_density(0.5);
+    run(&mut capped, 1.0, 30.0);
+    assert_eq!(capped.particle_count(), 20);
+    let mut slow = system(base(10.0, 100.0, 1000), None);
+    slow.set_density(0.5);
+    run(&mut slow, 2.0, 60.0);
+    let n = slow.particle_count();
+    assert!((9..=11).contains(&n), "{n} particles");
+}
+
+#[test]
 fn lifetime_limits_population_and_particles_die() {
     let mut def = base(100.0, 0.5, 1000);
     def["emitter"][0]["duration"] = json!(1.0);

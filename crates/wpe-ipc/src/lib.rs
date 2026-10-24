@@ -33,6 +33,10 @@ use std::time::Duration;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
+mod rules;
+
+pub use rules::{Battery, Condition, Limits, Playback, Rule, Signals, WindowInfo, WindowState};
+
 /// The protocol version, in [`VersionInfo::protocol`].
 pub const PROTOCOL: u32 = 2;
 
@@ -127,6 +131,10 @@ pub struct Settings {
     pub layer: Layer,
     /// Let pointer input through to what is underneath.
     pub passthrough: bool,
+    /// Particles, in percent of what wallpapers ask for. (Protocol 2.)
+    pub particles: u32,
+    /// What holds wallpapers back, and when. (Protocol 2.)
+    pub rules: Vec<Rule>,
 }
 
 impl Settings {
@@ -139,6 +147,8 @@ impl Settings {
             fill: patch.fill.unwrap_or(self.fill),
             layer: patch.layer.unwrap_or(self.layer),
             passthrough: patch.passthrough.unwrap_or(self.passthrough),
+            particles: patch.particles.unwrap_or(self.particles),
+            rules: patch.rules.clone().unwrap_or_else(|| self.rules.clone()),
         }
     }
 }
@@ -160,6 +170,11 @@ pub struct SettingsPatch {
     pub layer: Option<Layer>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub passthrough: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub particles: Option<u32>,
+    /// All the rules, replacing the old ones.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rules: Option<Vec<Rule>>,
 }
 
 impl Default for Settings {
@@ -171,6 +186,8 @@ impl Default for Settings {
             fill: Fill::Auto,
             layer: Layer::Background,
             passthrough: false,
+            particles: 100,
+            rules: Rule::defaults(),
         }
     }
 }
@@ -269,6 +286,9 @@ pub enum Request {
         #[serde(flatten)]
         patch: SettingsPatch,
     },
+    /// What the rules are checked against: [`Response::signals`].
+    /// (Protocol 2.)
+    Signals,
 }
 
 /// The daemon's answer to one request. `ok` tells whether it succeeded;
@@ -284,6 +304,8 @@ pub struct Response {
     pub properties: Option<Vec<OutputProperties>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub version: Option<VersionInfo>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub signals: Option<Signals>,
 }
 
 /// The answer to [`Request::Version`].
@@ -352,6 +374,11 @@ pub struct OutputStatus {
     /// The wallpaper being loaded for it (a `set`), if any. (Protocol 2.)
     #[serde(default)]
     pub loading: Option<String>,
+    /// What the rules holding make of its wallpaper. With
+    /// [`Playback::Stop`] the wallpaper is unloaded (`wallpaper` still
+    /// tells which). (Protocol 2.)
+    #[serde(default, skip_serializing_if = "Limits::is_none")]
+    pub limits: Limits,
 }
 
 #[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
@@ -577,7 +604,10 @@ mod tests {
             ..info
         };
         let wire = serde_json::to_value(&info).unwrap();
-        assert_eq!((&wire["sound"], &wire["volume"]), (&json!(true), &json!(30)));
+        assert_eq!(
+            (&wire["sound"], &wire["volume"]),
+            (&json!(true), &json!(30))
+        );
         assert_eq!(serde_json::from_value::<WallpaperInfo>(wire).unwrap(), info);
     }
 
@@ -854,6 +884,7 @@ mod tests {
                     fps: 60.0,
                     fill: Fill::Crop,
                     loading: None,
+                    limits: Limits::default(),
                 }],
             }),
             properties: Some(vec![OutputProperties {

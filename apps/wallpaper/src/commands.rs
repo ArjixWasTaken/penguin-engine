@@ -88,7 +88,7 @@ pub fn property_infos(
 /// What `screen` shows. For a preset item: the item's path, id and title,
 /// the dependency's type, and the dependency.
 /// What `screen` shows; it plays at `volume` percent of the global volume.
-fn wallpaper_info(screen: &Screen, volume: u32) -> WallpaperInfo {
+pub fn wallpaper_info(screen: &Screen, volume: u32) -> WallpaperInfo {
     let (path, wallpaper) = (&screen.path, &screen.wallpaper);
     let project = wallpaper.project();
     let kind = match &project.kind {
@@ -166,6 +166,17 @@ fn check_settings(settings: &Settings) -> Result<(), String> {
     if settings.fps > MAX_FPS {
         return Err(format!("fps {} is above {MAX_FPS}", settings.fps));
     }
+    if settings.particles > 100 {
+        return Err(format!("particles {}% is above 100%", settings.particles));
+    }
+    for rule in &settings.rules {
+        if rule.fps.is_some_and(|f| f == 0 || f > MAX_FPS) {
+            return Err(format!("a rule's fps must be within 1..={MAX_FPS}"));
+        }
+        if rule.particles.is_some_and(|p| p > 100) {
+            return Err("a rule's particles must be within 0..=100%".to_owned());
+        }
+    }
     Ok(())
 }
 
@@ -178,6 +189,7 @@ impl control::Handler for App {
                 | Request::Properties { .. }
                 | Request::Property { .. }
                 | Request::Version
+                | Request::Signals
         );
         let result = match request {
             Request::Status => Ok(Response {
@@ -200,6 +212,10 @@ impl control::Handler for App {
             }
             Request::Version => Ok(Response {
                 version: Some(version()),
+                ..Response::ok()
+            }),
+            Request::Signals => Ok(Response {
+                signals: Some(self.signals()),
                 ..Response::ok()
             }),
             Request::Subscribe => {
@@ -283,17 +299,23 @@ impl App {
                         .and_then(|s| s.fill)
                         .unwrap_or(self.settings.fill)
                 });
+                let stopped = self.stopped.iter().find(|s| s.output == o.output);
                 OutputStatus {
                     name: o.name.clone(),
                     width: logical.0,
                     height: logical.1,
                     scale,
                     wallpaper: screen
-                        .map(|s| wallpaper_info(s, self.state.volume(&s.name, &s.path))),
-                    paused: screen.is_some_and(|s| s.paused),
+                        .map(|s| wallpaper_info(s, self.state.volume(&s.name, &s.path)))
+                        .or_else(|| stopped.map(|s| s.info.clone())),
+                    paused: screen.is_some_and(|s| s.frozen()) || stopped.is_some(),
                     fps: screen
-                        .filter(|s| !s.paused)
+                        .filter(|s| !s.frozen())
                         .map_or(0.0, |s| s.stats.current()),
+                    limits: screen
+                        .map(|s| s.held.clone())
+                        .or_else(|| stopped.map(|s| s.limits.clone()))
+                        .unwrap_or_default(),
                     fill,
                     loading: self
                         .loads
@@ -630,10 +652,8 @@ impl App {
 
     /// Play each screen's wallpaper at its own volume times the global one.
     pub fn apply_volumes(&mut self) {
-        let global = self.settings.volume as f32 / 100.0;
-        for s in &mut self.screens {
-            let own = self.state.volume(&s.name, &s.path) as f32 / 100.0;
-            s.wallpaper.set_volume(global * own);
+        for i in 0..self.screens.len() {
+            self.apply_limits(i);
         }
     }
 
@@ -736,6 +756,12 @@ impl App {
         }
         if old.audio != new.audio {
             self.apply_audio();
+        }
+        if old.rules != new.rules {
+            self.watch_idle();
+        }
+        if old.rules != new.rules || old.particles != new.particles {
+            self.apply_rules();
         }
         if old.fps != new.fps {
             let now = Instant::now();

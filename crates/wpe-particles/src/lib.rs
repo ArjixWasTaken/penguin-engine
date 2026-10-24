@@ -147,6 +147,16 @@ impl ParticleSystem {
         }
     }
 
+    /// Scale how many particles every subsystem keeps and emits (a quality
+    /// setting; 1 is what the wallpaper asks for). Particles over a lower
+    /// budget live out their lives.
+    pub fn set_density(&mut self, density: f32) {
+        let density = density.clamp(0.0, 1.0);
+        for sub in &mut self.subs {
+            sub.set_density(density);
+        }
+    }
+
     /// Emit `count` extra particles from the root at the next update
     /// (`emitParticles`).
     pub fn emit(&mut self, count: u32) {

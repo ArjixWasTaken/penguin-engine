@@ -8,10 +8,15 @@ mod commands;
 mod control;
 mod desktop_click;
 mod events;
+mod idle;
 mod loading;
+mod power;
 mod preset;
+mod rules;
+mod sound_watch;
 mod state;
 mod systemd;
+mod windows;
 
 use std::collections::BTreeMap;
 use std::io::Read;
@@ -63,7 +68,7 @@ use smithay_client_toolkit::{
     delegate_compositor, delegate_layer, delegate_output, delegate_pointer, delegate_registry,
     delegate_seat, delegate_simple, registry_handlers,
 };
-use wpe_ipc::{Fill, Settings};
+use wpe_ipc::{Fill, Limits, Playback, Settings};
 use wpe_render::{Gpu, wgpu};
 use wpe_runtime::{FillMode, Wallpaper};
 
@@ -269,7 +274,12 @@ struct Screen {
     /// A `--fps` timer is armed.
     timer_pending: bool,
     next_frame: Instant,
+    /// Paused by request (rules may pause it too: `held`).
     paused: bool,
+    /// What the rules make of it.
+    held: Limits,
+    /// Since when a rule stops it (it is unloaded a little later).
+    stop_since: Option<Instant>,
     /// A right press went to the desktop; its release replays the click.
     right_held: bool,
     /// Needs a frame even while paused (resized, changed).
@@ -321,6 +331,8 @@ impl Screen {
             timer_pending: false,
             next_frame: Instant::now(),
             paused: false,
+            held: Limits::default(),
+            stop_since: None,
             right_held: false,
             dirty: true,
             fill,
@@ -373,7 +385,7 @@ impl Screen {
     /// current one.
     fn replace_wallpaper(&mut self, mut wallpaper: Wallpaper, path: PathBuf, item: preset::Item) {
         wallpaper.fill = fill_mode(self.fill);
-        wallpaper.set_paused(self.paused);
+        wallpaper.set_paused(self.frozen());
         let started = Instant::now();
         drop(std::mem::replace(&mut self.wallpaper, wallpaper));
         tracing::debug!(
@@ -395,8 +407,35 @@ impl Screen {
 
     fn set_paused(&mut self, paused: bool) {
         self.paused = paused;
-        self.wallpaper.set_paused(paused);
-        self.dirty = true;
+        self.apply_pause();
+    }
+
+    /// Paused by request or by a rule (a stop pauses until it unloads).
+    fn frozen(&self) -> bool {
+        self.paused || self.held.playback >= Playback::Pause
+    }
+
+    fn apply_pause(&mut self) {
+        let frozen = self.frozen();
+        if frozen != self.wallpaper.paused() {
+            self.wallpaper.set_paused(frozen);
+            self.dirty = true;
+        }
+    }
+
+    /// Play at `volume` (0..1), unless a rule mutes it.
+    fn apply_volume(&mut self, volume: f32) {
+        let muted = self.held.playback >= Playback::Mute;
+        self.wallpaper.set_volume(if muted { 0.0 } else { volume });
+    }
+
+    /// The frame rate cap, given the global one (0 follows the display).
+    fn fps_cap(&self, global: u32) -> u32 {
+        match (global, self.held.fps) {
+            (0, Some(fps)) => fps,
+            (global, Some(fps)) => global.min(fps),
+            (global, None) => global,
+        }
     }
 
     /// Take no input until [`Self::set_passthrough`] (a right click goes
@@ -488,6 +527,17 @@ struct App {
     fractional_manager: Option<SimpleGlobal<WpFractionalScaleManagerV1, 1>>,
     /// Hands right clicks to the desktop (KWin); None elsewhere.
     desktop_clicks: Option<desktop_click::DesktopClicks>,
+    /// Other applications' windows (KWin); None elsewhere.
+    windows: Option<windows::Windows>,
+    /// Time without input; None when the compositor doesn't tell.
+    idle: Option<idle::Idle>,
+    /// Applications playing sound; None while the sound server is out of reach.
+    sound: Option<Vec<String>>,
+    battery: Option<wpe_ipc::Battery>,
+    /// The rules are checked shortly.
+    rules_pending: bool,
+    /// Outputs whose wallpaper a rule stopped.
+    stopped: Vec<rules::Stopped>,
     pointers: Vec<WlPointer>,
     outputs: Vec<KnownOutput>,
     screens: Vec<Screen>,
@@ -717,11 +767,11 @@ impl App {
         if !screen.configured || screen.frame_pending || screen.timer_pending {
             return;
         }
-        if screen.paused && !screen.dirty {
+        if screen.frozen() && !screen.dirty {
             return;
         }
         let now = Instant::now();
-        let fps = self.settings.fps;
+        let fps = screen.fps_cap(self.settings.fps);
         if fps > 0 && screen.next_frame > now {
             screen.timer_pending = true;
             let surface = screen.layer.wl_surface().clone();
@@ -805,7 +855,7 @@ impl App {
             self.screens
                 .iter()
                 .map(|s| {
-                    let paused = if s.paused { " (paused)" } else { "" };
+                    let paused = if s.frozen() { " (paused)" } else { "" };
                     format!("{}: {}{paused}", s.name, s.wallpaper.title)
                 })
                 .collect::<Vec<_>>()
@@ -943,6 +993,35 @@ fn main() -> Result<()> {
     if desktop_clicks.is_none() {
         tracing::debug!("no org_kde_kwin_fake_input: right clicks stay with the wallpaper");
     }
+    let windows = windows::Windows::bind(&globals, &qh);
+    if windows.is_none() {
+        tracing::info!("the compositor doesn't tell about windows: window rules never hold");
+    }
+    let idle = idle::Idle::bind(&globals, &qh);
+
+    // The rules' other signals: sound from a thread, the battery polled.
+    let (sound_tx, sound_rx) = channel::channel();
+    sound_watch::watch(sound_tx);
+    event_loop
+        .handle()
+        .insert_source(sound_rx, |event, _, app: &mut App| {
+            if let channel::Event::Msg(playing) = event {
+                app.sound = playing;
+                app.signals_changed();
+            }
+        })
+        .map_err(|e| anyhow::anyhow!("cannot watch the sound server: {}", e.error))?;
+    event_loop
+        .handle()
+        .insert_source(Timer::immediate(), |_, _, app: &mut App| {
+            let battery = power::battery();
+            if battery != app.battery {
+                app.battery = battery;
+                app.signals_changed();
+            }
+            TimeoutAction::ToDuration(Duration::from_secs(20))
+        })
+        .map_err(|e| anyhow::anyhow!("cannot arm a timer: {e}"))?;
     let mut app = App {
         args,
         assets,
@@ -957,6 +1036,12 @@ fn main() -> Result<()> {
         viewporter,
         fractional_manager,
         desktop_clicks,
+        windows,
+        idle,
+        sound: None,
+        battery: power::battery(),
+        rules_pending: false,
+        stopped: Vec::new(),
         pointers: Vec::new(),
         outputs: Vec::new(),
         screens: Vec::new(),
@@ -980,6 +1065,7 @@ fn main() -> Result<()> {
     for _ in 0..2 {
         wayland.queue().roundtrip(&mut app)?;
     }
+    app.watch_idle();
     wayland
         .insert(event_loop.handle())
         .map_err(|e| anyhow::anyhow!("cannot watch the Wayland socket: {}", e.error))?;
@@ -1080,6 +1166,7 @@ impl OutputHandler for App {
             keep
         });
         self.screens.retain(|s| s.output != output);
+        self.stopped.retain(|s| s.output != output);
         self.cancel_loads(&output);
         // Sound moves to the new first screen.
         self.apply_audio();
@@ -1129,7 +1216,9 @@ impl SeatHandler for App {
         &mut self.seat_state
     }
 
-    fn new_seat(&mut self, _: &Connection, _: &QueueHandle<Self>, _: WlSeat) {}
+    fn new_seat(&mut self, _: &Connection, _: &QueueHandle<Self>, _: WlSeat) {
+        self.watch_idle();
+    }
 
     fn new_capability(
         &mut self,

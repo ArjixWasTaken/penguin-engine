@@ -434,7 +434,10 @@ impl VideoStream {
 
     /// Whether the file has a sound track (known once it has opened).
     pub fn has_audio_track(&self) -> bool {
-        let count = self.mpv.get_property::<i64>("track-list/count").unwrap_or(0);
+        let count = self
+            .mpv
+            .get_property::<i64>("track-list/count")
+            .unwrap_or(0);
         (0..count).any(|i| {
             self.mpv
                 .get_property::<String>(&format!("track-list/{i}/type"))
