@@ -13,6 +13,8 @@ regex = "1.13.1"
 serde = "1.0.229"
 texture2ddecoder = "0.1.2"
 wpe-assets = { version = "0.1.0", path = "../../crates/wpe-assets" }
+wpe-mdl = { version = "0.1.0", path = "../../crates/wpe-mdl" }
+wpe-particles = { version = "0.1.0", path = "../../crates/wpe-particles" }
 wpe-runtime = { version = "0.1.0", path = "../../crates/wpe-runtime" }
 wpe-scene = { version = "0.1.0", path = "../../crates/wpe-scene" }
 wpe-vfs = { version = "0.1.0", path = "../../crates/wpe-vfs" }

@@ -1,3 +1,5 @@
+mod mdl;
+mod particles;
 mod scenes;
 mod shaders;
 mod tex;
@@ -52,6 +54,32 @@ enum Command {
         #[arg(long)]
         assets: Vec<PathBuf>,
     },
+    /// Parse every .mdl in workshop scenes and stock assets; evaluate puppet bones for 2 s.
+    ScanMdl {
+        #[arg(long)]
+        assets: PathBuf,
+        #[arg(long)]
+        workshop: PathBuf,
+        /// Print every puppet layer.
+        #[arg(long)]
+        verbose: bool,
+    },
+    /// Load every particle object in workshop scenes, simulate it and report unsupported features.
+    ScanParticles {
+        #[arg(long)]
+        assets: PathBuf,
+        #[arg(long)]
+        workshop: PathBuf,
+        /// Simulated seconds per particle system.
+        #[arg(long, default_value_t = 2.0)]
+        seconds: f32,
+        /// Only scan the first N wallpapers.
+        #[arg(long)]
+        limit: Option<usize>,
+        /// Show example objects per group.
+        #[arg(long)]
+        verbose: bool,
+    },
     /// Parse project, scene, model, material and effect JSON of every workshop scene.
     ScanScenes {
         /// Wallpaper Engine's stock assets/ directory.
@@ -76,6 +104,18 @@ fn main() -> Result<()> {
             verbose,
         } => shaders::scan_shaders(&assets, &workshop, limit, verbose),
         Command::ScanTex { workshop, assets } => tex::scan_tex(workshop.as_deref(), &assets),
+        Command::ScanMdl {
+            assets,
+            workshop,
+            verbose,
+        } => mdl::scan_mdl(&assets, &workshop, verbose),
+        Command::ScanParticles {
+            assets,
+            workshop,
+            seconds,
+            limit,
+            verbose,
+        } => particles::scan_particles(&assets, &workshop, seconds, limit, verbose),
         Command::ScanScenes { assets, workshop } => scenes::scan_scenes(&assets, &workshop),
     }
 }
