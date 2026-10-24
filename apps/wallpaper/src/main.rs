@@ -766,7 +766,7 @@ fn main() -> Result<()> {
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| "info,wgpu_core=warn,wgpu_hal=warn,naga=error,script=warn,webrender=warn,layout=warn,style=warn,net=warn,fonts=warn,constellation=warn,storage=error,profile_traits=error".into()),
+                .unwrap_or_else(|_| "info,wgpu_core=warn,wgpu_hal=warn,naga=error,script=error,servo_base=error,paint=warn,webrender=warn,layout=warn,style=warn,net=warn,fonts=warn,constellation=warn,storage=error,profile_traits=error".into()),
         )
         .init();
     let args = Args::parse();
