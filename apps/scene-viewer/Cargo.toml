@@ -18,5 +18,7 @@ wpe-render = { version = "0.1.0", path = "../../crates/wpe-render" }
 wpe-runtime = { version = "0.1.0", path = "../../crates/wpe-runtime" }
 
 [features]
-# Web wallpapers, rendered with Servo (a long first build).
+default = ["web"]
+# Web wallpapers, rendered with Servo (a long first build; leave it out with
+# `--no-default-features`).
 web = ["wpe-runtime/web"]

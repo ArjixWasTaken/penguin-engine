@@ -24,9 +24,10 @@ Video textures need libmpv. Frames are decoded with VA-API and handed to wgpu as
 without touching the CPU; this needs the Vulkan backend and a Mesa EGL driver. Otherwise
 mpv decodes in software and frames are uploaded (`WPE_VIDEO=cpu` forces this path).
 
-Web wallpapers are rendered with [Servo](https://servo.org), behind the `web` cargo feature
-(off by default; the first build downloads a prebuilt SpiderMonkey and takes a few minutes):
-`cargo build --release -p penguind --features web`, likewise for `scene-viewer`. Pages paint on
+Web wallpapers are rendered with [Servo](https://servo.org) (the `web` cargo feature, on by
+default; the first build downloads a prebuilt SpiderMonkey and takes a few minutes). To build
+without them: `cargo build --release -p penguind --no-default-features`, likewise for
+`scene-viewer`. Pages paint on
 the GPU through an offscreen EGL context and frames reach wgpu as dma-bufs, like video frames;
 pages animate in step with the wallpaper's frames, so the frame rate limit, pausing and hidden
 outputs apply to them. `WPE_WEB=cpu` forces Mesa's software renderer (WebGL content doesn't show
@@ -34,7 +35,7 @@ there). Page media needs GStreamer.
 
 ## Status
 
-Plays Wallpaper Engine scene, video and (with the `web` feature) web wallpapers; application
+Plays Wallpaper Engine scene, video and web wallpapers; application
 wallpapers are not supported. Video wallpapers play their `.mp4` full screen through libmpv (GPU decoding, the
 fill modes, sound with `--audio`). Scenes render with their own shaders, compiled from WE's
 GLSL/HLSL dialect to SPIR-V and run through wgpu:

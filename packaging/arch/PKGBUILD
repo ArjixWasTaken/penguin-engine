@@ -1,9 +1,5 @@
 # Maintainer: ArjixWasTaken <me@arjix.dev>
 
-# Web wallpapers (Servo): set to 1 to build them in. The build takes much
-# longer and downloads a prebuilt SpiderMonkey.
-: "${_web:=0}"
-
 pkgname=penguin-engine-git
 _pkgname=penguin-engine
 pkgver=0.1.0.r0.g0000000
@@ -16,11 +12,16 @@ depends=(
   'alsa-lib'
   'cairo'
   'dbus'
+  'fontconfig'
+  'freetype2'
   'gcc-libs'
   'gdk-pixbuf2'
   'glib2'
   'glibc'
   'glslang'
+  'gst-plugins-bad-libs'
+  'gst-plugins-base-libs'
+  'gstreamer'
   'gtk3'
   'libglvnd'
   'libpulse'
@@ -32,15 +33,11 @@ depends=(
   'wayland'
   'webkit2gtk-4.1'
 )
-makedepends=('cargo' 'git' 'nodejs' 'pnpm')
+makedepends=('cargo' 'clang' 'git' 'nodejs' 'pnpm' 'python')
 optdepends=(
   'steam: Wallpaper Engine, whose assets and workshop wallpapers are played'
   'vulkan-driver: GPU rendering'
 )
-if ((_web)); then
-  depends+=('fontconfig' 'freetype2' 'gst-plugins-bad-libs' 'gst-plugins-base-libs' 'gstreamer')
-  makedepends+=('clang' 'python')
-fi
 provides=("$_pkgname")
 conflicts=("$_pkgname")
 options=('!lto')
@@ -66,9 +63,7 @@ build() {
   export RUSTUP_TOOLCHAIN=stable
   export CARGO_TARGET_DIR=target
   pnpm -C apps/penguin-engine/ui build
-  local features=()
-  ((_web)) && features=(--features penguind/web)
-  cargo build --frozen --release -p penguind -p penguinctl -p penguin-engine "${features[@]}"
+  cargo build --frozen --release -p penguind -p penguinctl -p penguin-engine
 }
 
 check() {
