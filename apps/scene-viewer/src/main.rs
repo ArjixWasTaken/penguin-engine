@@ -35,7 +35,7 @@ struct Args {
     /// clicking across the scene now and then (exercises scripts).
     #[arg(long, default_value_t = 1)]
     frames: u32,
-    /// Play sound layers and react to system audio (window mode).
+    /// Play sound layers, a video wallpaper's sound, and react to system audio.
     #[arg(long)]
     audio: bool,
     /// Log the frame rate every few seconds.
@@ -134,6 +134,9 @@ fn screenshot(args: &Args, assets: &std::path::Path, out: &std::path::Path) -> R
         wallpaper.set_user_property(&gpu, name, value.clone());
     }
     wallpaper.fill = args.fill.into();
+    if args.audio {
+        wallpaper.set_audio(true);
+    }
     for frame in 1..args.frames {
         wallpaper.time_override = Some(args.time + frame as f32 / 30.0);
         // Every half second, press and release somewhere on a 4x4 grid.

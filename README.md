@@ -19,8 +19,10 @@ mpv decodes in software and frames are uploaded (`WPE_VIDEO=cpu` forces this pat
 
 ## Status
 
-Renders Wallpaper Engine scene wallpapers with their own shaders, compiled from WE's GLSL/HLSL
-dialect to SPIR-V and run through wgpu:
+Plays Wallpaper Engine scene and video wallpapers (web and application wallpapers are not
+supported). Video wallpapers play their `.mp4` full screen through libmpv (GPU decoding, the
+fill modes, sound with `--audio`). Scenes render with their own shaders, compiled from WE's
+GLSL/HLSL dialect to SPIR-V and run through wgpu:
 
 - image layers with materials, blend modes, `colorBlendMode`, compose/fullscreen layers
 - image effect chains (ping-pong buffers, FBOs, copy commands, layer dependencies)

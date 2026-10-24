@@ -42,6 +42,13 @@ impl Project {
             .as_deref()
             .is_some_and(|k| k.eq_ignore_ascii_case("scene"))
     }
+
+    /// Whether this is a video wallpaper (its `file` is the video).
+    pub fn is_video(&self) -> bool {
+        self.kind
+            .as_deref()
+            .is_some_and(|k| k.eq_ignore_ascii_case("video"))
+    }
 }
 
 /// The `general` block of `project.json`.

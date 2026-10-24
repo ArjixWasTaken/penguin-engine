@@ -12,6 +12,7 @@ glow = "0.18.0"
 khronos-egl = { version = "6.0.0", features = ["static"] }
 libmpv2 = "6.0.0"
 libmpv2-sys = "4.0.1"
+mp4parse = "0.17.0"
 serde_json = { version = "1.0.154", features = ["preserve_order"] }
 thiserror = "2.0.21"
 tracing = "0.1.44"

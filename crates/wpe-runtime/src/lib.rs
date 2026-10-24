@@ -12,6 +12,7 @@ mod shadow;
 mod sound;
 mod storage;
 mod video;
+mod video_wallpaper;
 
 use std::path::Path;
 use std::sync::Arc;
@@ -183,6 +184,9 @@ pub struct Wallpaper {
     moving_lights: Option<(Vec<wpe_scene::SceneLight>, Vec3, Vec3)>,
     /// Shadow maps and volumetric passes of the lights.
     light_fx: shadow::LightEffects,
+    /// A video wallpaper plays its video's sound when audio is on.
+    video_wallpaper: bool,
+    audio_enabled: bool,
     /// Script geometry, shared with the scripts.
     model_data: model_data::SharedModelDatas,
     renderer: SceneRenderer,
@@ -237,8 +241,16 @@ impl Wallpaper {
         assets: &Path,
         path: &Path,
     ) -> Result<Self, LoadError> {
-        let files = WallpaperFiles::open_with_assets_dir(assets, path)?;
+        let mut files = WallpaperFiles::open_with_assets_dir(assets, path)?;
         let props = wpe_scene::UserProperties::from_project(&files.project);
+        let mut store = TextureStore::default();
+        let video_wallpaper = files.video.is_some();
+        if let Some((mp4, width, height)) = files.video.take() {
+            store.insert(
+                video_wallpaper::TEXTURE,
+                video_wallpaper::texture(mp4, width, height),
+            );
+        }
         let mut wallpaper = Self {
             title: files
                 .project
@@ -260,11 +272,9 @@ impl Wallpaper {
             model_data: Default::default(),
             renderer: SceneRenderer::new(gpu, output_format),
             scene_json: files.scene_json.clone(),
-            cache: Some(FrameCache::new(
-                gpu,
-                TextureStore::default(),
-                white_texture(),
-            )),
+            cache: Some(FrameCache::new(gpu, store, white_texture())),
+            video_wallpaper,
+            audio_enabled: false,
             text: None,
             bindings: Vec::new(),
             particles: Vec::new(),
@@ -562,6 +572,8 @@ impl Wallpaper {
     /// analysing system audio for audio-reactive shaders.
     pub fn set_audio(&mut self, enabled: bool) {
         self.sounds.enable(enabled);
+        self.audio_enabled = enabled;
+        self.apply_video_audio();
         if !enabled {
             self.audio = None;
             return;
@@ -570,6 +582,16 @@ impl Wallpaper {
             self.audio = wpe_audio::AudioCapture::start()
                 .inspect_err(|e| tracing::warn!("audio capture unavailable: {e}"))
                 .ok();
+        }
+    }
+
+    /// A video wallpaper's sound follows the audio setting (videos inside
+    /// scenes stay silent, as in Wallpaper Engine).
+    fn apply_video_audio(&self) {
+        if self.video_wallpaper {
+            for (_, stream) in self.videos() {
+                stream.set_audio(self.audio_enabled.then_some(1.0));
+            }
         }
     }
 

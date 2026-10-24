@@ -370,6 +370,25 @@ impl VideoStream {
         }
     }
 
+    /// Play the video's sound at `volume` (0..1), or none (the default).
+    pub fn set_audio(&self, volume: Option<f32>) {
+        match volume {
+            Some(volume) => {
+                self.set(
+                    "volume",
+                    f64::from(volume.clamp(0.0, 1.0)) * 100.0,
+                    "setting volume",
+                );
+                self.set("aid", "auto", "enabling video sound");
+                tracing::debug!(
+                    "video sound: track {:?}",
+                    self.mpv.get_property::<String>("aid").ok()
+                );
+            }
+            None => self.set("aid", "no", "muting video"),
+        }
+    }
+
     /// Scripts often call this every frame; unchanged state isn't resent.
     pub fn set_paused(&self, paused: bool) {
         if self.mpv.get_property::<bool>("pause").ok() != Some(paused) {

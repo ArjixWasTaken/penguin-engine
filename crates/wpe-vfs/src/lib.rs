@@ -7,6 +7,7 @@
 //! case-insensitive and the most recently mounted layer wins.
 
 mod alias;
+mod memory;
 mod path;
 mod physical;
 mod pkg;
@@ -14,6 +15,7 @@ mod pkg;
 use std::borrow::Cow;
 
 pub use alias::AliasFs;
+pub use memory::MemoryFs;
 pub use path::normalize;
 pub use physical::PhysicalFs;
 pub use pkg::{PkgEntry, PkgFs};
