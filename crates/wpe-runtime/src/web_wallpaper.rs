@@ -116,7 +116,7 @@ mod enabled {
             properties: super::properties_json(project),
             general: serde_json::json!({ "fps": 60 }),
             network: network_policy(),
-            profile_dir: dirs::data_dir().map(|d| d.join("wallpaper-engine-rs/web")),
+            profile_dir: dirs::data_dir().map(|d| d.join("penguin-engine/web")),
             export_frames,
         };
         wpe_web::WebPage::open(options, Duration::from_secs(20))

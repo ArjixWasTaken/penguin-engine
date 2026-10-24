@@ -11,9 +11,9 @@ use std::time::UNIX_EPOCH;
 pub const WIDTH: u32 = 360;
 pub const HEIGHT: u32 = 360;
 
-/// `$XDG_CACHE_HOME/wallpaper-engine-rs/thumbs`.
+/// `$XDG_CACHE_HOME/penguin-engine/thumbs`.
 pub fn cache_dir() -> Option<PathBuf> {
-    Some(dirs::cache_dir()?.join("wallpaper-engine-rs/thumbs"))
+    Some(dirs::cache_dir()?.join("penguin-engine/thumbs"))
 }
 
 /// The cached thumbnail of `preview`, made now if there is none. None when

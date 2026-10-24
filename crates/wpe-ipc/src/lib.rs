@@ -1,4 +1,4 @@
-//! Control protocol of the `wallpaper` daemon.
+//! Control protocol of `penguind`.
 //!
 //! The daemon listens on a Unix stream socket ([`socket_path`]). Clients
 //! send one JSON [`Request`] per line and get one JSON [`Response`] per line
@@ -45,9 +45,9 @@ pub const PROTOCOL: u32 = 2;
 pub type Values = serde_json::Map<String, Value>;
 
 /// File name of the control socket in `$XDG_RUNTIME_DIR`.
-pub const SOCKET_NAME: &str = "wallpaper-engine-rs.sock";
+pub const SOCKET_NAME: &str = "penguin-engine.sock";
 
-/// `$XDG_RUNTIME_DIR/wallpaper-engine-rs.sock`.
+/// `$XDG_RUNTIME_DIR/penguin-engine.sock`.
 pub fn socket_path() -> Option<PathBuf> {
     let dir = std::env::var_os("XDG_RUNTIME_DIR").filter(|d| !d.is_empty())?;
     Some(PathBuf::from(dir).join(SOCKET_NAME))

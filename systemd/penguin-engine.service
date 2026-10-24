@@ -1,0 +1,30 @@
+[Unit]
+Description=Penguin Engine: animated desktop wallpapers (penguind)
+PartOf=graphical-session.target
+After=graphical-session.target
+# plasmashell, so the wallpaper maps above Plasma's own desktop window.
+After=plasma-plasmashell.service
+Requires=penguin-engine.socket
+After=penguin-engine.socket
+
+[Service]
+Type=notify
+NotifyAccess=main
+# Without a wallpaper argument the daemon restores the saved wallpapers; it
+# reads ~/.config/penguin-engine/config.toml. Adjust the path to where
+# the binary is installed (cargo install --path apps/penguind puts it in
+# ~/.cargo/bin).
+ExecStart=%h/.cargo/bin/penguind
+ExecReload=kill -HUP $MAINPID
+Restart=on-failure
+RestartSec=2
+# Readiness waits for the first frame, after the wallpapers load (a heavy
+# scene compiles its shaders first).
+TimeoutStartSec=120
+# The loop pings at half this. Wallpapers load on worker threads, so it is
+# never blocked for long.
+WatchdogSec=15
+Slice=app-graphical.slice
+
+[Install]
+WantedBy=graphical-session.target

@@ -1,5 +1,5 @@
 //! Scripts' `localStorage`, kept per wallpaper between runs in
-//! `<data dir>/wallpaper-engine-rs/storage/<wallpaper>.json`.
+//! `<data dir>/penguin-engine/storage/<wallpaper>.json`.
 
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
@@ -27,7 +27,7 @@ fn key(path: &Path) -> Option<String> {
 impl Storage {
     pub fn for_wallpaper(path: &Path) -> Self {
         let path = dirs::data_dir().zip(key(path)).map(|(data, key)| {
-            data.join("wallpaper-engine-rs/storage")
+            data.join("penguin-engine/storage")
                 .join(format!("{key}.json"))
         });
         Self {

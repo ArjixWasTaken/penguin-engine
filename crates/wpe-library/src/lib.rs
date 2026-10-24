@@ -86,9 +86,34 @@ pub struct Item {
     pub dependency: Option<String>,
 }
 
-/// `$XDG_CONFIG_HOME/wallpaper-engine-rs`.
+/// The directory name under the XDG base directories.
+pub const APP_DIR: &str = "penguin-engine";
+/// The name before the project was Penguin Engine.
+const OLD_APP_DIR: &str = "wallpaper-engine-rs";
+
+/// `$XDG_CONFIG_HOME/penguin-engine`.
 pub fn config_dir() -> Option<PathBuf> {
-    dirs::config_dir().map(|d| d.join("wallpaper-engine-rs"))
+    dirs::config_dir().map(|d| d.join(APP_DIR))
+}
+
+/// Move what older versions kept under `wallpaper-engine-rs` (config,
+/// cache, state, data) to `penguin-engine`, unless that exists already.
+pub fn migrate_dirs() {
+    let bases = [
+        dirs::config_dir(),
+        dirs::cache_dir(),
+        dirs::state_dir(),
+        dirs::data_dir(),
+    ];
+    for base in bases.into_iter().flatten() {
+        let (old, new) = (base.join(OLD_APP_DIR), base.join(APP_DIR));
+        if old.is_dir() && !new.exists() {
+            match std::fs::rename(&old, &new) {
+                Ok(()) => tracing::info!("moved {} to {}", old.display(), new.display()),
+                Err(e) => tracing::warn!("cannot move {} to {}: {e}", old.display(), new.display()),
+            }
+        }
+    }
 }
 
 /// Write `data` to `path` through a temporary file and a rename, creating

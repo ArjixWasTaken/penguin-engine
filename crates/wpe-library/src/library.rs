@@ -50,9 +50,9 @@ pub struct Library {
     pub items: Vec<Item>,
 }
 
-/// `$XDG_CACHE_HOME/wallpaper-engine-rs/library.json`.
+/// `$XDG_CACHE_HOME/penguin-engine/library.json`.
 pub fn default_cache_path() -> Option<PathBuf> {
-    dirs::cache_dir().map(|d| d.join("wallpaper-engine-rs/library.json"))
+    dirs::cache_dir().map(|d| d.join("penguin-engine/library.json"))
 }
 
 /// Bumped when [`Item`] or the scan changes, so old caches are rescanned.

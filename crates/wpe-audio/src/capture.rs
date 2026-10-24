@@ -45,7 +45,7 @@ impl AudioCapture {
         };
         let simple = Simple::new(
             None,
-            "wallpaper-engine-rs",
+            "Penguin Engine",
             Direction::Record,
             Some("@DEFAULT_MONITOR@"),
             "audio spectrum",

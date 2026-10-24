@@ -18,7 +18,7 @@ pub struct Folder {
     pub folders: Vec<Folder>,
 }
 
-/// `$XDG_CONFIG_HOME/wallpaper-engine-rs/folders.json`.
+/// `$XDG_CONFIG_HOME/penguin-engine/folders.json`.
 pub fn default_path() -> Option<PathBuf> {
     crate::config_dir().map(|d| d.join("folders.json"))
 }

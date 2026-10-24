@@ -1,0 +1,12 @@
+[Unit]
+Description=Penguin Engine control socket (penguind)
+PartOf=graphical-session.target
+
+[Socket]
+ListenStream=%t/penguin-engine.sock
+SocketMode=0600
+# The daemon removes nothing it was handed; systemd owns the socket file.
+RemoveOnStop=yes
+
+[Install]
+WantedBy=graphical-session.target

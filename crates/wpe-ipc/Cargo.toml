@@ -3,7 +3,7 @@ name = "wpe-ipc"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
-description = "Control protocol of the wallpaper daemon (line-delimited JSON over a Unix socket)"
+description = "Control protocol of penguind (line-delimited JSON over a Unix socket)"
 
 [dependencies]
 serde = { version = "1.0.229", features = ["derive"] }

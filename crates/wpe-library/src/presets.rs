@@ -1,5 +1,5 @@
 //! Saved property values for a wallpaper:
-//! `$XDG_CONFIG_HOME/wallpaper-engine-rs/presets/<item id>/<name>.json`.
+//! `$XDG_CONFIG_HOME/penguin-engine/presets/<item id>/<name>.json`.
 
 use std::io;
 use std::path::{Path, PathBuf};
@@ -18,7 +18,7 @@ pub struct Preset {
     pub values: Map<String, Value>,
 }
 
-/// `$XDG_CONFIG_HOME/wallpaper-engine-rs/presets`.
+/// `$XDG_CONFIG_HOME/penguin-engine/presets`.
 pub fn default_dir() -> Option<PathBuf> {
     crate::config_dir().map(|d| d.join("presets"))
 }

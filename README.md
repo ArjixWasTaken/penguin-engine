@@ -1,7 +1,14 @@
-# wallpaper-engine-rs
+# Penguin Engine
 
-A Rust ([wgpu](https://wgpu.rs) + [winit](https://github.com/rust-windowing/winit)) renderer for
-[Wallpaper Engine](https://www.wallpaperengine.io/) *scene* wallpapers, aimed at Linux.
+Animated desktop wallpapers for Linux: plays [Wallpaper Engine](https://www.wallpaperengine.io/)
+wallpapers (scene, video and web) as the desktop background on Wayland. Written in Rust on
+[wgpu](https://wgpu.rs). Penguin Engine is an independent project, not affiliated with
+Wallpaper Engine.
+
+- `penguind`: the daemon showing the wallpapers (one per output), controlled over a socket
+- `penguinctl`: its command-line client
+- `penguin-engine`: the app to browse your wallpaper library, apply wallpapers and change
+  their properties and the settings
 
 Work in progress. Format and behaviour knowledge is derived from
 [CaptSilver/wallpaper-scene-renderer](https://github.com/CaptSilver/wallpaper-scene-renderer)
@@ -19,7 +26,7 @@ mpv decodes in software and frames are uploaded (`WPE_VIDEO=cpu` forces this pat
 
 Web wallpapers are rendered with [Servo](https://servo.org), behind the `web` cargo feature
 (off by default; the first build downloads a prebuilt SpiderMonkey and takes a few minutes):
-`cargo build --release -p wallpaper --features web`, likewise for `scene-viewer`. Pages paint on
+`cargo build --release -p penguind --features web`, likewise for `scene-viewer`. Pages paint on
 the GPU through an offscreen EGL context and frames reach wgpu as dma-bufs, like video frames;
 pages animate in step with the wallpaper's frames, so the frame rate limit, pausing and hidden
 outputs apply to them. `WPE_WEB=cpu` forces Mesa's software renderer (WebGL content doesn't show
@@ -62,9 +69,9 @@ GLSL/HLSL dialect to SPIR-V and run through wgpu:
     changes (`Wallpaper::set_user_property`, `scene-viewer --property name=value`),
     `openUserShortcut` (only shortcuts the user bound), `applyGeneralSettings`
 
-`wallpaper` plays them as the desktop background on Wayland (wlr-layer-shell), controlled at
-runtime over a Unix socket (`wallpaperctl`) and run as a systemd user service. Not yet: the
-wallpaper picker UI and X11 desktops.
+`penguind` plays them as the desktop background on Wayland (wlr-layer-shell), controlled at
+runtime over a Unix socket (`penguinctl`, the `penguin-engine` app) and run as a systemd user
+service. Not yet: playlists and X11 desktops.
 
 Debugging aids: `WPE_SCRIPT_AUDIT=<file>` records script requests the runtime doesn't
 handle, `WPE_FAKE_AUDIO=1` feeds a synthetic spectrum, `scene-viewer --frames N` runs N
@@ -87,11 +94,13 @@ wallpaper's load time went (texture decoding, shaders, uploads, pipelines, scrip
 | `crates/wpe-audio` | Sound playback and audio spectrum |
 | `crates/wpe-web` | Web wallpapers: Servo host thread, file serving, Wallpaper Engine's JS API |
 | `crates/wpe-runtime` | Embeddable API tying loading, animation and rendering together |
-| `crates/wpe-ipc` | The `wallpaper` daemon's control protocol (requests, responses, client) |
+| `crates/wpe-ipc` | `penguind`'s control protocol (requests, responses, client) |
+| `crates/wpe-library` | The wallpaper library: Steam workshop items, folders, presets, thumbnails |
 | `apps/scene-viewer` | Windowed scene viewer |
-| `apps/wallpaper` | Desktop background mode (Wayland layer-shell), control socket, systemd |
-| `apps/wallpaperctl` | Command-line client of the `wallpaper` daemon |
-| `systemd/` | systemd user units for `wallpaper` |
+| `apps/penguind` | The daemon: desktop background (Wayland layer-shell), control socket, rules |
+| `apps/penguinctl` | Command-line client of `penguind` |
+| `apps/penguin-engine` | The app (Tauri; its page in `ui/`, Preact) |
+| `systemd/` | systemd user units for `penguind` |
 | `tools/wpe-cli` | Debug tooling (pkg/tex/scene/shader corpus scans) |
 
 ## Scene viewer
@@ -109,7 +118,7 @@ Set `WPE_DUMP_SHADERS=<dir>` to dump the final GLSL of every compiled shader.
 ### Web wallpapers
 
 A web wallpaper's directory is served at `http://<workshop id>.wallpaper.localhost/` (its own
-local storage, kept under `<data dir>/wallpaper-engine-rs/web`). Pages get Wallpaper Engine's
+local storage, kept under `<data dir>/penguin-engine/web`). Pages get Wallpaper Engine's
 JavaScript API: `wallpaperPropertyListener` (`applyUserProperties`, `applyGeneralProperties`
 with the frame rate limit, `setPaused`) and `wallpaperRegisterAudioListener`. They get the
 pointer, all three mouse buttons and the scroll wheel, and lay out at the output's scale. Audio
@@ -126,9 +135,9 @@ Navigating away from the wallpaper and popups are blocked.
 ## Desktop wallpaper (Wayland)
 
 ```sh
-cargo run --release -p wallpaper -- ~/.local/share/Steam/steamapps/workshop/content/431960/<id>
-cargo run --release -p wallpaper -- <wallpaper> --output DP-1 --fps 30 --fill fit --audio
-cargo run --release -p wallpaper -- <wallpaper> --layer bottom --passthrough --property name=value
+cargo run --release -p penguind -- ~/.local/share/Steam/steamapps/workshop/content/431960/<id>
+cargo run --release -p penguind -- <wallpaper> --output DP-1 --fps 30 --fill fit --audio
+cargo run --release -p penguind -- <wallpaper> --layer bottom --passthrough --property name=value
 ```
 
 Needs a compositor with `zwlr_layer_shell_v1` (KDE Plasma, sway, Hyprland, niri, ...). It puts
@@ -143,10 +152,10 @@ reach the wallpaper (parallax, script cursor events) unless `--passthrough` is g
 
 KDE Plasma (6, Wayland): KWin maps the layer-shell `background` layer to its desktop layer,
 the same layer as plasmashell's desktop window (wallpaper, icons, desktop widgets), and
-stacks windows within a layer by mapping order. Started after plasmashell, `wallpaper` on
+stacks windows within a layer by mapping order. Started after plasmashell, `penguind` on
 `background` therefore shows above Plasma's own wallpaper — and above desktop icons and
 widgets, and it takes the desktop's clicks (right-click menu) unless `--passthrough`. If
-plasmashell restarts afterwards it covers the wallpaper again; restart `wallpaper` then.
+plasmashell restarts afterwards it covers the wallpaper again; restart `penguind` then.
 `bottom` maps to KWin's below layer: always above Plasma's desktop, still under normal
 windows and panels. Other players handle Plasma the same way or avoid layer-shell there:
 linux-wallpaperengine users disable the desktop icons (the "Desktop" layout) and add window
@@ -156,27 +165,29 @@ which renders inside plasmashell instead.
 
 ### Control socket
 
-The daemon listens on `$XDG_RUNTIME_DIR/wallpaper-engine-rs.sock` (`--socket` to change it).
-`wallpaperctl` talks to it:
+The daemon listens on `$XDG_RUNTIME_DIR/penguin-engine.sock` (`--socket` to change it).
+`penguinctl` talks to it:
 
 ```sh
-wallpaperctl status                        # outputs, wallpapers, fps, settings
-wallpaperctl set 3566329932                # a workshop id or a path, on every output
-wallpaperctl set --output DP-1 ~/walls/foo # one output
-wallpaperctl properties                    # user properties, with types, ranges, options
-wallpaperctl property sakura false         # value as JSON, or else a string
-wallpaperctl properties-set a=1 b=true     # several at once, one rebuild
-wallpaperctl reset-properties              # back to the wallpaper's (or preset's) values
-wallpaperctl set --prop speed=2 3566329932 # load with property values
-wallpaperctl pause | resume                # [--output X]
-wallpaperctl audio on|off ; wallpaperctl volume 40 ; wallpaperctl fps 30
-wallpaperctl wallpaper-volume 50           # [--output X] this wallpaper, % of the global volume
-wallpaperctl fill fit                      # [--output X] auto | crop | fit | stretch
-wallpaperctl reload                        # re-read config.toml (as SIGHUP does)
-wallpaperctl quit
-wallpaperctl version                       # daemon version, protocol, features (web)
-wallpaperctl watch                         # events as JSON lines, until the daemon goes
-wallpaperctl --json status                 # the raw response
+penguinctl status                        # outputs, wallpapers, fps, settings
+penguinctl set 3566329932                # a workshop id or a path, on every output
+penguinctl set --output DP-1 ~/walls/foo # one output
+penguinctl properties                    # user properties, with types, ranges, options
+penguinctl property sakura false         # value as JSON, or else a string
+penguinctl properties-set a=1 b=true     # several at once, one rebuild
+penguinctl reset-properties              # back to the wallpaper's (or preset's) values
+penguinctl set --prop speed=2 3566329932 # load with property values
+penguinctl pause | resume                # [--output X]
+penguinctl audio on|off ; penguinctl volume 40 ; penguinctl fps 30
+penguinctl particles 50                  # percent of the particles wallpapers ask for
+penguinctl signals                       # windows, sound, battery, idle: what rules see
+penguinctl wallpaper-volume 50           # [--output X] this wallpaper, % of the global volume
+penguinctl fill fit                      # [--output X] auto | crop | fit | stretch
+penguinctl reload                        # re-read config.toml (as SIGHUP does)
+penguinctl quit
+penguinctl version                       # daemon version, protocol, features (web)
+penguinctl watch                         # events as JSON lines, until the daemon goes
+penguinctl --json status                 # the raw response
 ```
 
 The protocol (`crates/wpe-ipc`) is line-delimited JSON: one request object per line, tagged
@@ -208,7 +219,8 @@ Requests: `status`, `set` {`output`?, `wallpaper`, `properties`?}, `properties` 
 `property` {`output`?, `name`, `value`}, `set-properties` {`output`?, `values`},
 `reset-properties` {`output`?}, `pause` / `resume` {`output`?}, `audio` {`enabled`}, `volume`
 {`volume`}, `wallpaper-volume` {`output`?, `volume`}, `fps` {`fps`}, `fill` {`output`?, `fill`}, `settings` {`fps`?, `audio`?, `volume`?,
-`fill`?, `layer`?, `passthrough`?}, `reload-settings`, `version`, `subscribe`, `quit`. Without
+`fill`?, `layer`?, `passthrough`?, `particles`?, `rules`?}, `signals`, `reload-settings`,
+`version`, `subscribe`, `quit`. Without
 `output` a request applies to every output.
 
 Protocol 2 (`version` answers `{"protocol":2,"daemon":"0.1.0","features":["web"]}`) only adds
@@ -239,13 +251,13 @@ status shows the preset item's path, id and title, and the wallpaper playing as 
 
 ### State and settings
 
-What is shown where is saved to `$XDG_STATE_HOME/wallpaper-engine-rs/state.json`
+What is shown where is saved to `$XDG_STATE_HOME/penguin-engine/state.json`
 (`~/.local/state/...`): each output's wallpaper, its changed user properties and fill mode,
 and the wallpaper set last, which new outputs get. Started without a wallpaper argument,
-`wallpaper` restores it (outputs are matched by name); a wallpaper on the command line is shown
+`penguind` restores it (outputs are matched by name); a wallpaper on the command line is shown
 on every output and saved.
 
-Settings live in `$XDG_CONFIG_HOME/wallpaper-engine-rs/config.toml` (all optional):
+Settings live in `$XDG_CONFIG_HOME/penguin-engine/config.toml` (all optional):
 
 ```toml
 fps = 0              # frame rate cap, 0 = follow the display
@@ -254,35 +266,68 @@ volume = 100         # percent
 fill = "auto"        # auto | crop | fit | stretch
 layer = "background" # background | bottom
 passthrough = false
+particles = 100      # percent of the particles wallpapers ask for
+
+# Rules hold wallpapers back while something else goes on (without any, the
+# default pauses behind a fullscreen window). `when` is one of
+#   { if = "window", state = "open" | "focused" | "maximized" | "fullscreen", app = "firefox" }
+#   { if = "audio", app = "spotify" }     another app plays sound
+#   { if = "battery", below = 20 }        on battery (below: only under that charge)
+#   { if = "idle", seconds = 600 }        no input
+# (`app` is optional); then `playback` (run | mute | pause | stop, which unloads the
+# wallpaper), `fps`, `particles` (percent) and, for window states, `all_outputs`.
+[[rules]]
+when = { if = "window", state = "fullscreen" }
+playback = "pause"
+
+[[rules]]
+when = { if = "battery" }
+fps = 30
+particles = 50
 ```
 
+Window rules need KWin (KDE Plasma), which tells about other applications' windows; a window
+counts on the output its centre is on. `penguinctl signals` shows what the rules see, and
+`penguinctl status` which rules hold where.
+
 Command-line flags win over it. Settings changed over the socket are saved in the state and win
-over the file until the next reload (`wallpaperctl reload`, SIGHUP, `systemctl --user reload`),
+over the file until the next reload (`penguinctl reload`, SIGHUP, `systemctl --user reload`),
 which makes the file (and the flags) authoritative again. Everything except the layer on very
 old compositors is applied live.
 
+### The app
+
+```sh
+pnpm -C apps/penguin-engine/ui install && pnpm -C apps/penguin-engine/ui build
+cargo run --release -p penguin-engine
+```
+
+It lists the wallpapers Steam installed (and Wallpaper Engine's own projects), applies them
+through `penguind`, edits their properties live and keeps the settings (including the rules).
+`apps/penguin-engine/API.md` describes the backend the page talks to.
+
 ### systemd
 
-`systemd/` has user units: `wallpaper-engine-rs.socket` (the control socket, so `wallpaperctl`
-starts the daemon on demand) and `wallpaper-engine-rs.service` (`Type=notify`: ready once the
+`systemd/` has user units: `penguin-engine.socket` (the control socket, so `penguinctl`
+starts the daemon on demand) and `penguin-engine.service` (`Type=notify`: ready once the
 outputs render, a status line with what plays where, a watchdog, `ExecReload` sends SIGHUP).
 Both are part of `graphical-session.target`, which KDE Plasma, GNOME and systemd-managed
 sway/Hyprland sessions start.
 
 ```sh
-cargo install --path apps/wallpaper && cargo install --path apps/wallpaperctl
-wallpaper 3566329932   # once, to pick a wallpaper (Ctrl-C), or later: wallpaperctl set ...
-systemctl --user link $PWD/systemd/wallpaper-engine-rs.socket $PWD/systemd/wallpaper-engine-rs.service
-systemctl --user enable --now wallpaper-engine-rs.socket wallpaper-engine-rs.service
-systemctl --user status wallpaper-engine-rs   # Status: "DP-1: <title>"
-journalctl --user -u wallpaper-engine-rs
+cargo install --path apps/penguind && cargo install --path apps/penguinctl
+penguind 3566329932    # once, to pick a wallpaper (Ctrl-C), or later: penguinctl set ...
+systemctl --user link $PWD/systemd/penguin-engine.socket $PWD/systemd/penguin-engine.service
+systemctl --user enable --now penguin-engine.socket penguin-engine.service
+systemctl --user status penguin-engine   # Status: "DP-1: <title>"
+journalctl --user -u penguin-engine
 ```
 
-`ExecStart` points at `~/.cargo/bin/wallpaper`; edit it (`systemctl --user edit --full
-wallpaper-engine-rs.service`) to pass flags or use another path. The session's
+`ExecStart` points at `~/.cargo/bin/penguind`; edit it (`systemctl --user edit --full
+penguin-engine.service`) to pass flags or use another path. The session's
 `WAYLAND_DISPLAY` must be in the user manager's environment (Plasma and most compositors
-import it). To uninstall: `systemctl --user disable --now wallpaper-engine-rs.socket
-wallpaper-engine-rs.service`.
+import it). To uninstall: `systemctl --user disable --now penguin-engine.socket
+penguin-engine.service`.
 
 ## Tools
 
