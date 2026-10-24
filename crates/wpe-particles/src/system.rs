@@ -129,6 +129,8 @@ pub struct Subsystem {
     time_scale: f32,
     rate_scale: f32,
     over: InstanceOverride,
+    /// Extra particles to emit at the next step (`emitParticles`).
+    burst: u32,
     pub(crate) instances: Vec<Instance>,
     time: f64,
     next_id: u32,
@@ -268,6 +270,31 @@ fn read_def(vfs: &Vfs, path: &str) -> Result<ParticleDef, ParticleError> {
     })
 }
 
+impl Subsystem {
+    /// Apply a new `instanceoverride`: rates, budgets and control points
+    /// change now, per-particle multipliers for particles spawned from now.
+    pub(crate) fn set_override(&mut self, over: &InstanceOverride) {
+        let mut cp_defs = self.def.control_points;
+        for (slot, o) in over.control_points.iter().enumerate() {
+            if let Some(offset) = o {
+                cp_defs[slot].offset = *offset;
+                cp_defs[slot].null_offset = false;
+            }
+        }
+        self.cp_defs = cp_defs;
+        let count = if over.count > 0.0 { over.count } else { 1.0 };
+        self.max_count =
+            ((self.def.max_count as f32 * count).ceil() as u32).clamp(1, MAX_PARTICLES);
+        self.time_scale = over.time_scale();
+        self.rate_scale = count;
+        self.over = over.clone();
+    }
+
+    pub(crate) fn add_burst(&mut self, count: u32) {
+        self.burst = self.burst.saturating_add(count);
+    }
+}
+
 /// Load `path` and its children, depth first, appending to `out`.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn load_tree(
@@ -311,6 +338,7 @@ pub(crate) fn load_tree(
         time_scale: over.time_scale(),
         rate_scale: count,
         over: over.clone(),
+        burst: 0,
         instances: Vec::new(),
         time: 0.0,
         next_id: 0,
@@ -629,6 +657,7 @@ fn step_one(
     let trail_def = sub.def.renderer;
     let sort = trail_kind == Some(RendererKind::Rope);
 
+    let mut burst = std::mem::take(&mut sub.burst);
     let mut instances = std::mem::take(&mut sub.instances);
     for (ii, inst) in instances.iter_mut().enumerate() {
         if let Some(b) = inst.bound.as_mut() {
@@ -664,13 +693,16 @@ fn step_one(
         if !inst.dead {
             let mut emitted_any = false;
             for (ei, e) in sub.def.emitters.iter().enumerate() {
-                let n = emit_count(
+                let mut n = emit_count(
                     e,
                     &mut inst.emitters[ei],
                     dt,
                     sub.rate_scale * ctx.audio_rate,
                     rng,
                 );
+                if ei == 0 {
+                    n += std::mem::take(&mut burst);
+                }
                 if n == 0 {
                     continue;
                 }

@@ -103,6 +103,7 @@ struct Resolved {
 
 /// A simulated particle object and the draws its subsystems feed.
 pub struct ParticleInstance {
+    pub layer: i32,
     system: wpe_particles::ParticleSystem,
     /// Subsystem index and the step drawing it.
     draws: Vec<(usize, usize)>,
@@ -115,6 +116,16 @@ pub struct ParticleInstance {
 const PARTICLE_STEP: f32 = 1.0 / 30.0;
 
 impl ParticleInstance {
+    /// Replace the instance override with `json` (an `instanceoverride` object).
+    pub fn set_override(&mut self, json: &serde_json::Value) {
+        let over = wpe_particles::InstanceOverride::from_json(Some(json));
+        self.system.set_override(&over);
+    }
+
+    pub fn emit(&mut self, count: u32) {
+        self.system.emit(count);
+    }
+
     /// Simulate up to `time` and upload each subsystem's mesh.
     pub fn advance(
         &mut self,
@@ -938,6 +949,7 @@ impl<'a> FrameBuilder<'a> {
         }
         if !draws.is_empty() {
             self.particles.push(ParticleInstance {
+                layer: layer.id,
                 system,
                 draws,
                 motion: layer.motion.clone(),

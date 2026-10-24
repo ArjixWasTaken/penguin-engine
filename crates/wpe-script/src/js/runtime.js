@@ -185,7 +185,11 @@
 		stop() { this._invoke('', 'stop'); }
 		isPlaying() { return !!this._invoke('', 'isPlaying', [], false); }
 		emitParticles(count) { this._invoke('', 'emitParticles', [count === undefined ? 1 : +count]); }
-		get instance() { return particleInstance(this); }
+		// Only particle systems have an instance; scripts probe for it.
+		get instance() {
+			const i = infoById(this.__id);
+			return i && i.kind !== 'particle' ? undefined : particleInstance(this);
+		}
 
 		getEffectCount() { const i = infoById(this.__id); return i ? i.effects.length : 0; }
 		getEffect(key) {

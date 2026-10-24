@@ -18,6 +18,7 @@ use wpe_script::{CursorEvent, CursorEventKind, CursorState, ScriptRuntime, Scrip
 use wpe_vfs::Vfs;
 
 pub use edit::{SceneEdit, apply as apply_edits, resolve_paths};
+pub use host::ParticleCommand;
 use host::{LayerState, ScriptHost, vec3};
 
 use crate::bones::SharedBones;
@@ -229,6 +230,11 @@ impl Scripts {
         std::mem::take(&mut self.host.edits)
     }
 
+    /// What scripts did to particle systems since the last call.
+    pub fn take_particle_commands(&mut self) -> Vec<(i32, ParticleCommand)> {
+        std::mem::take(&mut self.host.particle_commands)
+    }
+
     /// What scripts did to sound layers since the last call.
     pub fn take_sound_commands(&mut self) -> Vec<(i32, SoundCommand)> {
         std::mem::take(&mut self.host.sound_commands)
@@ -243,6 +249,12 @@ impl Scripts {
             l.rebind(by_layer.get(&id).copied(), steps);
         }
         self.host.videos = view.videos.clone();
+        // Rebuilt particle systems start from the scene's overrides.
+        for (&layer, over) in &self.host.particle_overrides {
+            self.host
+                .particle_commands
+                .push((layer, ParticleCommand::Override(over.clone())));
+        }
     }
 
     /// Deliver a mouse button press or release at `pointer`.

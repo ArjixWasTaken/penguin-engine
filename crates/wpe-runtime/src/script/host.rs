@@ -273,6 +273,14 @@ fn new_layer_config(config: &Value) -> Option<Value> {
     }
 }
 
+/// What scripts do to a particle system.
+#[derive(Debug, Clone, PartialEq)]
+pub enum ParticleCommand {
+    /// The whole `instanceoverride` object to use from now on.
+    Override(Value),
+    Emit(u32),
+}
+
 /// The [`SceneHost`] scripts run against.
 pub struct ScriptHost {
     pub layers: Vec<LayerState>,
@@ -288,6 +296,10 @@ pub struct ScriptHost {
     /// Sound layers' play state, and what scripts did to them.
     pub sounds: HashMap<i32, SoundState>,
     pub sound_commands: Vec<(i32, SoundCommand)>,
+    /// Particle layers' instance overrides scripts changed, and what they
+    /// asked of particle systems since the last frame.
+    pub particle_overrides: HashMap<i32, Value>,
+    pub particle_commands: Vec<(i32, ParticleCommand)>,
     /// Animation clocks and puppet bones, shared with the frame's bindings.
     pub clocks: SharedClocks,
     pub bones: SharedBones,
@@ -306,6 +318,8 @@ impl ScriptHost {
             next_id: 1,
             sounds: HashMap::new(),
             sound_commands: Vec::new(),
+            particle_overrides: HashMap::new(),
+            particle_commands: Vec::new(),
             clocks: Default::default(),
             bones: Default::default(),
             audit: Audit::from_env(),
@@ -421,6 +435,59 @@ impl ScriptHost {
                 return None;
             }
         })
+    }
+
+    fn is_particles(&self, layer: i32) -> bool {
+        self.layer(layer)
+            .is_some_and(|l| l.info.kind == LayerKind::Particle)
+    }
+
+    /// A particle layer's `instance.<key>` (`rate`, `count`, `colorn`,
+    /// `controlpoint0`, ...); `None` leaves the script its default.
+    fn particle_get(&self, layer: i32, key: &str) -> Option<ScriptValue> {
+        if !self.is_particles(layer) {
+            self.unhandled("get", &format!("instanceoverride/{key}"));
+            return None;
+        }
+        let v = self
+            .layer(layer)?
+            .config
+            .get("instanceoverride")?
+            .get(key)?;
+        let v = v.get("value").unwrap_or(v);
+        Some(match config_numbers(v)[..] {
+            [x] => ScriptValue::Number(x),
+            [x, y, z, ..] => ScriptValue::Vec3([x, y, z]),
+            _ => return None,
+        })
+    }
+
+    fn particle_set(&mut self, layer: i32, key: &str, value: &ScriptValue) {
+        if !self.is_particles(layer) {
+            self.unhandled("set", &format!("instanceoverride/{key}"));
+            return;
+        }
+        let json = scene_json(value);
+        let Some(l) = self.layer_mut(layer) else {
+            return;
+        };
+        let Some(config) = l.config.as_object_mut() else {
+            return;
+        };
+        let over = config
+            .entry("instanceoverride")
+            .or_insert_with(|| Value::Object(Default::default()));
+        if !over.is_object() {
+            *over = Value::Object(Default::default());
+        }
+        if over.get(key) == Some(&json) {
+            return;
+        }
+        over[key] = json;
+        let over = over.clone();
+        self.particle_overrides.insert(layer, over.clone());
+        self.particle_commands
+            .push((layer, ParticleCommand::Override(over)));
     }
 
     /// Index of a puppet animation layer named or numbered `key`.
@@ -578,6 +645,9 @@ impl SceneHost for ScriptHost {
     }
 
     fn get(&self, layer: i32, property: &str) -> Option<ScriptValue> {
+        if let Some(key) = property.strip_prefix("instanceoverride/") {
+            return self.particle_get(layer, key);
+        }
         if property == "volume"
             && let Some(sound) = self.sounds.get(&layer)
         {
@@ -621,6 +691,10 @@ impl SceneHost for ScriptHost {
     }
 
     fn set(&mut self, layer: i32, property: &str, value: ScriptValue) {
+        if let Some(key) = property.strip_prefix("instanceoverride/") {
+            self.particle_set(layer, key, &value);
+            return;
+        }
         if property == "volume"
             && let (Some(sound), Some(v)) = (self.sounds.get_mut(&layer), value.as_f64())
         {
@@ -707,6 +781,13 @@ impl SceneHost for ScriptHost {
                 video_call(self.videos.get(&layer)?, method, args)
             }
             "" if self.sounds.contains_key(&layer) => self.sound_call(layer, method),
+            "" if method == "emitParticles" && self.is_particles(layer) => {
+                let count = args.first().and_then(ScriptValue::as_f64).unwrap_or(1.0);
+                let count = count.clamp(0.0, 100_000.0) as u32;
+                self.particle_commands
+                    .push((layer, ParticleCommand::Emit(count)));
+                None
+            }
             "" if self.bones.borrow().puppets.contains_key(&layer) => {
                 self.bone_call(layer, method, args)
             }

@@ -387,6 +387,14 @@ impl Wallpaper {
         for (id, command) in scripts.take_sound_commands() {
             self.sounds.apply(id, command);
         }
+        for (id, command) in scripts.take_particle_commands() {
+            for particles in self.particles.iter_mut().filter(|p| p.layer == id) {
+                match &command {
+                    script::ParticleCommand::Override(json) => particles.set_override(json),
+                    script::ParticleCommand::Emit(count) => particles.emit(*count),
+                }
+            }
+        }
         scripts.apply(gpu, &self.vfs, &mut self.renderer, self.text.as_mut());
         self.scripts = Some(scripts);
     }

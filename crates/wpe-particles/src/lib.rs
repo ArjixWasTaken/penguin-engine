@@ -140,6 +140,19 @@ impl ParticleSystem {
         Ok(s)
     }
 
+    /// Replace the `instanceoverride` (scripts' `thisLayer.instance`).
+    pub fn set_override(&mut self, over: &InstanceOverride) {
+        for sub in &mut self.subs {
+            sub.set_override(over);
+        }
+    }
+
+    /// Emit `count` extra particles from the root at the next update
+    /// (`emitParticles`).
+    pub fn emit(&mut self, count: u32) {
+        self.subs[0].add_burst(count);
+    }
+
     /// Restart the simulation from scratch with a new random seed.
     pub fn set_seed(&mut self, seed: u64) {
         self.seed = seed;
