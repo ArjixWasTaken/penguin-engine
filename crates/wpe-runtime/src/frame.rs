@@ -26,6 +26,7 @@ pub struct Frame {
     pub steps: Vec<Step>,
     pub videos: Vec<(Arc<GpuTexture>, VideoStream)>,
     pub bindings: Vec<Binding>,
+    pub particles: Vec<ParticleInstance>,
 }
 
 /// Names under which the current chain input and framebuffer copies appear
@@ -64,6 +65,54 @@ struct Resolved {
     uv_scale: Vec2,
     sprites: Vec<SpriteAnimation>,
     animated: Vec<(String, Vec<f32>, Animation)>,
+}
+
+/// A simulated particle object and the draws its subsystems feed.
+pub struct ParticleInstance {
+    system: wpe_particles::ParticleSystem,
+    /// Subsystem index and the step drawing it.
+    draws: Vec<(usize, usize)>,
+    motion: Motion,
+    /// Seconds simulated so far.
+    simulated: f32,
+}
+
+/// Longest simulation step, so screenshots at a given time are reproducible.
+const PARTICLE_STEP: f32 = 1.0 / 30.0;
+
+impl ParticleInstance {
+    /// Simulate up to `time` and upload each subsystem's mesh.
+    pub fn advance(
+        &mut self,
+        renderer: &mut wpe_render::SceneRenderer,
+        time: f32,
+        cursor: Option<glam::Vec3>,
+    ) {
+        let ctx = wpe_particles::UpdateContext {
+            transform: self.motion.transform_at(time),
+            cursor,
+            ..Default::default()
+        };
+        while self.simulated < time {
+            let dt = (time - self.simulated).min(PARTICLE_STEP);
+            self.system.update(dt, &ctx);
+            self.simulated += dt;
+        }
+        let mut mesh = wpe_particles::ParticleMesh::default();
+        for &(index, step) in &self.draws {
+            let sub = &self.system.subsystems()[index];
+            sub.mesh(self.system.view(), &mut mesh);
+            renderer.set_model(step, sub.model_matrix());
+            renderer.set_mesh(
+                step,
+                Mesh::Triangles(MeshData {
+                    vertex_count: mesh.vertex_count,
+                    attributes: std::mem::take(&mut mesh.attributes),
+                    indices: Some(std::mem::take(&mut mesh.indices)),
+                }),
+            );
+        }
+    }
 }
 
 /// A puppet-warped layer: its parsed model and animation state.
@@ -259,6 +308,7 @@ pub struct FrameBuilder<'a> {
     frame_copy: Option<TargetId>,
     /// Offscreen outputs of layers other layers sample, by layer id.
     links: HashMap<i32, TargetId>,
+    particles: Vec<ParticleInstance>,
     /// Parsed puppet models by path; `None` caches a failure.
     mdls: HashMap<String, Option<Arc<wpe_mdl::Mdl>>>,
     /// Sprite-sheet pages after the first, by texture and page index.
@@ -289,6 +339,7 @@ impl<'a> FrameBuilder<'a> {
             parallax: None,
             pages: HashMap::new(),
             mdls: HashMap::new(),
+            particles: Vec::new(),
             stats: (0, 0),
         }
     }
@@ -299,6 +350,7 @@ impl<'a> FrameBuilder<'a> {
             steps: self.steps,
             videos: self.videos,
             bindings: self.bindings,
+            particles: self.particles,
         }
     }
 
@@ -607,8 +659,65 @@ impl<'a> FrameBuilder<'a> {
         }
     }
 
+    /// A particle object: one draw per renderable subsystem, whose meshes
+    /// are regenerated every frame from the simulation.
+    fn particle_layer(&mut self, layer: &ImageLayer, source: &wpe_scene::ParticleSource) {
+        let mut system = match wpe_particles::ParticleSystem::load(
+            self.vfs,
+            &source.path,
+            source.instance_override.as_ref(),
+        ) {
+            Ok(s) => s,
+            Err(e) => {
+                tracing::warn!("particles {:?}: {e}", layer.name);
+                return;
+            }
+        };
+        system.set_seed(layer.id as u64);
+        let mut draws = Vec::new();
+        for (index, sub) in system.subsystems().iter().enumerate() {
+            if !sub.is_renderable() {
+                continue;
+            }
+            let Some(mut pass) = sub.material_def().and_then(|m| m.passes.first().cloned()) else {
+                continue;
+            };
+            pass.shader = sub.shader().to_owned();
+            let label = format!("particles {:?}/{}", layer.name, sub.name());
+            let Some(mut r) = self.resolve_with(&label, &pass, &HashMap::new(), &sub.combos())
+            else {
+                continue;
+            };
+            r.constants.extend(sub.uniforms());
+            r.sprites.clear();
+            self.push_draw(
+                TargetId::DEFAULT,
+                r,
+                sub.model_matrix(),
+                Mesh::Triangles(MeshData::default()),
+                blend_mode(&pass.blending),
+                Camera::Scene,
+            );
+            draws.push((index, self.steps.len() - 1));
+        }
+        if !draws.is_empty() {
+            self.particles.push(ParticleInstance {
+                system,
+                draws,
+                motion: layer.motion.clone(),
+                simulated: 0.0,
+            });
+        }
+    }
+
     /// Draw `layer` onto the screen, or into `offscreen` filling it.
     fn layer(&mut self, layer: &ImageLayer, offscreen: Option<TargetId>) {
+        if let Some(source) = &layer.particle {
+            if offscreen.is_none() {
+                self.particle_layer(layer, source);
+            }
+            return;
+        }
         let effects = self.effects(layer);
         if effects.is_empty() {
             if !layer.compose {

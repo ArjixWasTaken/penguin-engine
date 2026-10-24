@@ -62,9 +62,8 @@ fn load_sources(vfs: &Vfs, name: &str) -> Result<(String, String), ShaderError> 
     let missing = || ShaderError::Missing(name.to_owned());
     let vert = read(vfs, &format!("{base}.vert")).ok_or_else(missing)?;
     let frag = read(vfs, &format!("{base}.frag")).ok_or_else(missing)?;
-    if vfs.contains(&format!("{base}.geom")) {
-        return Err(ShaderError::Geometry);
-    }
+    // A `.geom` stage is never used: WE shaders that have one also have a
+    // `GS_ENABLED=0` path, which callers expand on the CPU instead.
     Ok((vert, frag))
 }
 
@@ -85,6 +84,7 @@ pub fn compile(vfs: &Vfs, req: ShaderRequest) -> Result<CompiledShader, ShaderEr
     let frag = source::prepare(vfs, &frag, &mut info, req.slots);
 
     let mut combos = info.combos.clone();
+    combos.insert("GS_ENABLED".to_owned(), "0".to_owned());
     combos.extend(req.combos.iter().map(|(k, v)| (k.clone(), v.clone())));
     for (slot, format) in req.formats.iter().enumerate() {
         if let Some(format) = format {

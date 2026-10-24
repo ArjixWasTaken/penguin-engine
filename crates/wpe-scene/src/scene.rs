@@ -2,7 +2,9 @@ use std::collections::HashMap;
 
 use glam::{Mat4, Vec2, Vec3};
 use wpe_assets::material::{Material, MaterialPass, PassOverride};
-use wpe_assets::scene::{ImageEffect, ImageObject, ObjectCommon, SceneObject, TextObject};
+use wpe_assets::scene::{
+    ImageEffect, ImageObject, ObjectCommon, ParticleObject, SceneObject, TextObject,
+};
 use wpe_assets::{AssetError, ImageModel, load_json};
 use wpe_vfs::Vfs;
 
@@ -93,9 +95,18 @@ pub struct ImageLayer {
     /// For text layers, the object whose rendered text is the layer's image
     /// (see [`text_texture_name`]); its size and anchoring are known once rendered.
     pub text: Option<Box<TextObject>>,
+    /// For particle layers, the particle definition and instance overrides.
+    pub particle: Option<ParticleSource>,
     /// Puppet `.mdl` deforming the image, and the object's animation layers.
     pub puppet: Option<String>,
     pub animation_layers: Vec<serde_json::Value>,
+}
+
+/// A particle object's definition path and `instanceoverride`.
+#[derive(Debug, Clone)]
+pub struct ParticleSource {
+    pub path: String,
+    pub instance_override: Option<serde_json::Value>,
 }
 
 /// A layer's transform inputs and keyframe animations.
@@ -312,6 +323,7 @@ impl Scene {
                         .cloned()
                         .collect(),
                     text: None,
+                    particle: None,
                     puppet: loaded.puppet,
                     animation_layers: img.animationlayers.clone(),
                 };
@@ -319,8 +331,12 @@ impl Scene {
             })
             .collect();
         for (index, obj) in scene.objects.iter().enumerate() {
-            if let SceneObject::Text(text) = obj {
-                layers.push((index, text_layer(&nodes, props, text)));
+            match obj {
+                SceneObject::Text(text) => layers.push((index, text_layer(&nodes, props, text))),
+                SceneObject::Particle(p) if !p.particle.is_empty() => {
+                    layers.push((index, particle_layer(&nodes, props, p)))
+                }
+                _ => {}
             }
         }
         layers.sort_by_key(|(index, _)| *index);
@@ -408,6 +424,51 @@ fn text_layer(nodes: &HashMap<i32, Node>, props: &UserProperties, text: &TextObj
             .cloned()
             .collect(),
         text: Some(Box::new(text.clone())),
+        particle: None,
+        puppet: None,
+        animation_layers: Vec::new(),
+    }
+}
+
+fn particle_layer(
+    nodes: &HashMap<i32, Node>,
+    props: &UserProperties,
+    p: &ParticleObject,
+) -> ImageLayer {
+    let common = &p.common;
+    let anim = |a: &Option<serde_json::Value>| a.as_ref().and_then(Animation::parse);
+    let motion = Motion {
+        parent: parent_transform(nodes, props, common.parent, 0),
+        origin: vec3(*props.value(&common.origin)),
+        scale: vec3(*props.value(&common.scale)),
+        angles: vec3(*props.value(&common.angles)),
+        origin_animation: anim(&common.origin.animation),
+        scale_animation: anim(&common.scale.animation),
+        angles_animation: anim(&common.angles.animation),
+        ..Default::default()
+    };
+    ImageLayer {
+        id: common.id,
+        name: common.name.clone(),
+        visible: is_visible(nodes, props, common.id),
+        transform: motion.transform_at(0.0),
+        size: Vec2::ONE,
+        color: Vec3::ONE,
+        alpha: 1.0,
+        brightness: 1.0,
+        material: MaterialPass::default(),
+        motion,
+        parallax_depth: vec2(*props.value(&common.parallax_depth)),
+        solid: false,
+        compose: false,
+        fullscreen: false,
+        color_blend_mode: 0,
+        effects: Vec::new(),
+        text: None,
+        particle: Some(ParticleSource {
+            path: p.particle.clone(),
+            instance_override: p.instanceoverride.clone(),
+        }),
         puppet: None,
         animation_layers: Vec::new(),
     }

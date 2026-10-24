@@ -111,6 +111,7 @@ pub struct Wallpaper {
     renderer: SceneRenderer,
     videos: Vec<(Arc<GpuTexture>, video::VideoStream)>,
     bindings: Vec<frame::Binding>,
+    particles: Vec<frame::ParticleInstance>,
     start: Instant,
     /// Smoothed cursor over the output, 0..1 with Y down.
     pointer: Vec2,
@@ -226,6 +227,7 @@ impl Wallpaper {
             renderer,
             videos: frame.videos,
             bindings: frame.bindings,
+            particles: frame.particles,
             start: Instant::now(),
             pointer: Vec2::splat(0.5),
             pointer_target: Vec2::splat(0.5),
@@ -285,6 +287,11 @@ impl Wallpaper {
         };
         for binding in &self.bindings {
             binding.apply(&mut self.renderer, frame);
+        }
+        let scene = self.camera.scene_size;
+        let cursor = Vec2::new(self.pointer.x, 1.0 - self.pointer.y) * scene;
+        for particles in &mut self.particles {
+            particles.advance(&mut self.renderer, time, Some(cursor.extend(0.0)));
         }
     }
 
