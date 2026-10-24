@@ -23,9 +23,12 @@ dialect to SPIR-V and run through wgpu:
 - sprite sheets, video textures (via `ffmpeg`), text layers, scene bloom
 - user properties, keyframe animations, camera parallax and shake
 - sound layers and audio-reactive spectrum (`--audio`)
+- particles (sprite, trail, rope) without geometry shaders
+- puppet warp (`.mdl` skinned meshes and bone animations)
+- SceneScript (QuickJS): scripted text, visibility, transforms, colours, clicks
 
-In progress: particles, puppet warp (`.mdl`), SceneScript. Not yet: 3D models, HDR scenes,
-wallpaper (desktop background) mode.
+Not yet: 3D models, HDR scenes, SceneScript-driven video/sound/animation control, desktop
+background (wallpaper) mode and the wallpaper picker UI.
 
 ## Layout
 
@@ -37,6 +40,9 @@ wallpaper (desktop background) mode.
 | `crates/wpe-scene` | Scene graph, cameras, user properties, animations |
 | `crates/wpe-render` | wgpu renderer: render targets, material draws, effect chains |
 | `crates/wpe-text` | Text layer layout and rasterisation |
+| `crates/wpe-particles` | Particle simulation and CPU vertex generation |
+| `crates/wpe-mdl` | `.mdl` puppet/model parsing and bone animation |
+| `crates/wpe-script` | SceneScript runtime (QuickJS) |
 | `crates/wpe-audio` | Sound playback and audio spectrum |
 | `crates/wpe-runtime` | Embeddable API tying loading, animation and rendering together |
 | `apps/scene-viewer` | Windowed scene viewer |
