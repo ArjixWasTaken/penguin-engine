@@ -31,6 +31,9 @@ struct Args {
     /// Scene time in seconds for --screenshot.
     #[arg(long, default_value_t = 0.0)]
     time: f32,
+    /// Play sound layers and react to system audio (window mode).
+    #[arg(long)]
+    audio: bool,
 }
 
 #[derive(Clone, Copy, clap::ValueEnum)]
@@ -165,6 +168,7 @@ impl App {
 
         let mut wallpaper = Wallpaper::load(&gpu, format, &self.assets, &self.args.wallpaper)?;
         wallpaper.fill = self.args.fill.into();
+        wallpaper.set_audio(self.args.audio);
         window.set_title(&format!("{} — scene-viewer", wallpaper.title));
         Ok(State {
             window,

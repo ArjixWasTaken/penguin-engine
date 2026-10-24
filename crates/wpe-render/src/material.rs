@@ -599,6 +599,7 @@ impl PreparedMaterialDraw {
         &mut self,
         gpu: &Gpu,
         globals: &FrameGlobals,
+        shared: &HashMap<String, Vec<f32>>,
         placeholders: &Placeholders,
         targets: &Targets,
     ) {
@@ -698,7 +699,7 @@ impl PreparedMaterialDraw {
                 self.block.write(member, &mat4(Mat4::IDENTITY));
             }
         }
-        for (name, v) in &self.overrides {
+        for (name, v) in shared.iter().chain(&self.overrides) {
             if let Some(member) = r.uniforms.get(name) {
                 self.block.write(member, v);
             }

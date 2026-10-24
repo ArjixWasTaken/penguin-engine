@@ -12,6 +12,7 @@ sha1_smol = { version = "1.0.1", features = ["std"] }
 thiserror = "2.0.21"
 tracing = "0.1.44"
 wpe-assets = { version = "0.1.0", path = "../wpe-assets" }
+wpe-audio = { version = "0.1.0", path = "../wpe-audio" }
 wpe-render = { version = "0.1.0", path = "../wpe-render" }
 wpe-scene = { version = "0.1.0", path = "../wpe-scene" }
 wpe-shader = { version = "0.1.0", path = "../wpe-shader" }

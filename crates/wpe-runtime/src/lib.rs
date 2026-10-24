@@ -60,6 +60,52 @@ pub struct Wallpaper {
     parallax_influence: f32,
     /// Fixed scene time in seconds instead of the wall clock.
     pub time_override: Option<f32>,
+    audio: Option<wpe_audio::AudioCapture>,
+    sounds: Option<wpe_audio::SoundOutput>,
+    /// Encoded files and settings of each sound layer, played on demand.
+    sound_layers: Vec<SoundLayer>,
+}
+
+struct SoundLayer {
+    files: Vec<Vec<u8>>,
+    volume: f32,
+    mode: wpe_audio::Playback,
+}
+
+fn sound_layers(files: &WallpaperFiles, props: &wpe_scene::UserProperties) -> Vec<SoundLayer> {
+    files
+        .scene
+        .objects
+        .iter()
+        .filter_map(|obj| match obj {
+            wpe_assets::scene::SceneObject::Sound(s) => Some(s),
+            _ => None,
+        })
+        .filter(|s| !s.startsilent && props.flag(&s.common.visible))
+        .filter_map(|s| {
+            let data: Vec<Vec<u8>> = s
+                .sound
+                .iter()
+                .filter_map(|path| {
+                    files
+                        .vfs
+                        .read(path)
+                        .inspect_err(|e| tracing::warn!("sound {path}: {e}"))
+                        .ok()
+                        .map(|b| b.into_owned())
+                })
+                .collect();
+            let mode = match s.playbackmode.as_deref() {
+                Some("single") => wpe_audio::Playback::Single,
+                _ => wpe_audio::Playback::Loop,
+            };
+            (!data.is_empty()).then_some(SoundLayer {
+                files: data,
+                volume: props.value(&s.volume),
+                mode,
+            })
+        })
+        .collect()
 }
 
 impl Wallpaper {
@@ -119,7 +165,48 @@ impl Wallpaper {
             pointer: Vec2::splat(0.5),
             parallax_influence: files.scene.general.cameraparallaxmouseinfluence.value,
             time_override: None,
+            audio: None,
+            sounds: None,
+            sound_layers: sound_layers(&files, &props),
         })
+    }
+
+    /// Start or stop audio: playing the wallpaper's sound layers and
+    /// analysing system audio for audio-reactive shaders.
+    pub fn set_audio(&mut self, enabled: bool) {
+        if !enabled {
+            self.audio = None;
+            self.sounds = None;
+            return;
+        }
+        if self.audio.is_none() {
+            self.audio = wpe_audio::AudioCapture::start()
+                .inspect_err(|e| tracing::warn!("audio capture unavailable: {e}"))
+                .ok();
+        }
+        if self.sounds.is_none() && !self.sound_layers.is_empty() {
+            match wpe_audio::SoundOutput::open() {
+                Ok(mut out) => {
+                    for layer in &self.sound_layers {
+                        if let Err(e) = out.play(layer.files.clone(), layer.volume, layer.mode) {
+                            tracing::warn!("sound layer: {e}");
+                        }
+                    }
+                    self.sounds = Some(out);
+                }
+                Err(e) => tracing::warn!("audio output unavailable: {e}"),
+            }
+        }
+    }
+
+    fn update_audio(&mut self) {
+        let Some(capture) = &mut self.audio else {
+            return;
+        };
+        let spectrum = capture.spectrum();
+        for (name, values) in spectrum.uniforms() {
+            self.renderer.set_global_uniform(name, values);
+        }
     }
 
     fn animate(&mut self, time: f32) {
@@ -172,6 +259,7 @@ impl Wallpaper {
         self.upload_video_frames(gpu);
         let globals = self.globals(size);
         self.animate(globals.time);
+        self.update_audio();
         self.renderer.render(gpu, encoder, globals, output, size);
     }
 

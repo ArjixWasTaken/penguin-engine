@@ -74,6 +74,8 @@ pub struct SceneRenderer {
     targets: Targets,
     steps: Vec<PreparedStep>,
     placeholders: Placeholders,
+    /// Uniforms written into every material draw that declares them.
+    globals: std::collections::HashMap<String, Vec<f32>>,
     pub clear_color: wgpu::Color,
 }
 
@@ -136,6 +138,7 @@ impl SceneRenderer {
             targets: Targets::new(gpu),
             steps: Vec::new(),
             placeholders: Placeholders::new(gpu),
+            globals: Default::default(),
             clear_color: wgpu::Color::BLACK,
         }
     }
@@ -167,6 +170,19 @@ impl SceneRenderer {
             Some(PreparedStep::Material(_, d)) => d.draw.model = model,
             Some(PreparedStep::Image(_, d)) => d.draw.model = model,
             _ => {}
+        }
+    }
+
+    /// Set a uniform for every material draw (e.g. the audio spectrum).
+    pub fn set_global_uniform(&mut self, name: &str, values: &[f32]) {
+        match self.globals.get_mut(name) {
+            Some(v) => {
+                v.clear();
+                v.extend_from_slice(values);
+            }
+            None => {
+                self.globals.insert(name.to_owned(), values.to_vec());
+            }
         }
     }
 
@@ -342,9 +358,13 @@ impl SceneRenderer {
                         .write_buffer(&d.uniforms, 0, bytemuck::bytes_of(&uniforms));
                     self.images.get(&gpu.device, d.draw.blend);
                 }
-                PreparedStep::Material(_, d) => {
-                    d.update(gpu, &globals, &self.placeholders, &self.targets)
-                }
+                PreparedStep::Material(_, d) => d.update(
+                    gpu,
+                    &globals,
+                    &self.globals,
+                    &self.placeholders,
+                    &self.targets,
+                ),
                 PreparedStep::Copy { .. } => {}
             }
         }
