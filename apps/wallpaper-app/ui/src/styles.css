@@ -171,12 +171,7 @@ input[type="checkbox"] { accent-color: var(--accent); margin: 0; }
 .empty .what { color: var(--text); font-weight: 500; }
 
 /* Bars at the bottom */
-.playlist-bar { flex: none; display: flex; align-items: center; gap: 8px; padding-top: 10px; border-top: 1px solid var(--line); }
-.playlist-bar h2 { font-size: 19px; font-weight: 600; margin: 0 6px 0 0; }
-.pl-thumbs { display: flex; align-items: center; gap: 4px; margin-left: 8px; min-width: 0; overflow: hidden; }
-.pl-thumb { width: 28px; height: 28px; flex: none; border-radius: 5px; object-fit: cover; cursor: pointer; box-shadow: 0 0 0 1px rgba(255, 255, 255, .1); background: var(--field); }
-.pl-summary { font: 11px var(--mono); color: var(--muted); white-space: nowrap; margin-left: 6px; }
-.actions { flex: none; display: flex; align-items: center; gap: 8px; }
+.actions { flex: none; display: flex; align-items: center; gap: 8px; padding-top: 12px; border-top: 1px solid var(--line); }
 .actions .wide { width: 230px; }
 .actions .ok { width: 104px; font-weight: 600; }
 .actions .cancel { width: 104px; }
@@ -251,7 +246,6 @@ input[type="checkbox"] { accent-color: var(--accent); margin: 0; }
 .backdrop { position: absolute; inset: 0; background: rgba(5, 7, 9, .6); display: flex; align-items: center; justify-content: center; z-index: 20; }
 .modal { background: var(--field); border: 1px solid var(--field-line); border-radius: 12px; box-shadow: 0 30px 80px rgba(0, 0, 0, .5); display: flex; overflow: hidden; }
 .modal.settings { width: 720px; height: 500px; }
-.modal.playlist { width: 640px; max-height: 560px; flex-direction: column; }
 .modal-nav { width: 180px; background: #12151a; border-right: 1px solid var(--line-2); padding: 18px 10px; display: flex; flex-direction: column; gap: 2px; }
 .modal-nav .title { font-size: 16px; font-weight: 600; padding: 0 10px 12px; }
 .modal-nav button { display: flex; align-items: center; gap: 9px; height: 34px; padding: 0 10px; border: none; border-radius: 6px; background: transparent; color: var(--text-2); font-size: 13px; text-align: left; }
@@ -280,18 +274,6 @@ input[type="checkbox"] { accent-color: var(--accent); margin: 0; }
 .display .screen b { position: relative; font: 500 20px var(--mono); color: #fff; text-shadow: 0 1px 4px rgba(0, 0, 0, .6); }
 .display .label { font-size: 12px; color: var(--text-2); }
 .display .wall { font-size: 11px; color: var(--muted); max-width: 200px; text-align: center; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
-.pl-row { display: flex; align-items: center; gap: 16px; }
-.pl-row > .label { width: 120px; flex: none; color: var(--text-2); }
-.pl-row > .segments { flex: 1; }
-.pl-empty { padding: 26px; text-align: center; color: var(--muted); border: 1px dashed var(--field-line); border-radius: 8px; }
-.pl-item { display: flex; align-items: center; gap: 10px; padding: 6px; border-radius: 8px; background: var(--raised); }
-.pl-item .n { width: 22px; text-align: center; font: 11px var(--mono); color: var(--muted); }
-.pl-item img { width: 40px; height: 40px; border-radius: 6px; object-fit: cover; flex: none; background: var(--field); }
-.pl-item .what { flex: 1; min-width: 0; }
-.pl-item .what div:first-child { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
-.pl-item .what div:last-child { font-size: 11.5px; color: var(--muted); }
-.pl-item button { width: 28px; height: 28px; border: none; border-radius: 5px; background: var(--line-2); color: var(--text-2); display: grid; place-items: center; }
-.pl-item button.remove { color: var(--danger); }
 
 /* Notices */
 .toast {

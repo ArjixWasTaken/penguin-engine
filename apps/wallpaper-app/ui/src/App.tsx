@@ -3,7 +3,6 @@ import { Check, Compass, HardDrive, Monitor, Package, Settings, Upload } from "l
 import { useApp, closeWindow, revert, request, toast, apply, targetLabel, type Tab } from "./store";
 import { Browse } from "./components/Browse";
 import { Details } from "./components/Details";
-import { PlaylistBar, PlaylistDialog } from "./components/Playlist";
 import { SettingsDialog } from "./components/Settings";
 import { TitleBar } from "./components/TitleBar";
 
@@ -78,7 +77,6 @@ export function App() {
               <div>Browsing the Steam Workshop comes later. Wallpapers you subscribe to in Steam show up in the Library.</div>
             </div>
           )}
-          <PlaylistBar />
           <div class="actions">
             <button class="btn big wide" onClick={openWallpaper}>
               <Upload size={14} />
@@ -96,7 +94,6 @@ export function App() {
         {panelOpen && <Details />}
       </div>
       {modal === "settings" && <SettingsDialog />}
-      {modal === "playlist" && <PlaylistDialog />}
       {toastState && (
         <div class={"toast" + (toastState.error ? " error" : "")}>
           {!toastState.error && <Check size={15} color="#1d8bb0" />}

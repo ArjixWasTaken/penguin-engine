@@ -17,25 +17,6 @@ import { useProps } from "./props";
 export type Tab = "library" | "discover" | "workshop";
 export type SettingsTab = "General" | "Performance" | "Displays" | "Audio" | "About";
 
-export interface Playlist {
-  name: string;
-  items: string[];
-  mode: "Timer" | "Time of day" | "Each login";
-  /** Minutes between changes (timer mode). */
-  interval: number;
-  order: "Sequential" | "Random";
-  transition: boolean;
-}
-
-export const emptyPlaylist = (): Playlist => ({
-  name: "",
-  items: [],
-  mode: "Timer",
-  interval: 15,
-  order: "Sequential",
-  transition: true,
-});
-
 /** What is kept between runs (`save_ui_state`). */
 interface Saved extends Filters {
   sort: Sort;
@@ -46,8 +27,6 @@ interface Saved extends Filters {
   panelOpen: boolean;
   /** The output "Apply" changes; null for all of them. */
   target: string | null;
-  playlist: Playlist;
-  playlists: Playlist[];
   tileMin: number;
 }
 
@@ -70,7 +49,7 @@ interface State extends Saved {
   tab: Tab;
   /** Open folder, by names from the top. */
   folderPath: string[];
-  modal: "settings" | "playlist" | null;
+  modal: "settings" | null;
   settingsTab: SettingsTab;
   toast: { text: string; error: boolean } | null;
 }
@@ -87,8 +66,6 @@ const saved: Saved = {
   selected: null,
   panelOpen: true,
   target: null,
-  playlist: emptyPlaylist(),
-  playlists: [],
   tileMin: 180,
 };
 
