@@ -12,10 +12,11 @@
       {
         "label": "main",
         "title": "Penguin Engine",
-        "width": 1400,
-        "height": 860,
-        "minWidth": 900,
-        "minHeight": 600
+        "width": 1440,
+        "height": 900,
+        "minWidth": 1080,
+        "minHeight": 640,
+        "decorations": false
       }
     ],
     "security": {

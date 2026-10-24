@@ -12599,6 +12599,7 @@ name = "wallpaper-app"
 version = "0.1.0"
 dependencies = [
  "dirs",
+ "rayon",
  "serde",
  "serde_json",
  "tauri",

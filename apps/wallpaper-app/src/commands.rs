@@ -12,13 +12,17 @@ use tauri_plugin_opener::OpenerExt;
 use tokio::sync::RwLock;
 use wpe_ipc::{Client, PropertyInfo, Request, Response};
 use wpe_library::locale::{self, Locale};
+use wpe_library::folders::{self, Folder};
 use wpe_library::presets::{self, Preset};
 use wpe_library::{Item, Sources, steam};
 
 /// The scanned library and Wallpaper Engine's UI strings, loaded on first
 /// use.
 #[derive(Default)]
-pub struct Library(RwLock<Option<Arc<Loaded>>>);
+pub struct Library(RwLock<Option<Arc<Loaded>>>, tokio::sync::OnceCell<Arc<Resolutions>>);
+
+/// Wallpaper sizes by item id, for those whose size is known.
+type Resolutions = HashMap<String, (u32, u32)>;
 
 pub struct Loaded {
     pub items: Vec<Item>,
@@ -199,6 +203,31 @@ pub fn conditions(
         .collect()
 }
 
+/// Every wallpaper's size in pixels, by id (those that have one). Reads
+/// each wallpaper's files once (a second or two), then answers at once.
+#[tauri::command]
+pub async fn resolutions(state: State<'_, Library>) -> Result<Arc<Resolutions>, String> {
+    let loaded = state.loaded(false).await;
+    let sizes = state
+        .1
+        .get_or_init(|| async move {
+            tauri::async_runtime::spawn_blocking(move || {
+                use rayon::prelude::*;
+                Arc::new(
+                    loaded
+                        .items
+                        .par_iter()
+                        .filter_map(|item| Some((item.id.clone(), wpe_library::resolution(item)?)))
+                        .collect(),
+                )
+            })
+            .await
+            .expect("measuring wallpapers")
+        })
+        .await;
+    Ok(sizes.clone())
+}
+
 /// A wallpaper's size in pixels, if known (reads its files).
 #[tauri::command]
 pub async fn resolution(state: State<'_, Library>, id: String) -> Result<Option<(u32, u32)>, String> {
@@ -207,6 +236,66 @@ pub async fn resolution(state: State<'_, Library>, id: String) -> Result<Option<
     tauri::async_runtime::spawn_blocking(move || wpe_library::resolution(&item))
         .await
         .map_err(|e| e.to_string())
+}
+
+/// The user's folders. The first time, Wallpaper Engine's own folders are
+/// imported (and saved).
+#[tauri::command]
+pub fn folders() -> Result<Vec<Folder>, String> {
+    let path = folders::default_path().ok_or("no config directory")?;
+    if path.exists() {
+        return folders::load(&path).map_err(|e| e.to_string());
+    }
+    let imported = steam::we_dir()
+        .map(|dir| dir.join("config.json"))
+        .filter(|c| c.is_file())
+        .and_then(|c| folders::import_we_folders(&c).ok())
+        .unwrap_or_default();
+    folders::save(&path, &imported).map_err(|e| e.to_string())?;
+    Ok(imported)
+}
+
+#[tauri::command]
+pub fn save_folders(folders: Vec<Folder>) -> Result<(), String> {
+    let path = folders::default_path().ok_or("no config directory")?;
+    folders::save(&path, &folders).map_err(|e| e.to_string())
+}
+
+/// The daemon's systemd user units (README, "Running at login").
+const UNITS: [&str; 2] = ["wallpaper-engine-rs.socket", "wallpaper-engine-rs.service"];
+
+/// Whether the daemon starts with the session (its units are enabled).
+#[tauri::command]
+pub async fn autostart() -> Result<bool, String> {
+    let out = systemctl(&["is-enabled", UNITS[0]]).await?;
+    Ok(out.trim() == "enabled")
+}
+
+#[tauri::command]
+pub async fn set_autostart(enabled: bool) -> Result<(), String> {
+    let verb = if enabled { "enable" } else { "disable" };
+    systemctl(&[verb, UNITS[0], UNITS[1]]).await.map(|_| ())
+}
+
+/// `systemctl --user ...`: its output, or why it failed.
+async fn systemctl(args: &[&str]) -> Result<String, String> {
+    let args: Vec<String> = args.iter().map(|s| s.to_string()).collect();
+    tauri::async_runtime::spawn_blocking(move || {
+        let out = std::process::Command::new("systemctl")
+            .arg("--user")
+            .args(&args)
+            .output()
+            .map_err(|e| format!("systemctl: {e}"))?;
+        let stdout = String::from_utf8_lossy(&out.stdout).into_owned();
+        // `is-enabled` exits 1 for a disabled unit: that is an answer.
+        if out.status.success() || args[0] == "is-enabled" && !stdout.trim().is_empty() {
+            Ok(stdout)
+        } else {
+            Err(String::from_utf8_lossy(&out.stderr).trim().to_owned())
+        }
+    })
+    .await
+    .map_err(|e| e.to_string())?
 }
 
 fn presets_dir() -> Result<PathBuf, String> {

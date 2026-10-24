@@ -6,10 +6,10 @@ use std::hash::{DefaultHasher, Hash, Hasher};
 use std::path::{Path, PathBuf};
 use std::time::UNIX_EPOCH;
 
-/// Thumbnails are this size (16:9, covering): twice a typical tile, for
-/// scaled outputs.
-pub const WIDTH: u32 = 400;
-pub const HEIGHT: u32 = 225;
+/// Thumbnails are this size (square, covering, as previews mostly are):
+/// twice a typical tile, for scaled outputs.
+pub const WIDTH: u32 = 360;
+pub const HEIGHT: u32 = 360;
 
 /// `$XDG_CACHE_HOME/wallpaper-engine-rs/thumbs`.
 pub fn cache_dir() -> Option<PathBuf> {

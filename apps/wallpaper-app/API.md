@@ -9,6 +9,9 @@ holds the app state.
   (debug builds load the dev server at `localhost:1420` and reload on edit).
 - Release: `pnpm -C apps/wallpaper-app/ui build`, then
   `cargo build --release -p wallpaper-app` (embeds `ui/dist`).
+- Without the app: open `http://localhost:1420` in a browser while
+  `pnpm dev` runs. Outside Tauri the page answers its own commands with
+  made-up wallpapers and two displays (`ui/src/mock.ts`).
 
 ## Commands (`await invoke(name, args)`)
 
@@ -21,6 +24,11 @@ Errors reject with a message string.
 | `properties` | `{id, output?}` | `{output, properties: Property[]}`. With `output` (one showing this wallpaper): the live values; without: the project's (a preset item's values). |
 | `conditions` | `{conditions: {name: expr}, values: {name: value}}` | `{name: bool}`: which properties show (`Property.condition`) with these values. |
 | `resolution` | `{id}` | `[width, height]` or null. Reads the wallpaper's files: ask for the selected item only. |
+| `resolutions` | | `{id: [width, height]}` for every wallpaper with a known size. The first call reads every wallpaper (a second or two). |
+| `folders` | | `Folder[]`: `{name, items: id[], folders: Folder[]}`. The first time, Wallpaper Engine's own folders are imported. |
+| `save_folders` | `{folders}` | |
+| `autostart` | | Whether the daemon's systemd units are enabled. |
+| `set_autostart` | `{enabled}` | Enables or disables them. |
 | `presets` | `{id}` | `Preset[]`: `{name, wallpaper: id, values: {name: value}}`. |
 | `save_preset` | `{preset}` | Saves (replacing one of the same name). |
 | `delete_preset` | `{id, name}` | |

@@ -81,6 +81,13 @@ export interface Property {
   condition?: string;
 }
 
+export interface Folder {
+  name: string;
+  /** Item ids. */
+  items: string[];
+  folders: Folder[];
+}
+
 export interface Preset {
   name: string;
   wallpaper: string;
@@ -91,6 +98,7 @@ export interface Preset {
 export type Request =
   | { cmd: "status" }
   | { cmd: "version" }
+  | { cmd: "properties"; output?: string }
   | { cmd: "set"; output?: string; wallpaper: string; properties?: Values }
   | { cmd: "property"; output?: string; name: string; value: Value }
   | { cmd: "set-properties"; output?: string; values: Values }
@@ -122,6 +130,11 @@ export const api = {
   conditions: (conditions: Record<string, string>, values: Values) =>
     invoke<Record<string, boolean>>("conditions", { conditions, values }),
   resolution: (id: string) => invoke<[number, number] | null>("resolution", { id }),
+  resolutions: () => invoke<Record<string, [number, number]>>("resolutions"),
+  folders: () => invoke<Folder[]>("folders"),
+  saveFolders: (folders: Folder[]) => invoke<void>("save_folders", { folders }),
+  autostart: () => invoke<boolean>("autostart"),
+  setAutostart: (enabled: boolean) => invoke<void>("set_autostart", { enabled }),
   presets: (id: string) => invoke<Preset[]>("presets", { id }),
   savePreset: (preset: Preset) => invoke<void>("save_preset", { preset }),
   deletePreset: (id: string, name: string) => invoke<void>("delete_preset", { id, name }),
@@ -131,10 +144,21 @@ export const api = {
   openFolder: (id: string) => invoke<void>("open_folder", { id }),
 };
 
+/** Set by the browser preview (`mock.ts`): pictures are made up. */
+const mocked = () => !!(window as unknown as { __PENGUIN_MOCK__?: boolean }).__PENGUIN_MOCK__;
+let mockPicture: ((url: string) => string) | null = null;
+export function setMockPictures(f: (url: string) => string) {
+  mockPicture = f;
+}
+const picture = (scheme: string, id: string) => {
+  const url = `${scheme}://localhost/${encodeURIComponent(id)}`;
+  return mocked() && mockPicture ? mockPicture(url) : url;
+};
+
 /** A small still of a wallpaper (cached PNG). */
-export const thumbUrl = (id: string) => `thumb://localhost/${encodeURIComponent(id)}`;
+export const thumbUrl = (id: string) => picture("thumb", id);
 /** A wallpaper's preview as it is (GIFs animate). */
-export const previewUrl = (id: string) => `preview://localhost/${encodeURIComponent(id)}`;
+export const previewUrl = (id: string) => picture("preview", id);
 
 export function onDaemonEvent(f: (e: DaemonEvent) => void): Promise<UnlistenFn> {
   return listen<DaemonEvent>("daemon-event", ({ payload }) => f(payload));

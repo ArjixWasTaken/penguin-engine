@@ -10,7 +10,7 @@ fn main() {
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| "info".into()),
+                .unwrap_or_else(|_| "info,mp4parse=error".into()),
         )
         .init();
 
@@ -27,6 +27,11 @@ fn main() {
             commands::properties,
             commands::conditions,
             commands::resolution,
+            commands::resolutions,
+            commands::folders,
+            commands::save_folders,
+            commands::autostart,
+            commands::set_autostart,
             commands::presets,
             commands::save_preset,
             commands::delete_preset,

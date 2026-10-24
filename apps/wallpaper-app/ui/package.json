@@ -9,9 +9,12 @@
     "check": "tsc --noEmit"
   },
   "dependencies": {
+    "@fontsource/ibm-plex-mono": "5.3.0",
+    "@fontsource/ibm-plex-sans": "5.3.0",
     "@tauri-apps/api": "3.0.0-alpha.3",
     "@tauri-apps/plugin-dialog": "3.0.0-alpha.4",
     "@tauri-apps/plugin-opener": "3.0.0-alpha.3",
+    "lucide-preact": "1.55.0",
     "preact": "11.0.1",
     "zustand": "5.0.15"
   },
