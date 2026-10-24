@@ -1,6 +1,6 @@
 //! Requests from the control socket, and the settings changes they make.
 
-use std::path::Path;
+use std::collections::BTreeMap;
 use std::time::Instant;
 
 use serde_json::Value;
@@ -8,14 +8,14 @@ use smithay_client_toolkit::reexports::client::Proxy;
 use smithay_client_toolkit::shell::WaylandSurface;
 use smithay_client_toolkit::shell::wlr_layer::SurfaceKind;
 use wpe_ipc::{
-    Fill, OutputProperties, OutputStatus, PropertyChoice, PropertyInfo, Request, Response,
-    Settings, Status, WallpaperInfo,
+    Event, Fill, OutputProperties, OutputStatus, PropertyChoice, PropertyInfo, Request, Response,
+    Settings, SettingsPatch, Status, Values, VersionInfo, WallpaperInfo,
 };
-use wpe_runtime::{Project, Wallpaper};
+use wpe_runtime::Project;
 
 use crate::loading::{LoadSpec, SetRequest};
 use crate::state::SavedOutput;
-use crate::{App, control, shell_layer, state};
+use crate::{App, Screen, control, shell_layer, state};
 
 /// Fastest frame rate cap accepted.
 const MAX_FPS: u32 = 1000;
@@ -44,9 +44,11 @@ pub fn select<'a>(
 }
 
 /// The user properties of `project` for a settings form, in the order
-/// Wallpaper Engine shows them; `current` gives a property's value now.
+/// Wallpaper Engine shows them; `defaults` are the values without overrides
+/// (else `project`'s), `current` gives a property's value now.
 pub fn property_infos(
     project: &Project,
+    defaults: &BTreeMap<String, Value>,
     current: impl Fn(&str) -> Option<Value>,
 ) -> Vec<PropertyInfo> {
     let mut list: Vec<PropertyInfo> = project
@@ -58,7 +60,7 @@ pub fn property_infos(
             kind: p.kind.clone().unwrap_or_default(),
             text: p.text.clone(),
             value: current(name).unwrap_or_else(|| p.value.clone()),
-            default: p.value.clone(),
+            default: defaults.get(name).unwrap_or(&p.value).clone(),
             options: p
                 .options
                 .iter()
@@ -83,22 +85,72 @@ pub fn property_infos(
     list
 }
 
-fn wallpaper_info(path: &Path, wallpaper: &Wallpaper) -> WallpaperInfo {
+/// What `screen` shows. For a preset item: the item's path, id and title,
+/// the dependency's type, and the dependency.
+fn wallpaper_info(screen: &Screen) -> WallpaperInfo {
+    let (path, wallpaper) = (&screen.path, &screen.wallpaper);
     let project = wallpaper.project();
     let kind = match &project.kind {
         Some(kind) => kind.to_ascii_lowercase(),
         None if wallpaper.is_video() => "video".to_owned(),
         None => "scene".to_owned(),
     };
-    WallpaperInfo {
-        path: path.display().to_string(),
-        workshop_id: project
+    let own_id = || {
+        project
             .workshopid
             .clone()
             .filter(|id| !id.is_empty())
-            .or_else(|| wpe_runtime::steam::workshop_id(path)),
-        title: wallpaper.title.clone(),
-        kind,
+            .or_else(|| wpe_runtime::steam::workshop_id(path))
+    };
+    match &screen.preset {
+        Some(preset) => WallpaperInfo {
+            path: path.display().to_string(),
+            workshop_id: preset
+                .workshop_id
+                .clone()
+                .or_else(|| wpe_runtime::steam::workshop_id(path)),
+            title: preset
+                .title
+                .clone()
+                .unwrap_or_else(|| wallpaper.title.clone()),
+            kind,
+            dependency: Some(preset.dependency.display().to_string()),
+        },
+        None => WallpaperInfo {
+            path: path.display().to_string(),
+            workshop_id: own_id(),
+            title: wallpaper.title.clone(),
+            kind,
+            dependency: None,
+        },
+    }
+}
+
+/// The current values of every user property of `screen`'s wallpaper.
+fn current_values(screen: &Screen) -> Values {
+    screen
+        .wallpaper
+        .project()
+        .general
+        .properties
+        .iter()
+        .map(|(name, p)| {
+            let value = screen.wallpaper.user_property(name).unwrap_or(&p.value);
+            (name.clone(), value.clone())
+        })
+        .collect()
+}
+
+/// What the daemon is and supports.
+pub fn version() -> VersionInfo {
+    let mut features = Vec::new();
+    if cfg!(feature = "web") {
+        features.push("web".to_owned());
+    }
+    VersionInfo {
+        protocol: wpe_ipc::PROTOCOL,
+        daemon: env!("CARGO_PKG_VERSION").to_owned(),
+        features,
     }
 }
 
@@ -114,18 +166,59 @@ fn check_settings(settings: &Settings) -> Result<(), String> {
 
 impl control::Handler for App {
     fn handle_request(&mut self, request: Request, responder: control::Responder) {
+        // Changes to properties don't show in the status.
+        let changes_status = !matches!(
+            request,
+            Request::Status
+                | Request::Properties { .. }
+                | Request::Property { .. }
+                | Request::Version
+        );
         let result = match request {
             Request::Status => Ok(Response {
                 status: Some(self.status()),
                 ..Response::ok()
             }),
             // Answered once the wallpaper has loaded.
-            Request::Set { output, wallpaper } => {
-                if let Err(e) = self.set_wallpaper(output.as_deref(), &wallpaper, responder) {
+            Request::Set {
+                output,
+                wallpaper,
+                properties,
+            } => {
+                let properties = properties.into_iter().collect();
+                if let Err(e) =
+                    self.set_wallpaper(output.as_deref(), &wallpaper, properties, responder)
+                {
                     tracing::warn!("control request failed: {e}");
                 }
                 return;
             }
+            Request::Version => Ok(Response {
+                version: Some(version()),
+                ..Response::ok()
+            }),
+            Request::Subscribe => {
+                if let Some(stream) = responder.into_subscriber() {
+                    let first = Event::Status {
+                        status: self.status(),
+                    };
+                    if let Err(e) = self.events.add(stream, Some(&first)) {
+                        tracing::warn!("cannot subscribe a client: {e}");
+                    }
+                }
+                return;
+            }
+            // Answered at once, or once the outputs that reload have.
+            Request::SetProperties { output, values } => {
+                let values = values.into_iter().collect();
+                self.change_properties(output.as_deref(), Change::Set(values), responder);
+                return;
+            }
+            Request::ResetProperties { output } => {
+                self.change_properties(output.as_deref(), Change::Reset, responder);
+                return;
+            }
+            Request::Settings { patch } => self.patch_settings(&patch),
             Request::Properties { output } => self.properties(output.as_deref()),
             Request::Property {
                 output,
@@ -145,6 +238,9 @@ impl control::Handler for App {
                 Ok(Response::ok())
             }
         };
+        if changes_status {
+            self.status_changed();
+        }
         if let Err(e) = &result {
             tracing::warn!("control request failed: {e}");
         }
@@ -153,7 +249,7 @@ impl control::Handler for App {
 }
 
 impl App {
-    fn status(&self) -> Status {
+    pub fn status(&self) -> Status {
         let outputs = self
             .outputs
             .iter()
@@ -184,12 +280,16 @@ impl App {
                     width: logical.0,
                     height: logical.1,
                     scale,
-                    wallpaper: screen.map(|s| wallpaper_info(&s.path, &s.wallpaper)),
+                    wallpaper: screen.map(wallpaper_info),
                     paused: screen.is_some_and(|s| s.paused),
                     fps: screen
                         .filter(|s| !s.paused)
                         .map_or(0.0, |s| s.stats.current()),
                     fill,
+                    loading: self
+                        .loads
+                        .loading(&o.output)
+                        .map(|p| p.display().to_string()),
                 }
             })
             .collect();
@@ -221,6 +321,7 @@ impl App {
         &mut self,
         output: Option<&str>,
         spec: &str,
+        properties: BTreeMap<String, Value>,
         responder: control::Responder,
     ) -> Result<(), String> {
         let checked = (|| {
@@ -267,9 +368,10 @@ impl App {
                 output,
                 name,
                 path: path.clone(),
-                properties: Vec::new(),
+                properties: properties.clone(),
                 fill,
                 request: Some(request.clone()),
+                remember: true,
             };
             self.start_load(spec, surface);
         }
@@ -285,7 +387,7 @@ impl App {
                 OutputProperties {
                     output: s.name.clone(),
                     wallpaper: s.path.display().to_string(),
-                    properties: property_infos(s.wallpaper.project(), |name| {
+                    properties: property_infos(s.wallpaper.project(), &s.defaults, |name| {
                         s.wallpaper.user_property(name).cloned()
                     }),
                 }
@@ -342,10 +444,153 @@ impl App {
             );
             self.state
                 .set_property(&screen.name, &screen.path, name, value.clone());
+            self.emit_properties(i);
         }
         self.save_state();
         self.schedule_all();
         Ok(Response::ok())
+    }
+
+    /// Tell subscribers screen `i`'s property values.
+    pub fn emit_properties(&self, i: usize) {
+        if self.events.is_empty() {
+            return;
+        }
+        let screen = &self.screens[i];
+        self.events.send(&Event::Properties {
+            output: screen.name.clone(),
+            wallpaper: screen.path.display().to_string(),
+            values: current_values(screen),
+        });
+    }
+
+    /// `set-properties` and `reset-properties`. A change of one value (or
+    /// any on a web wallpaper, whose page takes them as they come) applies
+    /// in place; several on a scene reload it with all of them off the
+    /// render thread, one rebuild instead of one each, and the response
+    /// waits for that.
+    fn change_properties(
+        &mut self,
+        output: Option<&str>,
+        change: Change,
+        responder: control::Responder,
+    ) {
+        let targets = match self.property_targets(output, &change) {
+            Ok(t) => t,
+            Err(e) => {
+                tracing::warn!("control request failed: {e}");
+                responder.send(Response::error(e));
+                return;
+            }
+        };
+        let Some(gpu) = self.gpu.clone() else {
+            responder.send(Response::error("no GPU"));
+            return;
+        };
+        let mut reloads = Vec::new();
+        for (i, changes) in targets {
+            let screen = &self.screens[i];
+            let (name, path) = (screen.name.clone(), screen.path.clone());
+            match &change {
+                Change::Set(values) => {
+                    let project = &screen.wallpaper.project().general.properties;
+                    for (k, v) in values.iter().filter(|(k, _)| project.contains_key(*k)) {
+                        self.state.set_property(&name, &path, k, v.clone());
+                    }
+                }
+                Change::Reset => self.state.clear_properties(&name, &path),
+            }
+            if changes.is_empty() {
+                continue;
+            }
+            let screen = &mut self.screens[i];
+            if changes.len() == 1 || screen.wallpaper.is_web() {
+                let started = Instant::now();
+                for (k, v) in &changes {
+                    screen.wallpaper.set_user_property(&gpu, k, v.clone());
+                }
+                screen.dirty = true;
+                tracing::info!(
+                    "{name}: {} properties changed ({:.1?})",
+                    changes.len(),
+                    started.elapsed()
+                );
+                self.emit_properties(i);
+            } else {
+                tracing::info!("{name}: {} properties changed; reloading", changes.len());
+                reloads.push(i);
+            }
+        }
+        self.save_state();
+        if reloads.is_empty() {
+            self.schedule_all();
+            responder.send(Response::ok());
+            return;
+        }
+        let request = SetRequest::new(responder);
+        for i in reloads {
+            let screen = &self.screens[i];
+            let spec = LoadSpec {
+                output: screen.output.clone(),
+                name: screen.name.clone(),
+                path: screen.path.clone(),
+                properties: self.state.overrides(&screen.name, &screen.path),
+                fill: screen.fill,
+                request: Some(request.clone()),
+                remember: false,
+            };
+            self.start_load(spec, None);
+        }
+        self.schedule_all();
+    }
+
+    /// The screens `change` applies to, each with the values that differ
+    /// from what it shows now.
+    fn property_targets(
+        &self,
+        output: Option<&str>,
+        change: &Change,
+    ) -> Result<Vec<(usize, Changes)>, String> {
+        let screens = self.select_screens(output)?;
+        let mut known = false;
+        let mut targets = Vec::new();
+        for i in screens {
+            let screen = &self.screens[i];
+            let project = &screen.wallpaper.project().general.properties;
+            let wanted: Vec<(String, Value)> = match change {
+                Change::Set(values) => values
+                    .iter()
+                    .filter(|(k, _)| project.contains_key(*k))
+                    .map(|(k, v)| (k.clone(), v.clone()))
+                    .collect(),
+                Change::Reset => project
+                    .iter()
+                    .map(|(k, p)| {
+                        (
+                            k.clone(),
+                            screen.defaults.get(k).unwrap_or(&p.value).clone(),
+                        )
+                    })
+                    .collect(),
+            };
+            known |= !wanted.is_empty();
+            let changes = wanted
+                .into_iter()
+                .filter(|(k, v)| screen.wallpaper.user_property(k) != Some(v))
+                .collect();
+            targets.push((i, changes));
+        }
+        if let Change::Set(values) = change
+            && !values.is_empty()
+            && !known
+        {
+            let names: Vec<&str> = values.keys().map(String::as_str).collect();
+            return Err(format!(
+                "no wallpaper has the properties {}",
+                names.join(", ")
+            ));
+        }
+        Ok(targets)
     }
 
     fn pause(&mut self, output: Option<&str>, paused: bool) -> Result<Response, String> {
@@ -377,6 +622,19 @@ impl App {
                 self.change_settings(|s| s.fill = fill)
             }
         }
+    }
+
+    /// `settings`: several at once, as the single-setting requests do them.
+    fn patch_settings(&mut self, patch: &SettingsPatch) -> Result<Response, String> {
+        let new = self.settings.patched(patch);
+        check_settings(&new)?;
+        if patch.fill.is_some() {
+            // The global fill, for every output.
+            for saved in self.state.outputs.values_mut() {
+                saved.fill = None;
+            }
+        }
+        self.change_settings(|s| *s = new)
     }
 
     /// Change settings over the socket: applied now and saved, ahead of the
@@ -477,6 +735,16 @@ impl App {
     }
 }
 
+/// Property values to change, in order.
+type Changes = Vec<(String, Value)>;
+
+/// What `set-properties` and `reset-properties` do.
+enum Change {
+    Set(BTreeMap<String, Value>),
+    /// Back to the defaults.
+    Reset,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -509,7 +777,10 @@ mod tests {
             }}
         }))
         .unwrap();
-        let list = property_infos(&project, |name| (name == "speed").then(|| json!(2.5)));
+        let defaults = BTreeMap::from([("rain".to_owned(), json!(false))]);
+        let list = property_infos(&project, &defaults, |name| {
+            (name == "speed").then(|| json!(2.5))
+        });
         let names: Vec<_> = list.iter().map(|p| p.name.as_str()).collect();
         assert_eq!(names, ["schemecolor", "mode", "speed", "rain"]);
         let speed = &list[2];
@@ -523,6 +794,7 @@ mod tests {
         assert_eq!(list[1].options.len(), 2);
         assert_eq!(list[1].options[1].value, json!("b"));
         assert_eq!(list[3].value, json!(true));
+        assert_eq!(list[3].default, json!(false));
     }
 
     #[test]

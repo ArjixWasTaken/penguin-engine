@@ -165,11 +165,16 @@ wallpaperctl set 3566329932                # a workshop id or a path, on every o
 wallpaperctl set --output DP-1 ~/walls/foo # one output
 wallpaperctl properties                    # user properties, with types, ranges, options
 wallpaperctl property sakura false         # value as JSON, or else a string
+wallpaperctl properties-set a=1 b=true     # several at once, one rebuild
+wallpaperctl reset-properties              # back to the wallpaper's (or preset's) values
+wallpaperctl set --prop speed=2 3566329932 # load with property values
 wallpaperctl pause | resume                # [--output X]
 wallpaperctl audio on|off ; wallpaperctl volume 40 ; wallpaperctl fps 30
 wallpaperctl fill fit                      # [--output X] crop | fit | stretch
 wallpaperctl reload                        # re-read config.toml (as SIGHUP does)
 wallpaperctl quit
+wallpaperctl version                       # daemon version, protocol, features (web)
+wallpaperctl watch                         # events as JSON lines, until the daemon goes
 wallpaperctl --json status                 # the raw response
 ```
 
@@ -198,10 +203,38 @@ can show an output without a wallpaper yet.
 < {"ok":false,"error":"volume 150 is out of 0..=100"}
 ```
 
-Requests: `status`, `set` {`output`?, `wallpaper`}, `properties` {`output`?}, `property`
-{`output`?, `name`, `value`}, `pause` / `resume` {`output`?}, `audio` {`enabled`}, `volume`
-{`volume`}, `fps` {`fps`}, `fill` {`output`?, `fill`}, `reload-settings`, `quit`. Without
+Requests: `status`, `set` {`output`?, `wallpaper`, `properties`?}, `properties` {`output`?},
+`property` {`output`?, `name`, `value`}, `set-properties` {`output`?, `values`},
+`reset-properties` {`output`?}, `pause` / `resume` {`output`?}, `audio` {`enabled`}, `volume`
+{`volume`}, `fps` {`fps`}, `fill` {`output`?, `fill`}, `settings` {`fps`?, `audio`?, `volume`?,
+`fill`?, `layer`?, `passthrough`?}, `reload-settings`, `version`, `subscribe`, `quit`. Without
 `output` a request applies to every output.
+
+Protocol 2 (`version` answers `{"protocol":2,"daemon":"0.1.0","features":["web"]}`) only adds
+to version 1. `set-properties` changes several properties with one rebuild: one value (or a web
+wallpaper's, which its page takes as they come) applies in place; several on a scene reload it
+off the render thread with all of them, answered once it shows. `reset-properties` returns to
+the wallpaper's values and forgets the saved changes. `settings` changes several settings as
+the single-setting requests do (a `fill` there is the global one, clearing outputs' own). A
+status's outputs have `loading`, the wallpaper loading for them, if any.
+
+`subscribe` is answered `{"ok":true}`; from then on the connection carries events, starting
+with the current status, until it closes (other requests on it are ignored):
+
+```text
+< {"event":"status","status":{...}}          after any change, once per loop iteration
+< {"event":"loading","output":"DP-3","wallpaper":"/.../3717623935"}
+< {"event":"load-failed","output":"DP-3","wallpaper":"/...","error":"..."}
+< {"event":"properties","output":"DP-3","wallpaper":"/...","values":{"clock":false,...}}
+```
+
+`properties` carries every property's current value, after a change and after a wallpaper
+loads. A subscriber never slows the daemon down: one that leaves more than 1 MB unread is
+disconnected.
+
+Preset items (workshop items that only name another wallpaper, `dependency`, with property
+values, `preset`) play that wallpaper with the preset's values under the saved changes; their
+status shows the preset item's path, id and title, and the wallpaper playing as `dependency`.
 
 ### State and settings
 

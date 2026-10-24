@@ -52,14 +52,6 @@ impl SavedOutput {
             fill: None,
         }
     }
-
-    /// The property overrides as `Wallpaper::load_with_properties` takes them.
-    pub fn property_list(&self) -> Vec<(String, Value)> {
-        self.properties
-            .iter()
-            .map(|(k, v)| (k.clone(), v.clone()))
-            .collect()
-    }
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
@@ -118,11 +110,18 @@ impl State {
         self.outputs.get(name).or(self.last.as_ref())
     }
 
-    /// Output `name` now shows `wallpaper`, with its default properties.
-    pub fn set_wallpaper(&mut self, name: &str, wallpaper: &Path) {
+    /// Output `name` now shows `wallpaper`, with `properties` changed from
+    /// its defaults.
+    pub fn set_wallpaper(
+        &mut self,
+        name: &str,
+        wallpaper: &Path,
+        properties: BTreeMap<String, Value>,
+    ) {
         let fill = self.outputs.get(name).and_then(|o| o.fill);
         let entry = SavedOutput {
             fill,
+            properties,
             ..SavedOutput::new(wallpaper.to_owned())
         };
         self.last = Some(SavedOutput {
@@ -140,24 +139,56 @@ impl State {
 
     /// Remember a user property change on output `name` (which shows `wallpaper`).
     pub fn set_property(&mut self, name: &str, wallpaper: &Path, property: &str, value: Value) {
-        let entry = self
-            .outputs
-            .entry(name.to_owned())
-            .or_insert_with(|| SavedOutput::new(wallpaper.to_owned()));
+        let entry = self.entry(name, wallpaper);
         entry.properties.insert(property.to_owned(), value);
+        let properties = entry.properties.clone();
         // New outputs showing the same wallpaper get the same look.
         if let Some(last) = &mut self.last
             && last.wallpaper == wallpaper
         {
-            last.properties = entry.properties.clone();
+            last.properties = properties;
+        }
+    }
+
+    /// Forget the property changes on output `name` (which shows `wallpaper`).
+    pub fn clear_properties(&mut self, name: &str, wallpaper: &Path) {
+        if let Some(entry) = self.outputs.get_mut(name) {
+            entry.properties.clear();
+        }
+        if let Some(last) = &mut self.last
+            && last.wallpaper == wallpaper
+        {
+            last.properties.clear();
         }
     }
 
     pub fn set_fill(&mut self, name: &str, wallpaper: &Path, fill: Option<Fill>) {
+        self.entry(name, wallpaper).fill = fill;
+    }
+
+    /// Output `name`'s own entry, made from what it shows (`wallpaper`,
+    /// with the last one's properties when it is that one) if it has none.
+    fn entry(&mut self, name: &str, wallpaper: &Path) -> &mut SavedOutput {
+        let inherited = self
+            .last
+            .as_ref()
+            .filter(|last| last.wallpaper == wallpaper)
+            .map(|last| last.properties.clone())
+            .unwrap_or_default();
         self.outputs
             .entry(name.to_owned())
-            .or_insert_with(|| SavedOutput::new(wallpaper.to_owned()))
-            .fill = fill;
+            .or_insert_with(|| SavedOutput {
+                properties: inherited,
+                ..SavedOutput::new(wallpaper.to_owned())
+            })
+    }
+
+    /// The property changes output `name` (showing `wallpaper`) has.
+    pub fn overrides(&self, name: &str, wallpaper: &Path) -> BTreeMap<String, Value> {
+        self.for_output(name)
+            .filter(|saved| saved.wallpaper == wallpaper)
+            .map(|saved| saved.properties.clone())
+            .unwrap_or_default()
     }
 }
 
@@ -209,10 +240,14 @@ mod tests {
         assert_eq!(State::load(&path), State::default());
 
         let mut state = State::default();
-        state.set_wallpaper("DP-1", Path::new("/w/1"));
+        state.set_wallpaper("DP-1", Path::new("/w/1"), BTreeMap::new());
         state.set_property("DP-1", Path::new("/w/1"), "speed", json!(0.5));
         state.set_fill("DP-1", Path::new("/w/1"), Some(Fill::Fit));
-        state.set_wallpaper("HDMI-A-1", Path::new("/w/2"));
+        state.set_wallpaper(
+            "HDMI-A-1",
+            Path::new("/w/2"),
+            BTreeMap::from([("rain".to_owned(), json!(false))]),
+        );
         state.settings = Some(Settings {
             fps: 30,
             ..Default::default()
@@ -232,12 +267,18 @@ mod tests {
         let new = back.for_output("DP-3").unwrap();
         assert_eq!(new.wallpaper, Path::new("/w/2"));
         assert_eq!(new.fill, None);
+        assert_eq!(new.properties["rain"], json!(false));
 
         // Setting a new wallpaper keeps the output's fill, drops properties.
-        state.set_wallpaper("DP-1", Path::new("/w/3"));
+        state.set_wallpaper("DP-1", Path::new("/w/3"), BTreeMap::new());
         let dp = state.for_output("DP-1").unwrap();
         assert!(dp.properties.is_empty());
         assert_eq!(dp.fill, Some(Fill::Fit));
+
+        // Resetting forgets the overrides, here and for new outputs.
+        state.clear_properties("HDMI-A-1", Path::new("/w/2"));
+        assert!(state.outputs["HDMI-A-1"].properties.is_empty());
+        assert!(state.last.as_ref().unwrap().properties.is_empty());
 
         std::fs::write(&path, "{broken").unwrap();
         assert_eq!(State::load(&path), State::default());
@@ -247,18 +288,26 @@ mod tests {
     #[test]
     fn everywhere_replaces_every_output() {
         let mut state = State::default();
-        state.set_wallpaper("DP-1", Path::new("/w/1"));
+        state.set_wallpaper("DP-1", Path::new("/w/1"), BTreeMap::new());
         state.set_everywhere(SavedOutput::new("/w/9".into()));
         assert_eq!(
             state.for_output("DP-1").unwrap().wallpaper,
             Path::new("/w/9")
         );
-        // Property changes follow onto new outputs showing that wallpaper.
+        // Property changes follow onto new outputs showing that wallpaper,
+        // and keep the ones it was set with.
+        state
+            .last
+            .as_mut()
+            .unwrap()
+            .properties
+            .insert("y".into(), json!(1));
         state.set_property("DP-1", Path::new("/w/9"), "x", json!(true));
-        assert_eq!(
-            state.for_output("DP-2").unwrap().properties["x"],
-            json!(true)
-        );
+        let dp2 = state.for_output("DP-2").unwrap();
+        assert_eq!(dp2.properties["x"], json!(true));
+        assert_eq!(dp2.properties["y"], json!(1));
+        assert_eq!(state.overrides("DP-1", Path::new("/w/9")).len(), 2);
+        assert!(state.overrides("DP-1", Path::new("/w/8")).is_empty());
     }
 
     #[test]

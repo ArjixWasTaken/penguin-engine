@@ -9,7 +9,8 @@
 //! `set` request waiting on it is answered with an error.
 
 use std::cell::RefCell;
-use std::path::PathBuf;
+use std::collections::BTreeMap;
+use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use std::sync::Arc;
 use std::time::Instant;
@@ -20,17 +21,25 @@ use smithay_client_toolkit::reexports::protocols::wp::fractional_scale::v1::clie
 use smithay_client_toolkit::reexports::protocols::wp::viewporter::client::wp_viewport::WpViewport;
 use smithay_client_toolkit::shell::WaylandSurface;
 use smithay_client_toolkit::shell::wlr_layer::LayerSurface;
-use wpe_ipc::{Fill, Response};
+use serde_json::Value;
+use wpe_ipc::{Event, Fill, Response};
 use wpe_render::{Gpu, wgpu};
 use wpe_runtime::{PreparedWallpaper, Wallpaper};
 
 use crate::control::Responder;
+use crate::preset::{self, Item};
 use crate::{App, Screen, fill_mode};
+
+/// A prepared wallpaper and what it was loaded as.
+pub struct Loaded {
+    prepared: PreparedWallpaper,
+    item: Item,
+}
 
 /// A prepared wallpaper (or why it failed) coming back from a worker.
 pub struct Done {
     id: u64,
-    result: Result<PreparedWallpaper, String>,
+    result: Result<Loaded, String>,
 }
 
 /// A layer surface made for an output without a screen, waiting for its
@@ -99,12 +108,16 @@ impl SetRequest {
 pub struct LoadSpec {
     pub output: WlOutput,
     pub name: String,
+    /// What was set (a preset item stays itself here).
     pub path: PathBuf,
-    pub properties: Vec<(String, serde_json::Value)>,
+    /// The user's property overrides (over the wallpaper's or preset's).
+    pub properties: BTreeMap<String, Value>,
     /// The fill of a new screen.
     pub fill: Fill,
-    /// The `set` request it is for (then it's saved in the state), if any.
+    /// The request it answers, if any.
     pub request: Option<Rc<RefCell<SetRequest>>>,
+    /// Save it in the state as the output's wallpaper once shown (a `set`).
+    pub remember: bool,
 }
 
 /// A load in flight for one output.
@@ -115,7 +128,7 @@ struct PendingLoad {
     surface: Option<NewSurface>,
     started: Instant,
     /// The worker's result, kept until the other loads of the request are in.
-    result: Option<Result<PreparedWallpaper, String>>,
+    result: Option<Result<Loaded, String>>,
 }
 
 /// The loads in flight.
@@ -144,6 +157,14 @@ impl Loads {
             .iter()
             .any(|l| l.spec.output == *output && l.surface.is_some())
     }
+
+    /// The wallpaper loading for `output`, if any.
+    pub fn loading(&self, output: &WlOutput) -> Option<&Path> {
+        self.pending
+            .iter()
+            .find(|l| l.spec.output == *output)
+            .map(|l| l.spec.path.as_path())
+    }
 }
 
 fn same_request(a: &Option<Rc<RefCell<SetRequest>>>, b: &Rc<RefCell<SetRequest>>) -> bool {
@@ -158,14 +179,21 @@ fn spawn_prepare(
     id: u64,
     format: wgpu::TextureFormat,
     path: PathBuf,
-    properties: Vec<(String, serde_json::Value)>,
+    overrides: BTreeMap<String, Value>,
 ) {
     let fallback = sender.clone();
     let spawned = std::thread::Builder::new()
         .name("wallpaper-load".to_owned())
         .spawn(move || {
-            let result = Wallpaper::prepare(&gpu, format, &assets, &path, &properties)
-                .map_err(|e| format!("loading {}: {e}", path.display()));
+            let result = preset::resolve(&path).and_then(|item| {
+                let properties = item.properties(&overrides);
+                if item.preset.is_some() {
+                    tracing::info!("{} is a preset of {}", path.display(), item.load.display());
+                }
+                let prepared = Wallpaper::prepare(&gpu, format, &assets, &item.load, &properties)
+                    .map_err(|e| format!("loading {}: {e}", item.load.display()))?;
+                Ok(Loaded { prepared, item })
+            });
             // The loop may be gone (exiting).
             let _ = sender.send(Done { id, result });
         });
@@ -235,6 +263,11 @@ impl App {
             spec.path.clone(),
             spec.properties.clone(),
         );
+        self.events.send(&Event::Loading {
+            output: spec.name.clone(),
+            wallpaper: spec.path.display().to_string(),
+        });
+        self.status_changed();
         self.loads.pending.push(PendingLoad {
             id,
             spec,
@@ -273,6 +306,7 @@ impl App {
             tracing::debug!("dropping a superseded load");
             return;
         };
+        self.status_changed();
         let load = &mut self.loads.pending[i];
         if let Err(e) = &done.result {
             tracing::warn!("{}: {e}", load.spec.name);
@@ -285,6 +319,11 @@ impl App {
                 match load.result {
                     Some(Ok(_)) => self.install(load),
                     Some(Err(e)) => {
+                        self.events.send(&Event::LoadFailed {
+                            output: name.clone(),
+                            wallpaper: load.spec.path.display().to_string(),
+                            error: e.clone(),
+                        });
                         // A wallpaper named on the command line that doesn't
                         // load is fatal at startup; later, the output stays
                         // as it is.
@@ -323,9 +362,19 @@ impl App {
                     self.save_state();
                     request.borrow_mut().answer(Response::ok());
                 } else {
-                    request
-                        .borrow_mut()
-                        .answer(Response::error(errors.join("; ")));
+                    let all = errors.join("; ");
+                    for l in &loads {
+                        let error = match &l.result {
+                            Some(Err(e)) => e.clone(),
+                            _ => format!("not shown, another output failed: {all}"),
+                        };
+                        self.events.send(&Event::LoadFailed {
+                            output: l.spec.name.clone(),
+                            wallpaper: l.spec.path.display().to_string(),
+                            error,
+                        });
+                    }
+                    request.borrow_mut().answer(Response::error(all));
                 }
             }
         }
@@ -339,7 +388,7 @@ impl App {
 
     /// Finish a prepared wallpaper and show it.
     fn install(&mut self, mut load: PendingLoad) {
-        let Some(Ok(prepared)) = load.result.take() else {
+        let Some(Ok(Loaded { prepared, item })) = load.result.take() else {
             return;
         };
         let Some(gpu) = self.gpu.clone() else { return };
@@ -358,7 +407,7 @@ impl App {
         );
         tracing::info!("{}: playing \"{}\"", spec.name, wallpaper.title);
         match (self.screen_for(&spec.output), load.surface.take()) {
-            (Some(i), _) => self.screens[i].replace_wallpaper(wallpaper, spec.path.clone()),
+            (Some(i), _) => self.screens[i].replace_wallpaper(wallpaper, spec.path.clone(), item),
             (None, Some(surface)) => {
                 wallpaper.fill = fill_mode(spec.fill);
                 let screen = Screen::new(
@@ -368,6 +417,7 @@ impl App {
                     spec.output.clone(),
                     spec.name.clone(),
                     spec.fill,
+                    item,
                 );
                 screen.set_passthrough(&self.compositor, self.settings.passthrough);
                 // The initial commit, without a buffer; the configure follows.
@@ -379,11 +429,15 @@ impl App {
                 return;
             }
         }
-        if spec.request.is_some() {
-            self.state.set_wallpaper(&spec.name, &spec.path);
+        if spec.remember {
+            self.state
+                .set_wallpaper(&spec.name, &spec.path, spec.properties.clone());
         }
         self.apply_audio();
         self.update_status();
+        if let Some(i) = self.screen_for(&spec.output) {
+            self.emit_properties(i);
+        }
         self.schedule_all();
     }
 }

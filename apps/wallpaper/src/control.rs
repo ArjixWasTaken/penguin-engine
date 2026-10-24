@@ -71,6 +71,24 @@ impl Responder {
             }
         }
     }
+
+    /// Answer `ok` and hand the connection over for events: this side stops
+    /// reading requests from it. None when the client is gone already.
+    pub fn into_subscriber(mut self) -> Option<UnixStream> {
+        let client = self.0.take()?;
+        let mut c = client.borrow_mut();
+        c.write(&Response::ok());
+        let stream = if c.closed {
+            None
+        } else {
+            c.stream.try_clone().ok()
+        };
+        c.closed = true;
+        c.busy = false;
+        // Lets the wake source see it's done and go.
+        c.wake.ping();
+        stream
+    }
 }
 
 impl Drop for Responder {
@@ -162,6 +180,17 @@ pub fn listen(path: Option<&Path>) -> Result<ControlSocket> {
     };
     socket.listener.set_nonblocking(true)?;
     Ok(socket)
+}
+
+/// `path` bound here (for tests: no systemd socket).
+#[cfg(test)]
+pub fn listen_at(path: &Path) -> Result<ControlSocket> {
+    let listener = bind(path)?;
+    listener.set_nonblocking(true)?;
+    Ok(ControlSocket {
+        listener,
+        bound: Some(path.to_owned()),
+    })
 }
 
 /// Serve `socket` from the event loop of `handle`. The listener is moved
@@ -260,6 +289,7 @@ fn add_client<D: Handler + 'static>(
             handle_lines(handler, &client);
             let mut c = client.borrow_mut();
             if n == 0 || c.closed {
+                // (A subscriber's events now go through `events`.)
                 // Let the wake source finish what is outstanding, then go.
                 c.eof = true;
                 c.wake.ping();

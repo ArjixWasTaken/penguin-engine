@@ -6,10 +6,13 @@
 
 mod commands;
 mod control;
+mod events;
 mod loading;
+mod preset;
 mod state;
 mod systemd;
 
+use std::collections::BTreeMap;
 use std::io::Read;
 use std::os::unix::net::UnixStream;
 use std::path::PathBuf;
@@ -239,8 +242,13 @@ struct Screen {
     surface: wgpu::Surface<'static>,
     config: wgpu::SurfaceConfiguration,
     wallpaper: Wallpaper,
-    /// Where `wallpaper` was loaded from.
+    /// What was set: where `wallpaper` was loaded from, or the preset item
+    /// that shows it.
     path: PathBuf,
+    preset: Option<preset::Preset>,
+    /// The property values before the user's overrides (the preset's, or
+    /// `project.json`'s).
+    defaults: BTreeMap<String, serde_json::Value>,
     fractional: Option<WpFractionalScaleV1>,
     viewport: Option<WpViewport>,
     layer: LayerSurface,
@@ -277,7 +285,8 @@ impl Drop for Screen {
 }
 
 impl Screen {
-    /// A screen showing `wallpaper` (from `path`) on a surface made for it.
+    /// A screen showing `wallpaper` (set as `path`, loaded as `item`) on a
+    /// surface made for it.
     fn new(
         parts: SurfaceParts,
         wallpaper: Wallpaper,
@@ -285,12 +294,15 @@ impl Screen {
         output: WlOutput,
         name: String,
         fill: Fill,
+        item: preset::Item,
     ) -> Self {
         Self {
             surface: parts.surface,
             config: parts.config,
             wallpaper,
             path,
+            preset: item.preset,
+            defaults: item.defaults,
             fractional: parts.fractional,
             viewport: parts.viewport,
             layer: parts.layer,
@@ -351,8 +363,9 @@ impl Screen {
         self.dirty = true;
     }
 
-    /// Show `wallpaper` (from `path`) instead of the current one.
-    fn replace_wallpaper(&mut self, mut wallpaper: Wallpaper, path: PathBuf) {
+    /// Show `wallpaper` (set as `path`, loaded as `item`) instead of the
+    /// current one.
+    fn replace_wallpaper(&mut self, mut wallpaper: Wallpaper, path: PathBuf, item: preset::Item) {
         wallpaper.fill = fill_mode(self.fill);
         wallpaper.set_paused(self.paused);
         let started = Instant::now();
@@ -363,6 +376,8 @@ impl Screen {
             started.elapsed()
         );
         self.path = path;
+        self.preset = item.preset;
+        self.defaults = item.defaults;
         self.dirty = true;
     }
 
@@ -473,6 +488,10 @@ struct App {
     config_path: Option<PathBuf>,
     state: State,
     state_path: Option<PathBuf>,
+    /// Subscribed control connections.
+    events: events::Subscribers<App>,
+    /// Something in the status changed since subscribers were told.
+    status_dirty: bool,
     /// systemd has been told we're up.
     ready: bool,
     exit: bool,
@@ -513,9 +532,10 @@ impl App {
             output: output.clone(),
             name: name.to_owned(),
             path: saved.wallpaper.clone(),
-            properties: saved.property_list(),
+            properties: saved.properties.clone(),
             fill: saved.fill.unwrap_or(self.settings.fill),
             request: None,
+            remember: false,
         };
         self.start_load(spec, Some(surface));
         Ok(())
@@ -741,13 +761,29 @@ impl App {
             let screen = &mut self.screens[index];
             if screen.configured {
                 screen.reconfigure(gpu);
+                self.status_changed();
                 self.schedule(index);
             }
         }
     }
 
-    /// Tell systemd what is playing where.
-    fn update_status(&self) {
+    /// The status changed: subscribers hear of it after this loop iteration.
+    fn status_changed(&mut self) {
+        self.status_dirty = true;
+    }
+
+    /// Send what changed in this loop iteration to the subscribers.
+    fn flush_events(&mut self) {
+        if std::mem::take(&mut self.status_dirty) && !self.events.is_empty() {
+            self.events.send(&wpe_ipc::Event::Status {
+                status: self.status(),
+            });
+        }
+    }
+
+    /// Tell systemd (and subscribers) what is playing where.
+    fn update_status(&mut self) {
+        self.status_changed();
         let text = if self.screens.is_empty() {
             "No wallpaper".to_owned()
         } else {
@@ -911,6 +947,8 @@ fn main() -> Result<()> {
         config_path,
         state,
         state_path,
+        events: events::Subscribers::new(event_loop.handle()),
+        status_dirty: false,
         ready: false,
         exit: false,
         error: None,
@@ -929,8 +967,11 @@ fn main() -> Result<()> {
 
     while !app.exit {
         event_loop.dispatch(None, &mut app)?;
+        app.flush_events();
     }
     systemd::notify(&[NotifyState::Stopping]);
+    app.flush_events();
+    app.events.close_all();
     app.screens.clear();
     // Dropped video streams finish shutting down in the background.
     wpe_runtime::shutdown();
@@ -995,6 +1036,7 @@ impl OutputHandler for App {
     }
 
     fn new_output(&mut self, _: &Connection, _: &QueueHandle<Self>, output: WlOutput) {
+        self.status_changed();
         if let Err(e) = self.add_output(output) {
             // A wallpaper named on the command line that doesn't load is
             // fatal at startup, as before; later, the output stays empty.
@@ -1057,6 +1099,7 @@ impl LayerShellHandler for App {
         }
         screen.logical = (w, h);
         screen.reconfigure(gpu);
+        self.status_changed();
         self.schedule(i);
     }
 }

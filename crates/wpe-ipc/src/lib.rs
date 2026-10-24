@@ -10,6 +10,19 @@
 //! > {"cmd":"fps","fps":1000000}
 //! < {"ok":false,"error":"..."}
 //! ```
+//!
+//! After a [`Request::Subscribe`] the connection carries [`Event`] lines
+//! instead, until it closes:
+//!
+//! ```text
+//! > {"cmd":"subscribe"}
+//! < {"ok":true}
+//! < {"event":"status","status":{...}}
+//! < {"event":"loading","output":"DP-1","wallpaper":"/.../3566329932"}
+//! ```
+//!
+//! Version 2 of the protocol only added to version 1: requests, fields and
+//! events a version 1 client never sees unless it asks.
 
 use std::io::{self, BufRead, BufReader, Write};
 use std::os::unix::net::UnixStream;
@@ -19,6 +32,13 @@ use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+
+/// The protocol version, in [`VersionInfo::protocol`].
+pub const PROTOCOL: u32 = 2;
+
+/// User property values by name, as in `project.json` (`true`, `0.5`,
+/// `"1 0 0"`, ...).
+pub type Values = serde_json::Map<String, Value>;
 
 /// File name of the control socket in `$XDG_RUNTIME_DIR`.
 pub const SOCKET_NAME: &str = "wallpaper-engine-rs.sock";
@@ -101,6 +121,39 @@ pub struct Settings {
     pub passthrough: bool,
 }
 
+impl Settings {
+    /// These settings with `patch` applied.
+    pub fn patched(&self, patch: &SettingsPatch) -> Self {
+        Self {
+            fps: patch.fps.unwrap_or(self.fps),
+            audio: patch.audio.unwrap_or(self.audio),
+            volume: patch.volume.unwrap_or(self.volume),
+            fill: patch.fill.unwrap_or(self.fill),
+            layer: patch.layer.unwrap_or(self.layer),
+            passthrough: patch.passthrough.unwrap_or(self.passthrough),
+        }
+    }
+}
+
+/// Some of the [`Settings`], to change them in one request.
+#[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
+pub struct SettingsPatch {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fps: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub audio: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub volume: Option<u32>,
+    /// The global fill; outputs' own fill modes are cleared, as with
+    /// [`Request::Fill`] without an output.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fill: Option<Fill>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub layer: Option<Layer>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub passthrough: Option<bool>,
+}
+
 impl Default for Settings {
     fn default() -> Self {
         Self {
@@ -123,10 +176,15 @@ pub enum Request {
     Status,
     /// Show a wallpaper: a path (absolute, as the daemon sees it) or the id
     /// of an installed workshop wallpaper.
+    ///
+    /// `properties` are user property values to load it with (the rest
+    /// keep their defaults), saved as the output's overrides.
     Set {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         output: Option<String>,
         wallpaper: String,
+        #[serde(default, skip_serializing_if = "Values::is_empty")]
+        properties: Values,
     },
     /// The wallpapers' user properties: [`Response::properties`].
     Properties {
@@ -168,6 +226,33 @@ pub enum Request {
     /// Re-read the config file (as SIGHUP does).
     ReloadSettings,
     Quit,
+    /// The protocol version and what the daemon supports:
+    /// [`Response::version`]. (Protocol 2.)
+    Version,
+    /// Answered with `ok`; then the connection carries [`Event`] lines,
+    /// starting with the current status, until it closes. Further requests
+    /// on it are ignored. (Protocol 2.)
+    Subscribe,
+    /// Change several user properties at once (one rebuild per output).
+    /// Names a wallpaper doesn't have are skipped; without `output`, each
+    /// output takes the values its wallpaper has. (Protocol 2.)
+    SetProperties {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        output: Option<String>,
+        values: Values,
+    },
+    /// Back to the wallpaper's own values (a preset item's preset), the
+    /// saved overrides cleared. (Protocol 2.)
+    ResetProperties {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        output: Option<String>,
+    },
+    /// Change several settings at once, saved as the single-setting
+    /// requests are. (Protocol 2.)
+    Settings {
+        #[serde(flatten)]
+        patch: SettingsPatch,
+    },
 }
 
 /// The daemon's answer to one request. `ok` tells whether it succeeded;
@@ -181,6 +266,20 @@ pub struct Response {
     pub status: Option<Status>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub properties: Option<Vec<OutputProperties>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub version: Option<VersionInfo>,
+}
+
+/// The answer to [`Request::Version`].
+#[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
+pub struct VersionInfo {
+    /// [`PROTOCOL`] of the daemon.
+    pub protocol: u32,
+    /// The daemon's version.
+    pub daemon: String,
+    /// Optional features built in: `web` (web wallpapers).
+    #[serde(default)]
+    pub features: Vec<String>,
 }
 
 impl Response {
@@ -234,6 +333,9 @@ pub struct OutputStatus {
     /// Frames per second over the last few seconds.
     pub fps: f32,
     pub fill: Fill,
+    /// The wallpaper being loaded for it (a `set`), if any. (Protocol 2.)
+    #[serde(default)]
+    pub loading: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
@@ -244,6 +346,11 @@ pub struct WallpaperInfo {
     /// `project.json` `type`: `scene` or `video`.
     #[serde(rename = "type")]
     pub kind: String,
+    /// For a preset item (a workshop item that is another wallpaper with
+    /// its own property values), the wallpaper actually playing; `path`,
+    /// `workshop_id` and `title` are the preset item's. (Protocol 2.)
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dependency: Option<String>,
 }
 
 /// One output's wallpaper's user properties.
@@ -287,6 +394,37 @@ pub struct PropertyInfo {
 pub struct PropertyChoice {
     pub label: Option<String>,
     pub value: Value,
+}
+
+/// What a subscribed connection ([`Request::Subscribe`]) gets.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "event", rename_all = "kebab-case")]
+pub enum Event {
+    /// The status changed (once per change, however many things changed
+    /// together); also the first event after subscribing.
+    Status { status: Status },
+    /// A wallpaper started loading for `output`.
+    Loading { output: String, wallpaper: String },
+    /// Loading `wallpaper` for `output` failed (or another output of the
+    /// same `set` failed); the output shows what it showed before.
+    LoadFailed {
+        output: String,
+        wallpaper: String,
+        error: String,
+    },
+    /// The property values of `output`'s `wallpaper` now, all of them: after
+    /// a property change and after a wallpaper loaded.
+    Properties {
+        output: String,
+        wallpaper: String,
+        values: Values,
+    },
+}
+
+impl Event {
+    /// The `event` names this version knows; others (from a newer daemon)
+    /// are skipped by [`Client::subscribe`].
+    pub const NAMES: &[&str] = &["status", "loading", "load-failed", "properties"];
 }
 
 /// `value` as one protocol line (JSON and a newline).
@@ -336,6 +474,50 @@ impl Client {
         }
         serde_json::from_str(&line).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))
     }
+
+    /// Subscribe to the daemon's events: the iterator yields them as they
+    /// come and ends when the daemon closes the connection. Events newer
+    /// than this crate are skipped. A read timeout ([`Self::set_timeout`])
+    /// still applies; the default waits forever.
+    pub fn subscribe(mut self) -> io::Result<impl Iterator<Item = io::Result<Event>>> {
+        self.request(&Request::Subscribe)?
+            .into_result()
+            .map_err(io::Error::other)?;
+        let mut reader = self.reader;
+        Ok(std::iter::from_fn(move || {
+            loop {
+                let mut line = String::new();
+                match reader.read_line(&mut line) {
+                    Ok(0) => return None,
+                    Ok(_) => {}
+                    Err(e) => return Some(Err(e)),
+                }
+                if line.trim().is_empty() {
+                    continue;
+                }
+                match parse_event(&line) {
+                    Ok(Some(event)) => return Some(Ok(event)),
+                    Ok(None) => continue,
+                    Err(e) => return Some(Err(e)),
+                }
+            }
+        }))
+    }
+}
+
+/// An event line; none for an event this version doesn't know.
+fn parse_event(line: &str) -> io::Result<Option<Event>> {
+    let invalid = |e| io::Error::new(io::ErrorKind::InvalidData, e);
+    match serde_json::from_str::<Event>(line) {
+        Ok(event) => Ok(Some(event)),
+        Err(e) => {
+            let value: Value = serde_json::from_str(line).map_err(invalid)?;
+            match value.get("event").and_then(Value::as_str) {
+                Some(name) if !Event::NAMES.contains(&name) => Ok(None),
+                _ => Err(invalid(e)),
+            }
+        }
+    }
 }
 
 #[cfg(test)]
@@ -356,6 +538,7 @@ mod tests {
             Request::Set {
                 output: Some("DP-1".into()),
                 wallpaper: "3566329932".into(),
+                properties: Values::new(),
             },
             json!({"cmd": "set", "output": "DP-1", "wallpaper": "3566329932"}),
         );
@@ -363,6 +546,7 @@ mod tests {
             Request::Set {
                 output: None,
                 wallpaper: "/w".into(),
+                properties: Values::new(),
             },
             json!({"cmd": "set", "wallpaper": "/w"}),
         );
@@ -388,6 +572,188 @@ mod tests {
         );
         round_trip(Request::ReloadSettings, json!({"cmd": "reload-settings"}));
         round_trip(Request::Quit, json!({"cmd": "quit"}));
+    }
+
+    fn values(v: Value) -> Values {
+        v.as_object().unwrap().clone()
+    }
+
+    #[test]
+    fn v2_requests_on_the_wire() {
+        round_trip(Request::Version, json!({"cmd": "version"}));
+        round_trip(Request::Subscribe, json!({"cmd": "subscribe"}));
+        round_trip(
+            Request::Set {
+                output: None,
+                wallpaper: "1".into(),
+                properties: values(json!({"speed": 2, "rain": false})),
+            },
+            json!({"cmd": "set", "wallpaper": "1", "properties": {"speed": 2, "rain": false}}),
+        );
+        round_trip(
+            Request::SetProperties {
+                output: Some("DP-1".into()),
+                values: values(json!({"speed": 0.5, "color": "1 0 0"})),
+            },
+            json!({"cmd": "set-properties", "output": "DP-1",
+                   "values": {"speed": 0.5, "color": "1 0 0"}}),
+        );
+        round_trip(
+            Request::ResetProperties { output: None },
+            json!({"cmd": "reset-properties"}),
+        );
+        round_trip(
+            Request::Settings {
+                patch: SettingsPatch {
+                    fps: Some(30),
+                    fill: Some(Fill::Fit),
+                    passthrough: Some(true),
+                    ..Default::default()
+                },
+            },
+            json!({"cmd": "settings", "fps": 30, "fill": "fit", "passthrough": true}),
+        );
+        round_trip(
+            Request::Settings {
+                patch: SettingsPatch::default(),
+            },
+            json!({"cmd": "settings"}),
+        );
+        // Settings a newer client knows are ignored.
+        let newer: Request = serde_json::from_value(
+            json!({"cmd": "settings", "volume": 5, "pause_on_fullscreen": true}),
+        )
+        .unwrap();
+        assert_eq!(
+            newer,
+            Request::Settings {
+                patch: SettingsPatch {
+                    volume: Some(5),
+                    ..Default::default()
+                }
+            }
+        );
+        assert!(
+            serde_json::from_value::<Request>(json!({"cmd": "settings", "fill": "zoom"})).is_err()
+        );
+        assert!(serde_json::from_value::<Request>(json!({"cmd": "set-properties"})).is_err());
+    }
+
+    #[test]
+    fn settings_patches() {
+        let patch = SettingsPatch {
+            audio: Some(true),
+            layer: Some(Layer::Bottom),
+            ..Default::default()
+        };
+        assert_eq!(
+            Settings::default().patched(&patch),
+            Settings {
+                audio: true,
+                layer: Layer::Bottom,
+                ..Default::default()
+            }
+        );
+        assert_eq!(
+            Settings::default().patched(&SettingsPatch::default()),
+            Settings::default()
+        );
+    }
+
+    #[test]
+    fn v2_responses_on_the_wire() {
+        let version = Response {
+            version: Some(VersionInfo {
+                protocol: PROTOCOL,
+                daemon: "0.1.0".into(),
+                features: vec!["web".into()],
+            }),
+            ..Response::ok()
+        };
+        let wire = serde_json::to_value(&version).unwrap();
+        assert_eq!(
+            wire,
+            json!({"ok": true, "version": {"protocol": 2, "daemon": "0.1.0", "features": ["web"]}})
+        );
+        assert_eq!(serde_json::from_value::<Response>(wire).unwrap(), version);
+
+        // A version 1 status (no `loading`, no `dependency`) still parses.
+        let v1 = json!({"name": "DP-1", "width": 1, "height": 1, "scale": 1.0,
+                        "wallpaper": {"path": "/w", "workshop_id": null, "title": "W", "type": "scene"},
+                        "paused": false, "fps": 0.0, "fill": "crop"});
+        let output: OutputStatus = serde_json::from_value(v1).unwrap();
+        assert_eq!(output.loading, None);
+        assert_eq!(output.wallpaper.unwrap().dependency, None);
+
+        let output = OutputStatus {
+            name: "DP-1".into(),
+            loading: Some("/w/2".into()),
+            wallpaper: Some(WallpaperInfo {
+                path: "/w/preset".into(),
+                dependency: Some("/w/base".into()),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let wire = serde_json::to_value(&output).unwrap();
+        assert_eq!(wire["loading"], json!("/w/2"));
+        assert_eq!(wire["wallpaper"]["dependency"], json!("/w/base"));
+        assert_eq!(
+            serde_json::from_value::<OutputStatus>(wire).unwrap(),
+            output
+        );
+    }
+
+    #[test]
+    fn events_on_the_wire() {
+        let cases = [
+            (
+                Event::Status {
+                    status: Status::default(),
+                },
+                json!({"event": "status", "status": {"settings": Settings::default(), "outputs": []}}),
+            ),
+            (
+                Event::Loading {
+                    output: "DP-1".into(),
+                    wallpaper: "/w/1".into(),
+                },
+                json!({"event": "loading", "output": "DP-1", "wallpaper": "/w/1"}),
+            ),
+            (
+                Event::LoadFailed {
+                    output: "DP-1".into(),
+                    wallpaper: "/w/1".into(),
+                    error: "boom".into(),
+                },
+                json!({"event": "load-failed", "output": "DP-1", "wallpaper": "/w/1", "error": "boom"}),
+            ),
+            (
+                Event::Properties {
+                    output: "DP-1".into(),
+                    wallpaper: "/w/1".into(),
+                    values: values(json!({"speed": 1})),
+                },
+                json!({"event": "properties", "output": "DP-1", "wallpaper": "/w/1",
+                       "values": {"speed": 1}}),
+            ),
+        ];
+        for (event, wire) in cases {
+            assert_eq!(serde_json::to_value(&event).unwrap(), wire);
+            assert_eq!(
+                serde_json::from_value::<Event>(wire.clone()).unwrap(),
+                event
+            );
+            let name = wire["event"].as_str().unwrap();
+            assert!(Event::NAMES.contains(&name), "{name}");
+        }
+        assert!(
+            parse_event(r#"{"event":"playlist","index":3}"#)
+                .unwrap()
+                .is_none()
+        );
+        assert!(parse_event(r#"{"event":"loading"}"#).is_err());
+        assert!(parse_event("nope").is_err());
     }
 
     #[test]
@@ -423,10 +789,12 @@ mod tests {
                         workshop_id: Some("1".into()),
                         title: "One".into(),
                         kind: "scene".into(),
+                        dependency: None,
                     }),
                     paused: false,
                     fps: 60.0,
                     fill: Fill::Crop,
+                    loading: None,
                 }],
             }),
             properties: Some(vec![OutputProperties {
@@ -493,6 +861,41 @@ mod tests {
         let mut client = Client::connect(&path).unwrap();
         let response = client.request(&Request::Status).unwrap();
         assert_eq!(response, Response::error("nope"));
+        server.join().unwrap();
+
+        // Subscribing: `ok`, then events until the connection closes.
+        let listener = std::os::unix::net::UnixListener::bind(dir.join("events.sock")).unwrap();
+        let server = std::thread::spawn(move || {
+            let (stream, _) = listener.accept().unwrap();
+            let mut reader = BufReader::new(stream.try_clone().unwrap());
+            let mut writer = stream;
+            let mut line = String::new();
+            reader.read_line(&mut line).unwrap();
+            assert_eq!(
+                serde_json::from_str::<Request>(&line).unwrap(),
+                Request::Subscribe
+            );
+            writer
+                .write_all(encode_line(&Response::ok()).as_bytes())
+                .unwrap();
+            let loading = Event::Loading {
+                output: "DP-1".into(),
+                wallpaper: "/w".into(),
+            };
+            writer.write_all(encode_line(&loading).as_bytes()).unwrap();
+            writer
+                .write_all(b"{\"event\":\"from-the-future\"}\n\n")
+                .unwrap();
+            writer.write_all(encode_line(&loading).as_bytes()).unwrap();
+        });
+        let events: Vec<Event> = Client::connect(&dir.join("events.sock"))
+            .unwrap()
+            .subscribe()
+            .unwrap()
+            .map(Result::unwrap)
+            .collect();
+        assert_eq!(events.len(), 2);
+        assert!(matches!(&events[0], Event::Loading { output, .. } if output == "DP-1"));
         server.join().unwrap();
         std::fs::remove_dir_all(&dir).unwrap();
     }

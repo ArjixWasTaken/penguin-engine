@@ -1,12 +1,13 @@
 //! Command-line client of the `wallpaper` daemon's control socket.
 
+use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 use serde_json::Value;
-use wpe_ipc::{Client, Fill, OutputProperties, Request, Response, Status};
+use wpe_ipc::{Client, Fill, OutputProperties, Request, Response, Status, Values, VersionInfo};
 
 #[derive(Parser)]
 #[command(about = "Control the wallpaper daemon")]
@@ -30,6 +31,9 @@ enum Command {
     Set {
         #[arg(long)]
         output: Option<String>,
+        /// Load it with this user property value (repeatable).
+        #[arg(long = "prop", value_name = "NAME=VALUE", value_parser = parse_assignment)]
+        props: Vec<(String, Value)>,
         wallpaper: String,
     },
     /// List the wallpapers' user properties.
@@ -44,6 +48,18 @@ enum Command {
         output: Option<String>,
         name: String,
         value: String,
+    },
+    /// Change several user properties in one go (one rebuild per output).
+    PropertiesSet {
+        #[arg(long)]
+        output: Option<String>,
+        #[arg(value_name = "NAME=VALUE", required = true, value_parser = parse_assignment)]
+        values: Vec<(String, Value)>,
+    },
+    /// Put the user properties back to the wallpaper's own values.
+    ResetProperties {
+        #[arg(long)]
+        output: Option<String>,
     },
     Pause {
         #[arg(long)]
@@ -72,6 +88,10 @@ enum Command {
     Reload,
     /// Stop the daemon.
     Quit,
+    /// The daemon's version, protocol and features.
+    Version,
+    /// Print the daemon's events as JSON lines until it goes away.
+    Watch,
 }
 
 #[derive(Clone, Copy, clap::ValueEnum)]
@@ -92,13 +112,37 @@ fn wallpaper_arg(spec: &str) -> String {
     spec.to_owned()
 }
 
+/// A property value as typed: JSON (`true`, `0.5`, `"1 0 0"`) or else a
+/// string.
+fn property_value(value: &str) -> Value {
+    serde_json::from_str(value).unwrap_or_else(|_| Value::String(value.to_owned()))
+}
+
+fn parse_assignment(s: &str) -> Result<(String, Value), String> {
+    let (name, value) = s.split_once('=').ok_or("expected NAME=VALUE")?;
+    if name.is_empty() {
+        return Err("expected NAME=VALUE".to_owned());
+    }
+    Ok((name.to_owned(), property_value(value)))
+}
+
 fn request(command: Command) -> Request {
     match command {
         Command::Status => Request::Status,
-        Command::Set { output, wallpaper } => Request::Set {
+        Command::Set {
+            output,
+            props,
+            wallpaper,
+        } => Request::Set {
             output,
             wallpaper: wallpaper_arg(&wallpaper),
+            properties: props.into_iter().collect::<Values>(),
         },
+        Command::PropertiesSet { output, values } => Request::SetProperties {
+            output,
+            values: values.into_iter().collect(),
+        },
+        Command::ResetProperties { output } => Request::ResetProperties { output },
         Command::Properties { output } => Request::Properties { output },
         Command::Property {
             output,
@@ -107,7 +151,7 @@ fn request(command: Command) -> Request {
         } => Request::Property {
             output,
             name,
-            value: serde_json::from_str(&value).unwrap_or(Value::String(value)),
+            value: property_value(&value),
         },
         Command::Pause { output } => Request::Pause { output },
         Command::Resume { output } => Request::Resume { output },
@@ -119,7 +163,21 @@ fn request(command: Command) -> Request {
         Command::Fill { output, fill } => Request::Fill { output, fill },
         Command::Reload => Request::ReloadSettings,
         Command::Quit => Request::Quit,
+        Command::Version => Request::Version,
+        Command::Watch => Request::Subscribe,
     }
+}
+
+fn print_version(v: &VersionInfo) {
+    let features = if v.features.is_empty() {
+        "none".to_owned()
+    } else {
+        v.features.join(", ")
+    };
+    println!(
+        "wallpaper daemon {}, protocol {}, features: {features}",
+        v.daemon, v.protocol
+    );
 }
 
 fn print_status(status: &Status) {
@@ -206,12 +264,30 @@ fn print_properties(list: &[OutputProperties]) {
     }
 }
 
-fn run(args: Args) -> Result<Response> {
-    let mut client = match &args.socket {
+fn connect(socket: Option<&Path>) -> Result<Client> {
+    match socket {
         Some(path) => Client::connect(path),
         None => Client::connect_default(),
     }
-    .context("cannot reach the wallpaper daemon (is it running?)")?;
+    .context("cannot reach the wallpaper daemon (is it running?)")
+}
+
+/// Print events until the daemon closes the connection.
+fn watch(socket: Option<&Path>) -> Result<()> {
+    let events = connect(socket)?
+        .subscribe()
+        .context("subscribing to the daemon's events")?;
+    let mut out = std::io::stdout().lock();
+    for event in events {
+        let event = event.context("reading the daemon's events")?;
+        out.write_all(wpe_ipc::encode_line(&event).as_bytes())?;
+        out.flush()?;
+    }
+    Ok(())
+}
+
+fn run(args: Args) -> Result<Response> {
+    let mut client = connect(args.socket.as_deref())?;
     let response = client
         .request(&request(args.command))
         .context("talking to the wallpaper daemon")?;
@@ -220,6 +296,15 @@ fn run(args: Args) -> Result<Response> {
 
 fn main() -> ExitCode {
     let args = Args::parse();
+    if matches!(args.command, Command::Watch) {
+        return match watch(args.socket.as_deref()) {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(e) => {
+                eprintln!("wallpaperctl: {e:#}");
+                ExitCode::FAILURE
+            }
+        };
+    }
     let json = args.json;
     let response = match run(args) {
         Ok(r) => r,
@@ -236,6 +321,9 @@ fn main() -> ExitCode {
         }
         if let Some(properties) = &response.properties {
             print_properties(properties);
+        }
+        if let Some(version) = &response.version {
+            print_version(version);
         }
     }
     match response.into_result() {
@@ -266,9 +354,39 @@ mod tests {
             parse(&["set", "--output", "DP-1", "3566329932"]),
             Request::Set {
                 output: Some("DP-1".into()),
-                wallpaper: "3566329932".into()
+                wallpaper: "3566329932".into(),
+                properties: Values::new(),
             }
         );
+        assert_eq!(
+            parse(&["set", "--prop", "speed=2", "--prop", "name=x=y", "1"]),
+            Request::Set {
+                output: None,
+                wallpaper: "1".into(),
+                properties: serde_json::json!({"speed": 2, "name": "x=y"})
+                    .as_object()
+                    .unwrap()
+                    .clone(),
+            }
+        );
+        assert_eq!(
+            parse(&["properties-set", "--output", "DP-1", "a=true", "b=1 0 0"]),
+            Request::SetProperties {
+                output: Some("DP-1".into()),
+                values: serde_json::json!({"a": true, "b": "1 0 0"})
+                    .as_object()
+                    .unwrap()
+                    .clone(),
+            }
+        );
+        assert!(Args::try_parse_from(["wallpaperctl", "properties-set"]).is_err());
+        assert!(Args::try_parse_from(["wallpaperctl", "properties-set", "nope"]).is_err());
+        assert_eq!(
+            parse(&["reset-properties"]),
+            Request::ResetProperties { output: None }
+        );
+        assert_eq!(parse(&["version"]), Request::Version);
+        assert_eq!(parse(&["watch"]), Request::Subscribe);
         assert_eq!(
             parse(&["property", "speed", "0.5"]),
             Request::Property {
