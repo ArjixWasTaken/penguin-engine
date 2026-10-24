@@ -404,8 +404,7 @@ impl<'a> FrameBuilder<'a> {
                     image.mips.truncate(1);
                 }
                 let gpu_tex = Arc::new(upload_texture(self.gpu, &single, label));
-                let size = gpu_tex.texture.size();
-                match VideoStream::start(mp4, size.width, size.height) {
+                match VideoStream::start(self.gpu, mp4, &gpu_tex) {
                     Ok(stream) => self.videos.push((gpu_tex.clone(), stream)),
                     Err(e) => tracing::warn!("{label}: video playback unavailable: {e}"),
                 }

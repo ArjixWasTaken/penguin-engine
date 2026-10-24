@@ -17,8 +17,10 @@ pub struct Gpu {
 impl Gpu {
     /// Features used when the adapter offers them. BC compression covers the
     /// DXT/BC textures Wallpaper Engine ships; without it those are skipped.
+    /// dma-buf import lets video frames decoded on the GPU skip the CPU.
     const OPTIONAL_FEATURES: wgpu::Features = wgpu::Features::TEXTURE_COMPRESSION_BC
-        .union(wgpu::Features::TEXTURE_COMPRESSION_BC_SLICED_3D);
+        .union(wgpu::Features::TEXTURE_COMPRESSION_BC_SLICED_3D)
+        .union(wgpu::Features::VULKAN_EXTERNAL_MEMORY_DMA_BUF);
 
     pub async fn new(
         instance: wgpu::Instance,

@@ -13,6 +13,10 @@ Rendering needs the stock assets shipped with Wallpaper Engine (shaders, effects
 Nothing from Wallpaper Engine is bundled here. With a Steam install they live at
 `~/.local/share/Steam/steamapps/common/wallpaper_engine/assets`.
 
+Video textures need libmpv. Frames are decoded with VA-API and handed to wgpu as dma-bufs
+without touching the CPU; this needs the Vulkan backend and a Mesa EGL driver. Otherwise
+mpv decodes in software and frames are uploaded (`WPE_VIDEO=cpu` forces this path).
+
 ## Status
 
 Renders Wallpaper Engine scene wallpapers with their own shaders, compiled from WE's GLSL/HLSL
@@ -20,7 +24,7 @@ dialect to SPIR-V and run through wgpu:
 
 - image layers with materials, blend modes, `colorBlendMode`, compose/fullscreen layers
 - image effect chains (ping-pong buffers, FBOs, copy commands, layer dependencies)
-- sprite sheets, video textures (via `ffmpeg`), text layers, scene bloom
+- sprite sheets, video textures (libmpv), text layers, scene bloom
 - user properties, keyframe animations, camera parallax and shake
 - sound layers and audio-reactive spectrum (`--audio`)
 - particles (sprite, trail, rope) without geometry shaders

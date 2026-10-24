@@ -337,9 +337,7 @@ impl Wallpaper {
 
     fn upload_video_frames(&mut self, gpu: &Gpu) {
         for (texture, stream) in &self.videos {
-            if let Some(frame) = stream.take_frame() {
-                texture.write_rgba(gpu, &frame);
-            }
+            stream.update(gpu, texture);
         }
     }
 
