@@ -26,7 +26,8 @@ pub const COMMON: &str = r#"#version 330
 #define atan2 atan
 #define fmod(x, y) (x-y*trunc(x/y))
 #define ddx dFdx
-#define ddy(x) dFdy(-(x))
+// wgpu's framebuffer y points down, as Direct3D's does: no sign flip.
+#define ddy dFdy
 #define saturate(x) (clamp(x, 0.0, 1.0))
 #define log10(x) (log(x) / log(10.0))
 

@@ -282,6 +282,23 @@ fn mdl_mesh(m: &wpe_mdl::MdlMesh, uv_scale: Vec2, weights: &[f32]) -> Mesh {
             ),
         ];
         let mut streams = streams;
+        // Lightmapped materials read both texcoord sets from one vec4.
+        if m.texcoords.len() == n {
+            let second = if m.texcoords1.len() == n {
+                &m.texcoords1
+            } else {
+                &m.texcoords
+            };
+            streams.push((
+                "a_TexCoordVec4".to_owned(),
+                4,
+                m.texcoords
+                    .iter()
+                    .zip(second)
+                    .flat_map(|(t, l)| [t[0] * uv_scale.x, t[1] * uv_scale.y, l[0], l[1]])
+                    .collect(),
+            ));
+        }
         if m.tangents.len() == n {
             streams.push((
                 "a_Tangent4".to_owned(),
@@ -698,10 +715,17 @@ pub struct FrameBuilder<'a> {
     /// Combos every material gets: the scene's fog (`FOG_DIST`, ...).
     scene_combos: BTreeMap<String, String>,
     model_data: Option<&'a ModelDatas>,
+    /// User properties material constants bind to (`{"user": ...}` values
+    /// and `usershadervalues`).
+    props: Option<&'a wpe_scene::UserProperties>,
     is_3d: bool,
     /// `_rt_Reflection` and its blur buffer, when the scene renders planar
     /// reflections ([`Self::enable_reflection`]).
     reflection: Option<(TargetId, TargetId)>,
+    /// Mirror only the draws of `reflected` objects ([`Self::reflected_steps`])
+    /// into the reflection, rather than every perspective draw.
+    reflected_only: bool,
+    reflected_steps: std::collections::HashSet<usize>,
     /// Draws using their compiled material, and all draws.
     pub stats: (usize, usize),
     /// Where the build's time went.
@@ -770,8 +794,11 @@ impl<'a> FrameBuilder<'a> {
             light_combos: BTreeMap::new(),
             scene_combos: BTreeMap::new(),
             model_data: None,
+            props: None,
             is_3d: false,
             reflection: None,
+            reflected_only: false,
+            reflected_steps: Default::default(),
             particles: Vec::new(),
             current_layer: None,
             layer_steps: HashMap::new(),
@@ -796,6 +823,39 @@ impl<'a> FrameBuilder<'a> {
             texel_uniforms: self.texel_uniforms,
         };
         (frame, self.cache)
+    }
+
+    /// The user properties material constants are bound to.
+    pub fn set_user_properties(&mut self, props: &'a wpe_scene::UserProperties) {
+        self.props = Some(props);
+    }
+
+    /// `pass` with its user-bound constants (`{"user": "name"}` values and
+    /// `usershadervalues`, property → constant) set from the user
+    /// properties; `None` when nothing is bound.
+    fn bind_user_constants(&self, pass: &MaterialPass) -> Option<MaterialPass> {
+        let props = self.props?;
+        let bound = pass.constantshadervalues.values().any(|v| v.user.is_some());
+        if !bound && pass.usershadervalues.is_empty() {
+            return None;
+        }
+        let mut pass = pass.clone();
+        for value in pass.constantshadervalues.values_mut() {
+            if value.user.is_some() {
+                value.value = props.value(value);
+                value.user = None;
+            }
+        }
+        for (property, constant) in &pass.usershadervalues {
+            let Some(value) = props
+                .get(property)
+                .and_then(|v| wpe_assets::value::Dynamic::from_value(v.clone()).ok())
+            else {
+                continue;
+            };
+            pass.constantshadervalues.insert(constant.clone(), value);
+        }
+        Some(pass)
     }
 
     /// Render HDR scenes into [`wpe_render::HDR_FORMAT`] targets.
@@ -929,6 +989,8 @@ impl<'a> FrameBuilder<'a> {
         } else {
             combos
         };
+        let bound = self.bind_user_constants(pass);
+        let pass = bound.as_ref().unwrap_or(pass);
         let started = std::time::Instant::now();
         let decoding = self.cache.store.decode_time;
         let prepared = material::prepare(
@@ -1415,10 +1477,13 @@ impl<'a> FrameBuilder<'a> {
     /// may then sample) before adding objects, then add the passes filling
     /// it with [`Self::reflection_passes`]. Wallpaper Engine does this in 3D
     /// scenes with camera paths (its `"reflected_perspective"` camera).
-    pub fn enable_reflection(&mut self) {
+    ///
+    /// With `reflected_only`, only objects flagged `reflected` are mirrored.
+    pub fn enable_reflection(&mut self, reflected_only: bool) {
         if self.reflection.is_some() {
             return;
         }
+        self.reflected_only = reflected_only;
         let screen = TargetSize::Screen { divisor: 1.0 };
         let format = self.scene_format;
         let reflection = self.target(REFLECTION.to_owned(), screen, format);
@@ -1443,6 +1508,7 @@ impl<'a> FrameBuilder<'a> {
                         target: TargetId::DEFAULT,
                         draw: Draw::Material(d),
                     } if matches!(d.camera, Camera::Perspective)
+                        && (!self.reflected_only || self.reflected_steps.contains(&i))
                         && !d.textures.iter().any(
                             |t| matches!(t, Some(TexRef::Target(id)) if *id == reflection),
                         ) =>
@@ -1580,7 +1646,12 @@ impl<'a> FrameBuilder<'a> {
             });
             combos.extend(puppet.combos());
             for (i, mesh) in mdl.meshes.iter().enumerate() {
-                let Some(pass) = mesh.material.as_deref().and_then(|p| self.model_pass(p)) else {
+                let material = mesh
+                    .skins
+                    .get(m.skin)
+                    .map(String::as_str)
+                    .or(mesh.material.as_deref());
+                let Some(pass) = material.and_then(|p| self.model_pass(p)) else {
                     continue;
                 };
                 parts.push((
@@ -1661,6 +1732,9 @@ impl<'a> FrameBuilder<'a> {
                     attach,
                 });
             }
+        }
+        if m.reflected {
+            self.reflected_steps.extend(first..self.steps.len());
         }
         if !m.visible && self.steps.len() > first {
             self.hidden.push(m.id);
@@ -1910,6 +1984,22 @@ impl<'a> FrameBuilder<'a> {
                     .into(),
                 };
                 self.current_pass = Some((None, 0));
+                if layer.fullscreen {
+                    // Fullscreen materials place their quad in clip space.
+                    self.push_draw(
+                        offscreen.unwrap_or(TargetId::DEFAULT),
+                        r,
+                        Mat4::IDENTITY,
+                        CardMesh::FULLSCREEN,
+                        match offscreen {
+                            Some(_) => BlendMode::Normal,
+                            None => Self::final_blend(layer),
+                        },
+                        Camera::Fixed(Mat4::IDENTITY),
+                    );
+                    self.bind_layer(layer, false, false);
+                    return;
+                }
                 match offscreen {
                     Some(target) => self.push_draw(
                         target,

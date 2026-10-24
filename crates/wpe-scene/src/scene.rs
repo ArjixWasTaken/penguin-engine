@@ -96,6 +96,10 @@ pub struct ModelLayer {
     pub perspective: bool,
     /// The object's `animationlayers`, for skinned models.
     pub animation_layers: Vec<serde_json::Value>,
+    /// The object's `skin`: which of a multi-skin model's materials to use.
+    pub skin: usize,
+    /// The object's `reflected` flag: drawn into planar reflections.
+    pub reflected: bool,
     /// Position in the scene's object list, the draw-order key shared with
     /// [`ImageLayer::object_index`].
     pub object_index: usize,
@@ -714,6 +718,16 @@ fn model_layer(
             .and_then(serde_json::Value::as_array)
             .cloned()
             .unwrap_or_default(),
+        skin: m
+            .extra
+            .get("skin")
+            .and_then(serde_json::Value::as_u64)
+            .unwrap_or(0) as usize,
+        reflected: m.extra.get("reflected").is_some_and(|v| {
+            v.as_bool()
+                .or_else(|| v.get("value").and_then(serde_json::Value::as_bool))
+                .unwrap_or(false)
+        }),
         object_index,
     }
 }
@@ -1073,7 +1087,8 @@ mod tests {
                 {"id": 1, "name": "rig", "origin": "10 0 0", "angles": "0 0 1.5707964"},
                 {"id": 2, "name": "bg", "image": "models/bg.json", "perspective": true},
                 {"id": 3, "name": "rock", "model": "models/rock.mdl", "parent": 1,
-                 "origin": "1 0 0", "angles": "0.5 0.25 0", "attachment": "hand"},
+                 "origin": "1 0 0", "angles": "0.5 0.25 0", "attachment": "hand",
+                 "skin": 1, "reflected": true},
                 {"id": 4, "name": "front", "image": "models/bg.json"},
                 {"id": 5, "light": "lspot", "parent": 1, "origin": "0 2 0", "color": "1 0 0",
                  "radius": 50, "intensity": 2, "exponent": 0.5, "visible": false},
@@ -1094,7 +1109,8 @@ mod tests {
         let rock = &built.models[0];
         assert_eq!(rock.mdl.as_deref(), Some("models/rock.mdl"));
         assert_eq!(rock.attachment.as_deref(), Some("hand"));
-        assert!(rock.visible);
+        assert!(rock.visible && rock.reflected);
+        assert_eq!(rock.skin, 1);
         let expected = local_transform(
             Vec3::new(10.0, 0.0, 0.0),
             Vec3::ONE,

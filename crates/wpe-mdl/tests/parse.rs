@@ -43,6 +43,25 @@ fn model_position_texcoord_v13() {
     assert!(mdl.warnings.is_empty());
 }
 
+/// audiophile's grid.mdl: two skins, each submesh names a material per skin.
+#[test]
+fn model_with_two_skins_v4() {
+    let mut b = Bytes::mdlv(4);
+    b.u32(9).u32(2).u32(1);
+    b.str("materials/a.json").str("materials/b.json").u32(0);
+    b.u32(60);
+    for i in 0..3 {
+        b.floats(&[i as f32, 0., 0., 0., 0.]);
+    }
+    b.u32(6).u16(0).u16(1).u16(2).u8(0);
+    let mdl = Mdl::parse(&b.0).unwrap();
+    let m = &mdl.meshes[0];
+    assert_eq!(m.material.as_deref(), Some("materials/a.json"));
+    assert_eq!(m.skins, ["materials/a.json", "materials/b.json"]);
+    assert_eq!(m.positions[2], [2., 0., 0.]);
+    assert_eq!(m.indices, [0, 1, 2]);
+}
+
 #[test]
 fn model_normals_v16_reads_format_field() {
     let mdl = Mdl::parse(&tri_model(16, 11, &[1., 2., 3., 0., 0., 1., 0.1, 0.2]).0).unwrap();

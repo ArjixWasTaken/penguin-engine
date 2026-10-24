@@ -320,6 +320,7 @@ fn build_frame(
 
     let mut builder = FrameBuilder::new(cx.gpu, vfs, cache);
     builder.set_hdr(scene.hdr);
+    builder.set_user_properties(cx.props);
     builder.set_scene_combos(
         scene
             .fog
@@ -344,10 +345,12 @@ fn build_frame(
         let paths = wpe_scene::CameraPath::load_scene(vfs, &doc);
         *cx.camera_paths = wpe_scene::CameraPathPlayer::new(paths, fade);
     }
-    // Like Wallpaper Engine, only 3D scenes with camera paths render
-    // planar reflections.
-    if scene.is_3d && cx.camera_paths.is_some() {
-        builder.enable_reflection();
+    // 3D scenes render planar reflections when objects ask for them
+    // (`reflected`), mirroring only those, or when they have camera paths
+    // (Wallpaper Engine's `reflected_perspective` camera), mirroring all.
+    let reflected = scene.models.iter().any(|m| m.reflected);
+    if scene.is_3d && (reflected || cx.camera_paths.is_some()) {
+        builder.enable_reflection(reflected);
     }
     builder.objects(&scene.layers, &scene.models, &scene.draw_order);
     let postprocessing = doc

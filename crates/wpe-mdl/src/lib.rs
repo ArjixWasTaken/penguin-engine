@@ -4,9 +4,9 @@
 //! # File layout
 //!
 //! ```text
-//! "MDLVnnnn\0"  u32 format  u32 1  u32 submesh_count
+//! "MDLVnnnn\0"  u32 format  u32 skin_count (usually 1)  u32 submesh_count
 //! submesh × submesh_count:
-//!     cstr material   u32 index_kind (0 = u16, 1 = u32)
+//!     cstr material × skin_count   u32 index_kind (0 = u16, 1 = u32)
 //!     [v ≥ 17] f32×6 bounding box
 //!     [v ≥ 16] u32 vertex format (else the header format applies)
 //!     u32 vertex_bytes  vertices   u32 index_bytes  indices
@@ -216,6 +216,9 @@ impl Mdl {
 pub struct MdlMesh {
     /// Material JSON path, e.g. `materials/foo.json`.
     pub material: Option<String>,
+    /// Material JSON paths per skin when the model has several skins (the
+    /// first is [`Self::material`]); empty otherwise.
+    pub skins: Vec<String>,
     /// Attributes stored in the file.
     pub format: VertexFormat,
     /// Axis-aligned bounds `(min, max)` from the file (v17+; often zero for puppets).

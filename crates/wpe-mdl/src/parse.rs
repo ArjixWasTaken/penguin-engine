@@ -175,14 +175,17 @@ pub(crate) fn parse(bytes: &[u8]) -> Result<Mdl, MdlError> {
         format: r.u32()?,
         ..Mdl::default()
     };
-    let _unk = r.u32()?;
+    // Material names per submesh, one per skin (an object's `skin` picks
+    // one); 1 except in multi-skin models.
+    let skins = r.u32()?.max(1);
+    r.ensure_count(skins.into(), 1, "skin")?;
     let submeshes = r.u32()?;
     r.ensure_count(submeshes.into(), 10, "submesh")?;
 
     let mut resync_from = None;
     for index in 0..submeshes as usize {
         let meshes_before = mdl.meshes.len();
-        let after_indices = submesh(&mut r, &mut mdl, index)?;
+        let after_indices = submesh(&mut r, &mut mdl, index, skins)?;
         if version >= 21 {
             match post_submesh(&mut r, version) {
                 Ok((morphs, masks)) => {
@@ -275,8 +278,12 @@ fn header_plausible(r: &mut Reader, h: &SubmeshHeader) -> bool {
 }
 
 /// Parse one submesh; returns the offset just past its index data.
-fn submesh(r: &mut Reader, mdl: &mut Mdl, index: usize) -> Result<u64, MdlError> {
-    let material = r.cstr()?;
+fn submesh(r: &mut Reader, mdl: &mut Mdl, index: usize, skins: u32) -> Result<u64, MdlError> {
+    let mut materials = Vec::with_capacity(skins as usize);
+    for _ in 0..skins {
+        materials.push(r.cstr()?);
+    }
+    let material = materials[0].clone();
     let header_start = r.pos();
     let mut header = submesh_header(r, mdl.version, mdl.format, 0)?;
     if mdl.version >= 17 && !header_plausible(r, &header) {
@@ -312,6 +319,9 @@ fn submesh(r: &mut Reader, mdl: &mut Mdl, index: usize) -> Result<u64, MdlError>
     let vertex_count = header.vertex_bytes as usize / stride;
     let mut mesh = decode_vertices(vertex_data, format, vertex_count);
     mesh.material = material;
+    if materials.len() > 1 {
+        mesh.skins = materials;
+    }
     mesh.bounds = header.bounds;
 
     let wide = header.wide_flag == 1 || (vertex_count > 0xFFFF && index_bytes % 12 == 0);

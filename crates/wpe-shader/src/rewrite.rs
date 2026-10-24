@@ -165,7 +165,7 @@ pub fn expand_requires(src: &str) -> String {
 }
 
 static VARYING_ARRAY: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r"(?m)^\s*((?:(?:flat|smooth|noperspective|highp|mediump|lowp)\s+)*)(in|out)\s+(\w+)\s+(\w+)\s*\[\s*(\d+)\s*\]\s*;")
+    Regex::new(r"(?m)^\s*((?:(?:flat|smooth|noperspective|highp|mediump|lowp)\s+)*)(in|out)\s+(?:(?:highp|mediump|lowp)\s+)?(\w+)\s+(\w+)\s*\[\s*(\d+)\s*\]\s*;")
         .expect("valid regex")
 });
 
@@ -205,7 +205,7 @@ pub fn split_varying_arrays(src: &str) -> String {
 }
 
 static VARYING_DECL: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r"(?m)^([ \t]*)((?:(?:flat|smooth|noperspective|centroid|highp|mediump|lowp)\s+)*)(in|out)\s+(\w+)\s+(\w+)\s*;")
+    Regex::new(r"(?m)^([ \t]*)((?:(?:flat|smooth|noperspective|centroid|highp|mediump|lowp)\s+)*)(in|out)\s+(?:(?:highp|mediump|lowp)\s+)?(\w+)\s+(\w+)\s*;")
         .expect("valid regex")
 });
 
@@ -341,6 +341,16 @@ mod tests {
         assert!(f.contains("layout(location = 0) in vec2 v_A;"));
         assert!(f.contains("layout(location = 1) in vec4 v_B;"));
         assert!(f.contains("\nout vec4 glOutColor;"));
+    }
+
+    #[test]
+    fn varying_locations_allow_precision_after_direction() {
+        let (v, f) = assign_varying_locations(
+            "out vec3 v_A;\nout mediump vec2 v_TexCoord;\n",
+            "in vec3 v_A;\nin mediump vec2 v_TexCoord;\n",
+        );
+        assert!(v.contains("layout(location = 1) out mediump vec2 v_TexCoord;"));
+        assert!(f.contains("layout(location = 1) in mediump vec2 v_TexCoord;"));
     }
 
     #[test]

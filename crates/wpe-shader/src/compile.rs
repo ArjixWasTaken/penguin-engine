@@ -191,8 +191,8 @@ fn build(vert: &str, frag: &str) -> Result<(Vec<u32>, Vec<u32>, Reflection), Str
         }
     };
     let (vertex, fragment) = (
-        spirv.next().unwrap_or_default(),
-        spirv.next().unwrap_or_default(),
+        strip_relaxed_precision(spirv.next().unwrap_or_default()),
+        strip_relaxed_precision(spirv.next().unwrap_or_default()),
     );
     let mut reflection = Reflection::default();
     for (stage, words) in [(Stage::Vertex, &vertex), (Stage::Fragment, &fragment)] {
@@ -203,4 +203,56 @@ fn build(vert: &str, frag: &str) -> Result<(Vec<u32>, Vec<u32>, Reflection), Str
             .map_err(|e| format!("{stage:?}: {e}"))?;
     }
     Ok((vertex, fragment, reflection))
+}
+
+/// Drop `RelaxedPrecision` decorations (glslang emits them for `mediump` and
+/// `lowp`): they don't change results here and naga's SPIR-V front end warns
+/// about every one it meets.
+fn strip_relaxed_precision(words: Vec<u32>) -> Vec<u32> {
+    const OP_DECORATE: u32 = 71;
+    const OP_MEMBER_DECORATE: u32 = 72;
+    const RELAXED_PRECISION: u32 = 0;
+    if words.len() < 5 {
+        return words;
+    }
+    let mut out = Vec::with_capacity(words.len());
+    out.extend_from_slice(&words[..5]);
+    let mut i = 5;
+    while i < words.len() {
+        let count = (words[i] >> 16) as usize;
+        let opcode = words[i] & 0xffff;
+        if count == 0 || i + count > words.len() {
+            out.extend_from_slice(&words[i..]);
+            break;
+        }
+        let inst = &words[i..i + count];
+        let relaxed = match opcode {
+            OP_DECORATE => count == 3 && inst[2] == RELAXED_PRECISION,
+            OP_MEMBER_DECORATE => count == 4 && inst[3] == RELAXED_PRECISION,
+            _ => false,
+        };
+        if !relaxed {
+            out.extend_from_slice(inst);
+        }
+        i += count;
+    }
+    out
+}
+
+#[cfg(test)]
+mod strip_tests {
+    use super::strip_relaxed_precision;
+
+    #[test]
+    fn strips_only_relaxed_precision_decorations() {
+        let header = [0x0723_0203, 0x0001_0300, 0, 10, 0];
+        let mut words = header.to_vec();
+        words.extend([(3 << 16) | 71, 5, 0]); // OpDecorate %5 RelaxedPrecision
+        words.extend([(4 << 16) | 71, 6, 30, 1]); // OpDecorate %6 Location 1
+        words.extend([(4 << 16) | 72, 7, 2, 0]); // OpMemberDecorate %7 2 RelaxedPrecision
+        let out = strip_relaxed_precision(words);
+        let mut expected = header.to_vec();
+        expected.extend([(4 << 16) | 71, 6, 30, 1]);
+        assert_eq!(out, expected);
+    }
 }
