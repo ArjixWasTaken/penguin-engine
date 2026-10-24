@@ -6,7 +6,7 @@ use std::sync::Arc;
 
 use iced::widget::image::Handle;
 use iced::{Subscription, Task, Theme};
-use wpe_ipc::{Event, Request, Status};
+use wpe_ipc::{Event, Request, SettingsPatch, Status};
 use wpe_library::locale::Locale;
 use wpe_library::{Item, Kind, Rating, Source};
 
@@ -36,6 +36,10 @@ pub struct App {
     pub form: Option<Form>,
     /// The selection to restore once the library is loaded.
     restore: Option<String>,
+    /// The volume being dragged to, until the daemon has it.
+    pub volume: Option<u32>,
+    volume_inflight: bool,
+    volume_queued: Option<u32>,
 }
 
 pub struct Filters {
@@ -162,6 +166,9 @@ pub enum Message {
     RefreshStatus,
     Daemon(daemon::Feed),
     Pause(bool),
+    Sound(bool),
+    Volume(u32),
+    VolumeSent(Result<(), String>),
     Props(String, Option<String>, Result<library::Props, String>),
     Edit(Edit),
     PickFile(String, bool),
@@ -191,6 +198,9 @@ impl App {
             applying: None,
             notice: None,
             form: None,
+            volume: None,
+            volume_inflight: false,
+            volume_queued: None,
         };
         let load = Task::perform(library::load(), Message::Loaded);
         let mut tasks = vec![load, status()];
@@ -419,6 +429,36 @@ impl App {
                     None => Message::Ignore,
                 });
             }
+            Message::Sound(on) => {
+                let patch = SettingsPatch {
+                    audio: Some(on),
+                    ..Default::default()
+                };
+                return Task::perform(daemon::request(Request::Settings { patch }), |_| {
+                    Message::Ignore
+                });
+            }
+            Message::Volume(volume) => {
+                if self.status().is_none() {
+                    return Task::none();
+                }
+                self.volume = Some(volume);
+                if self.volume_inflight {
+                    self.volume_queued = Some(volume);
+                    return Task::none();
+                }
+                return self.send_volume(volume);
+            }
+            Message::VolumeSent(result) => {
+                self.volume_inflight = false;
+                if let Err(e) = result {
+                    tracing::warn!("setting the volume: {e}");
+                }
+                match self.volume_queued.take() {
+                    Some(volume) => return self.send_volume(volume),
+                    None => self.volume = None,
+                }
+            }
             Message::OpenWorkshop(id) => open(&format!(
                 "https://steamcommunity.com/sharedfiles/filedetails/?id={id}"
             )),
@@ -435,6 +475,17 @@ impl App {
 
     pub fn view(&self) -> iced::Element<'_, Message> {
         view::view(self)
+    }
+
+    fn send_volume(&mut self, volume: u32) -> Task<Message> {
+        self.volume_inflight = true;
+        let patch = SettingsPatch {
+            volume: Some(volume),
+            ..Default::default()
+        };
+        Task::perform(daemon::request(Request::Settings { patch }), |r| {
+            Message::VolumeSent(r.map(|_| ()))
+        })
     }
 
     /// The output the selected wallpaper plays on, among the target ones.

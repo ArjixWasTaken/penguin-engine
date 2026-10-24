@@ -18,6 +18,8 @@ icons! {
     external = "external-link",
     reset = "rotate-ccw",
     monitor = "monitor",
+    volume = "volume-2",
+    muted = "volume-x",
 }
 
 fn icon<'a, Message: 'a>(bytes: &'static [u8], size: f32) -> Element<'a, Message> {

@@ -56,6 +56,33 @@ fn top_bar(app: &App) -> Element<'_, Message> {
         .style(button::secondary)
         .on_press_maybe(app.status().map(|_| Message::Pause(!paused)));
 
+    let settings = app.status().map(|s| &s.settings);
+    let sound_on = settings.is_some_and(|s| s.audio);
+    let volume = app
+        .volume
+        .or(settings.map(|s| s.volume))
+        .unwrap_or(100);
+    let sound = button(if sound_on { icons::volume(16.0) } else { icons::muted(16.0) })
+        .padding([6, 8])
+        .style(button::text)
+        .on_press_maybe(settings.map(|_| Message::Sound(!sound_on)));
+    let sound = iced::widget::tooltip(
+        sound,
+        container(text(if sound_on { "Sound on: click to mute" } else { "Sound off: click to turn on" }).size(12))
+            .padding([4, 8])
+            .style(container::rounded_box),
+        iced::widget::tooltip::Position::Bottom,
+    );
+    let mut slider = iced::widget::slider(0..=100u32, volume, Message::Volume).width(110);
+    if settings.is_none() || !sound_on {
+        slider = slider.style(|theme: &iced::Theme, status| {
+            let mut style = iced::widget::slider::default(theme, status);
+            style.rail.backgrounds.0 = theme::MUTED.scale_alpha(0.5).into();
+            style
+        });
+    }
+    let volume_text = text(format!("{volume}%")).size(13).color(theme::MUTED).width(36);
+
     let bar = row![
         text("Wallpapers").size(18),
         Space::new().width(24),
@@ -64,6 +91,10 @@ fn top_bar(app: &App) -> Element<'_, Message> {
         text("Sort").size(13).color(theme::MUTED),
         sort,
         space::horizontal(),
+        sound,
+        slider,
+        volume_text,
+        Space::new().width(8),
         icons::monitor(16.0),
         target,
         pause,
