@@ -23,9 +23,13 @@ pub enum Verdict {
 }
 
 impl NetworkPolicy {
+    /// The verdict on `url`. Local files are blocked here; the pages'
+    /// own files and the files users pick are served by the host.
     pub fn check(&self, url: &Url) -> Verdict {
-        if !matches!(url.scheme(), "http" | "https" | "ws" | "wss") {
-            return Verdict::Allow;
+        match url.scheme() {
+            "http" | "https" | "ws" | "wss" => {}
+            "file" => return Verdict::Block,
+            _ => return Verdict::Allow,
         }
         let Some(host) = url.host() else {
             return Verdict::Block;
@@ -129,6 +133,7 @@ mod tests {
             Verdict::Resolve("example.com".into(), 443)
         );
         assert_eq!(check(&p, "data:text/plain,hi"), Verdict::Allow);
+        assert_eq!(check(&p, "file:///etc/passwd"), Verdict::Block);
     }
 
     #[test]

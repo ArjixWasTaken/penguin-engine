@@ -24,6 +24,7 @@ use url::Url;
 
 use crate::context::PageContext;
 use crate::gpu::Ring;
+use crate::local::{self, LocalFiles};
 use crate::policy::{self, NetworkPolicy, Verdict};
 use crate::{Button, Frame, Input, PageOptions, Shared, WebError};
 
@@ -49,6 +50,11 @@ pub enum Cmd {
     Js {
         id: u64,
         script: String,
+    },
+    /// Changed user properties, `{name: {type, value}}`.
+    Properties {
+        id: u64,
+        changed: serde_json::Value,
     },
     Paused {
         id: u64,
@@ -169,6 +175,8 @@ struct Page {
     export_frames: bool,
     /// The exported textures frames are copied into.
     ring: Option<Ring>,
+    /// Local files the page may read.
+    local: LocalFiles,
 }
 
 impl Page {
@@ -290,14 +298,33 @@ impl WebViewDelegate for Pages {
     }
 
     fn load_web_resource(&self, webview: WebView, load: WebResourceLoad) {
-        let Some((root, origin, network)) = self.with(&webview, |p| {
-            (p.root.clone(), p.origin.clone(), p.network.clone())
+        let Some((root, origin, network, shared)) = self.with(&webview, |p| {
+            (
+                p.root.clone(),
+                p.origin.clone(),
+                p.network.clone(),
+                p.shared.clone(),
+            )
         }) else {
             return;
         };
         let url = load.request().url.clone();
         if url.origin() == origin.origin() {
-            serve(load, root, url);
+            match url.path().strip_prefix("/__wpe/rpc/") {
+                Some(method) => {
+                    let method = method.to_owned();
+                    rpc(load, &shared, &method, url)
+                }
+                None => serve(load, root, url),
+            }
+            return;
+        }
+        tracing::trace!("request for {url}");
+        if url.scheme() == "file" {
+            match self.with(&webview, |p| p.local.allowed(&url)).flatten() {
+                Some(path) => serve_file(load, &path, url),
+                None => block(load, &url),
+            }
             return;
         }
         match network.check(&url) {
@@ -372,23 +399,51 @@ impl Page {
 }
 
 fn block(load: WebResourceLoad, url: &Url) {
-    tracing::info!("blocked a request to {url} (a local address)");
+    tracing::info!("blocked a request to {url}");
     load.intercept(WebResourceResponse::new(url.clone()))
         .cancel();
 }
 
-/// Answer a request on the page's own origin from its directory.
-fn serve(load: WebResourceLoad, root: std::path::PathBuf, url: Url) {
-    let range = load
-        .request()
+/// Calls from the shim: `fetch("/__wpe/rpc/<method>")`.
+fn rpc(load: WebResourceLoad, shared: &Shared, method: &str, url: Url) {
+    match method {
+        "audio-registered" => shared.audio_registered.store(true, Ordering::Release),
+        other => tracing::debug!("unknown page call {other}"),
+    }
+    let mut head = WebResourceResponse::new(url);
+    head.status_code = StatusCode::NO_CONTENT;
+    head.status_message = b"No Content".to_vec();
+    load.intercept(head).finish();
+}
+
+fn range(load: &WebResourceLoad) -> Option<String> {
+    load.request()
         .headers
         .get(http::header::RANGE)
         .and_then(|v| v.to_str().ok())
-        .map(ToOwned::to_owned);
-    let response = crate::serve::get(&root, url.path(), range.as_deref());
+        .map(ToOwned::to_owned)
+}
+
+/// Answer a request on the page's own origin from its directory.
+fn serve(load: WebResourceLoad, root: std::path::PathBuf, url: Url) {
+    let response = crate::serve::get(&root, url.path(), range(&load).as_deref());
     if response.status == 404 {
         tracing::debug!("not found: {}", url.path());
     }
+    respond(load, url, response);
+}
+
+/// Answer a `file:` request for a file the page may read.
+fn serve_file(load: WebResourceLoad, path: &std::path::Path, url: Url) {
+    let mut response = crate::serve::respond(path, range(&load).as_deref());
+    // Pages fetch them from their http origin.
+    response
+        .headers
+        .push(("Access-Control-Allow-Origin", "*".to_owned()));
+    respond(load, url, response);
+}
+
+fn respond(load: WebResourceLoad, url: Url, response: crate::serve::Response) {
     let mut head = WebResourceResponse::new(url);
     head.status_code = StatusCode::from_u16(response.status).unwrap_or(StatusCode::OK);
     head.status_message = head
@@ -472,6 +527,16 @@ fn run(rx: Receiver<Cmd>, waker: Sender<Cmd>, profile_dir: Option<std::path::Pat
             Some(Cmd::Input { id, input }) => {
                 if let Some(webview) = pages.webview(id) {
                     webview.notify_input_event(input_event(input));
+                }
+            }
+            Some(Cmd::Properties { id, changed }) => {
+                pages.by_id(id, |p| p.local.update(&changed));
+                if let Some(webview) = pages.webview(id) {
+                    let changed = local::for_page(&changed);
+                    webview.evaluate_javascript(
+                        format!("window.__wpe && __wpe.apply({changed})"),
+                        |_| {},
+                    );
                 }
             }
             Some(Cmd::Js { id, script }) => {
@@ -579,9 +644,11 @@ fn open_page(
         .unwrap_or_else(|_| origin.clone());
     let content = Rc::new(UserContentManager::new(servo));
     content.add_script(Rc::new(UserScript::new(
-        crate::shim::script(&options.properties, &options.general),
+        crate::shim::script(&local::for_page(&options.properties), &options.general),
         None,
     )));
+    let mut local = LocalFiles::new(&options.root);
+    local.update(&options.properties);
     let webview = WebViewBuilder::new(servo, context.clone())
         .url(url.clone())
         .hidpi_scale_factor(Scale::new(options.scale.max(0.1)))
@@ -604,6 +671,7 @@ fn open_page(
             paused: false,
             export_frames: options.export_frames,
             ring: None,
+            local,
         },
     );
 }

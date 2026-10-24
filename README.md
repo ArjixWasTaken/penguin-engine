@@ -112,7 +112,12 @@ A web wallpaper's directory is served at `http://<workshop id>.wallpaper.localho
 local storage, kept under `<data dir>/wallpaper-engine-rs/web`). Pages get Wallpaper Engine's
 JavaScript API: `wallpaperPropertyListener` (`applyUserProperties`, `applyGeneralProperties`
 with the frame rate limit, `setPaused`) and `wallpaperRegisterAudioListener`. They get the
-pointer, all three mouse buttons and the scroll wheel, and lay out at the output's scale.
+pointer, all three mouse buttons and the scroll wheel, and lay out at the output's scale. Audio
+listeners get the spectrum while audio is on; page sound follows the audio setting and volume.
+`file:` URLs reach only the wallpaper's own files and the files and directories picked for its
+`file`/`directory` properties (handed to pages as Wallpaper Engine does, for `file:///` + path;
+directories also through `userDirectoryFilesAddedOrChanged` and
+`wallpaperRequestRandomFileForProperty`).
 `crates/wpe-web/examples/event-test` is a page logging what it receives. They may load from the internet, but not
 from this machine or the local network (localhost, private and link-local addresses, and names
 resolving to them); `WPE_WEB_ALLOW_HOSTS=nas.lan,192.168.1.10` lets chosen hosts through.

@@ -9,6 +9,7 @@
 mod context;
 mod gpu;
 mod host;
+mod local;
 mod policy;
 mod serve;
 mod shim;
@@ -103,6 +104,8 @@ struct Shared {
     pacer: Arc<context::Pacer>,
     /// The renderer ticks the page; until then it ticks itself.
     driven: AtomicBool,
+    /// The page called `wallpaperRegisterAudioListener`.
+    audio_registered: AtomicBool,
 }
 
 /// One open page.
@@ -189,7 +192,38 @@ impl WebPage {
     /// Changed user properties, `{name: {type, value}}`, for the page's
     /// `applyUserProperties`.
     pub fn apply_properties(&self, changed: &serde_json::Value) {
-        self.eval(format!("window.__wpe && __wpe.apply({changed})"));
+        host::send(host::Cmd::Properties {
+            id: self.id,
+            changed: changed.clone(),
+        });
+    }
+
+    /// Whether the page listens to audio (`wallpaperRegisterAudioListener`).
+    pub fn wants_audio(&self) -> bool {
+        self.shared.audio_registered.load(Ordering::Acquire)
+    }
+
+    /// The audio spectrum for the page's audio listeners: 64 left
+    /// bands, then 64 right, as Wallpaper Engine sends them.
+    pub fn send_audio(&self, bands: &[f32; 128]) {
+        let mut script = String::with_capacity(1024);
+        script.push_str("window.__wpe && __wpe.audio([");
+        for (i, v) in bands.iter().enumerate() {
+            if i > 0 {
+                script.push(',');
+            }
+            script.push_str(&format!("{:.3}", v.max(0.0)));
+        }
+        script.push_str("])");
+        self.eval(script);
+    }
+
+    /// Sound volume of the page's media and Web Audio, 0..1 (0 mutes).
+    pub fn set_volume(&self, volume: f32) {
+        self.eval(format!(
+            "window.__wpe && __wpe.setVolume({})",
+            volume.clamp(0.0, 1.0)
+        ));
     }
 
     /// New general properties (`{fps: 30}`) for `applyGeneralProperties`.

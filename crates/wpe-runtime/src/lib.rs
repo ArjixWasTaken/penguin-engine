@@ -555,6 +555,7 @@ impl PreparedWallpaper {
                 target: None,
                 shown: None,
                 shared: None,
+                audio_sent: None,
             }),
         };
         let built = wallpaper.install(gpu, self.frame);
@@ -1027,6 +1028,33 @@ impl Wallpaper {
                 stream.set_audio(self.audio_enabled.then_some(self.volume));
             }
         }
+        // A web wallpaper's own sound likewise.
+        #[cfg(feature = "web")]
+        if let Some(web) = &self.web {
+            web.page
+                .set_volume(if self.audio_enabled { self.volume } else { 0.0 });
+        }
+    }
+
+    /// Hand the audio spectrum to a web wallpaper's audio listeners, about
+    /// 30 times a second as Wallpaper Engine does.
+    #[cfg(feature = "web")]
+    fn feed_web_audio(&mut self) {
+        let (Some(web), Some(spectrum)) = (&mut self.web, &self.spectrum) else {
+            return;
+        };
+        if !web.page.wants_audio()
+            || web
+                .audio_sent
+                .is_some_and(|t| t.elapsed() < std::time::Duration::from_millis(33))
+        {
+            return;
+        }
+        web.audio_sent = Some(Instant::now());
+        let mut bands = [0.0; 128];
+        bands[..64].copy_from_slice(&spectrum.left64);
+        bands[64..].copy_from_slice(&spectrum.right64);
+        web.page.send_audio(&bands);
     }
 
     /// Refresh the audio spectrum. Without capture, `WPE_FAKE_AUDIO` feeds a
@@ -1337,6 +1365,8 @@ impl Wallpaper {
         self.animate(globals.time);
         self.light_fx.select(&mut self.renderer, &globals);
         self.update_audio(globals.time);
+        #[cfg(feature = "web")]
+        self.feed_web_audio();
         self.run_scripts(gpu, globals.time, size);
         self.renderer.render(gpu, encoder, globals, output, size);
     }
@@ -1354,6 +1384,8 @@ impl Wallpaper {
         self.animate(globals.time);
         self.light_fx.select(&mut self.renderer, &globals);
         self.update_audio(globals.time);
+        #[cfg(feature = "web")]
+        self.feed_web_audio();
         self.run_scripts(gpu, globals.time, size);
         self.renderer.capture(gpu, globals, size)
     }

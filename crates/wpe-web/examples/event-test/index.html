@@ -5,12 +5,16 @@ let frames = 0;
 const log = (m) => console.error("TEST " + m);
 addEventListener("mousedown", e => log("down button=" + e.button + " at " + e.clientX + "," + e.clientY));
 addEventListener("wheel", e => log("wheel dy=" + e.deltaY));
+fetch("file:///etc/hostname").then(r => r.text()).then(t => log("LEAK " + t), e => log("file fetch refused: " + e));
+fetch("/__wpe/rpc/nothing").then(r => log("rpc status " + r.status));
 addEventListener("contextmenu", e => e.preventDefault());
 const t = document.getElementById("t"); const tick = () => { frames++; t.textContent = frames; requestAnimationFrame(tick); };
 requestAnimationFrame(tick);
 setInterval(() => { log("raf/s=" + frames + " dpr=" + devicePixelRatio + " size=" + innerWidth + "x" + innerHeight); frames = 0; }, 1000);
 window.wallpaperPropertyListener = {
-  applyUserProperties: p => { log("props " + JSON.stringify(p)); if (p.color) document.body.style.background = "rgb(" + p.color.value.split(" ").map(c => c * 255) + ")"; },
+  userDirectoryFilesAddedOrChanged: (name, files) => { log("dir " + name + " " + files.length + " files, first " + files[0]); wallpaperRequestRandomFileForProperty(name, (n, f) => log("random " + n + " " + f)); },
+  applyUserProperties: p => {
+    if (p.pic && p.pic.value) { const i = new Image(); i.onload = () => { const c = document.createElement("canvas"); c.width = 4; c.height = 4; const x = c.getContext("2d"); x.drawImage(i, -10, -10); log("img ok " + i.naturalWidth + "x" + i.naturalHeight + " pixel " + Array.from(x.getImageData(0, 0, 1, 1).data)); document.body.style.backgroundImage = "url('file:///" + p.pic.value + "')"; }; i.onerror = () => log("img error"); i.src = "file:///" + p.pic.value; } log("props " + JSON.stringify(p)); if (p.color) document.body.style.background = "rgb(" + p.color.value.split(" ").map(c => c * 255) + ")"; },
   applyGeneralProperties: p => log("general " + JSON.stringify(p)),
   setPaused: p => log("paused " + p),
 };

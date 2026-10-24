@@ -142,8 +142,13 @@ fn screenshot(args: &Args, assets: &std::path::Path, out: &std::path::Path) -> R
     let web = wallpaper.is_web();
     let small = if web { args.size } else { (64, 64) };
     if web {
-        wallpaper.capture(&gpu, args.size);
-        std::thread::sleep(std::time::Duration::from_secs_f32(args.time.max(3.0)));
+        // Pages advance only as frames are drawn.
+        let settle =
+            std::time::Instant::now() + std::time::Duration::from_secs_f32(args.time.max(3.0));
+        while std::time::Instant::now() < settle {
+            wallpaper.capture(&gpu, args.size);
+            std::thread::sleep(std::time::Duration::from_millis(33));
+        }
     }
     for frame in 1..args.frames {
         wallpaper.time_override = Some(args.time + frame as f32 / 30.0);

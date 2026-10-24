@@ -1,2 +1,24 @@
-{"type": "web", "file": "index.html", "title": "event test",
- "general": {"properties": {"color": {"type": "color", "value": "1 0 0", "text": "Colour"}}}}
+{
+ "type": "web",
+ "file": "index.html",
+ "title": "event test",
+ "general": {
+  "properties": {
+   "color": {
+    "type": "color",
+    "value": "1 0 0",
+    "text": "Colour"
+   },
+   "pic": {
+    "type": "file",
+    "value": "",
+    "text": "Picture"
+   },
+   "pics": {
+    "type": "directory",
+    "value": "",
+    "text": "Pictures"
+   }
+  }
+ }
+}

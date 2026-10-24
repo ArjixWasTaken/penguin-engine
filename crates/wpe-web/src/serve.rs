@@ -24,14 +24,19 @@ impl Response {
 /// The response to a GET of `path` (the URL path, percent-encoded) with
 /// an optional `Range` header.
 pub fn get(root: &Path, path: &str, range: Option<&str>) -> Response {
-    let Some(file) = find(root, path) else {
-        return Response::status(404);
-    };
-    let Ok(mut f) = std::fs::File::open(&file) else {
+    match find(root, path) {
+        Some(file) => respond(&file, range),
+        None => Response::status(404),
+    }
+}
+
+/// The response to a GET of `file` with an optional `Range` header.
+pub fn respond(file: &Path, range: Option<&str>) -> Response {
+    let Ok(mut f) = std::fs::File::open(file) else {
         return Response::status(404);
     };
     let len = f.metadata().map_or(0, |m| m.len());
-    let mime = mime(&file);
+    let mime = mime(file);
     let mut headers = vec![
         ("Content-Type", mime.to_owned()),
         ("Accept-Ranges", "bytes".to_owned()),

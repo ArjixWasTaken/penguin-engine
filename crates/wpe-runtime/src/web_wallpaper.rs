@@ -73,6 +73,8 @@ mod enabled {
         pub shown: Option<(u32, u32)>,
         /// The page's exported textures, imported.
         pub shared: Option<Shared>,
+        /// When the audio spectrum was last sent.
+        pub audio_sent: Option<std::time::Instant>,
     }
 
     /// Exported textures frames are copied from.
