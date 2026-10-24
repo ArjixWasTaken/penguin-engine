@@ -20,6 +20,7 @@ pub struct ImageDraw {
     pub texture: Arc<GpuTexture>,
 }
 
+#[allow(clippy::large_enum_variant)]
 pub enum Draw {
     /// The built-in stand-in image shader (scene camera).
     Image(ImageDraw),
