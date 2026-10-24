@@ -295,6 +295,41 @@ pub enum TexRef {
     Target(TargetId),
 }
 
+/// One frame of a sprite-sheet animation.
+#[derive(Debug, Clone, Copy)]
+pub struct SpriteFrame {
+    /// Index into [`SpriteAnimation::pages`].
+    pub page: usize,
+    pub duration: f32,
+    /// `g_Texture<N>Rotation`: the frame's x and y axes in UV units.
+    pub rotation: [f32; 4],
+    /// `g_Texture<N>Translation`: the frame's origin in UV units.
+    pub translation: [f32; 2],
+}
+
+/// A sprite sheet bound to one texture slot.
+#[derive(Clone)]
+pub struct SpriteAnimation {
+    pub slot: usize,
+    pub frames: Vec<SpriteFrame>,
+    /// One texture per sheet page.
+    pub pages: Vec<Arc<GpuTexture>>,
+}
+
+impl SpriteAnimation {
+    fn frame_at(&self, time: f32) -> Option<&SpriteFrame> {
+        let total: f32 = self.frames.iter().map(|f| f.duration.max(0.0)).sum();
+        if total <= 0.0 {
+            return self.frames.first();
+        }
+        let mut t = time.rem_euclid(total);
+        self.frames.iter().find(|f| {
+            t -= f.duration.max(0.0);
+            t < 0.0
+        })
+    }
+}
+
 /// The view-projection a draw uses.
 #[derive(Debug, Clone, Copy)]
 pub enum Camera {
@@ -315,6 +350,7 @@ pub struct MaterialDraw {
     pub mesh: CardMesh,
     pub blend: BlendMode,
     pub camera: Camera,
+    pub sprites: Vec<SpriteAnimation>,
 }
 
 pub(crate) struct PreparedMaterialDraw {
@@ -499,6 +535,37 @@ impl PreparedMaterialDraw {
         placeholders: &Placeholders,
         targets: &Targets,
     ) {
+        for anim in &self.draw.sprites {
+            let Some(frame) = anim.frame_at(globals.time) else {
+                continue;
+            };
+            let Some(page) = anim.pages.get(frame.page) else {
+                continue;
+            };
+            let bound = self.draw.textures.get(anim.slot).and_then(Option::as_ref);
+            if !matches!(bound, Some(TexRef::Asset(t)) if Arc::ptr_eq(t, page)) {
+                if self.draw.textures.len() <= anim.slot {
+                    self.draw.textures.resize(anim.slot + 1, None);
+                }
+                self.draw.textures[anim.slot] = Some(TexRef::Asset(page.clone()));
+                self.bind_group = None;
+            }
+            let r = &self.draw.program.reflection;
+            for (name, values) in [
+                (
+                    format!("g_Texture{}Rotation", anim.slot),
+                    &frame.rotation[..],
+                ),
+                (
+                    format!("g_Texture{}Translation", anim.slot),
+                    &frame.translation[..],
+                ),
+            ] {
+                if let Some(member) = r.uniforms.get(&name) {
+                    self.block.write(member, values);
+                }
+            }
+        }
         self.bind(gpu, placeholders, targets);
         let Some(buffer) = &self.uniforms else { return };
         let r = &self.draw.program.reflection;

@@ -16,6 +16,24 @@ pub struct GpuTexture {
 }
 
 impl GpuTexture {
+    /// Replace the first mip of an RGBA8 texture (video frames).
+    pub fn write_rgba(&self, gpu: &Gpu, data: &[u8]) {
+        let size = self.texture.size();
+        gpu.queue.write_texture(
+            self.texture.as_image_copy(),
+            data,
+            wgpu::TexelCopyBufferLayout {
+                offset: 0,
+                bytes_per_row: Some(size.width * 4),
+                rows_per_image: Some(size.height),
+            },
+            wgpu::Extent3d {
+                depth_or_array_layers: 1,
+                ..size
+            },
+        );
+    }
+
     /// UV scale mapping a card onto the picture inside a padded texture.
     pub fn uv_scale(&self) -> [f32; 2] {
         if self.width * self.height > self.map_width * self.map_height {
@@ -84,6 +102,9 @@ fn valid_mip_chain(format: TexFormat, mips: &[Mip]) -> usize {
 
 /// Upload the first image slot of `tex`, with as much of its mip chain as is valid.
 pub fn upload_texture(gpu: &Gpu, tex: &Texture, label: &str) -> GpuTexture {
+    if tex.video.is_some() {
+        tracing::warn!("texture {label} is a video; showing a placeholder");
+    }
     let mips = tex.images.first().map_or(&[][..], |i| &i.mips[..]);
     let mut format = tex.format;
     if format.is_compressed() && !gpu.supports_bc() {

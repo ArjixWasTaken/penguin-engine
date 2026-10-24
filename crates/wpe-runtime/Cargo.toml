@@ -6,7 +6,9 @@ license.workspace = true
 
 [dependencies]
 chrono = { version = "0.4.45", default-features = false, features = ["clock"] }
+dirs = "7.0.0"
 glam = "0.34.1"
+sha1_smol = { version = "1.0.1", features = ["std"] }
 thiserror = "2.0.21"
 tracing = "0.1.44"
 wpe-assets = { version = "0.1.0", path = "../wpe-assets" }

@@ -3,14 +3,16 @@
 mod files;
 mod frame;
 pub mod material;
+mod video;
 
 use std::path::Path;
+use std::sync::Arc;
 use std::time::Instant;
 
 use chrono::Timelike;
 use glam::Vec2;
 use wpe_assets::tex::{Mip, TexFormat, TexImage, Texture};
-use wpe_render::{FrameGlobals, Gpu, SceneRenderer, wgpu};
+use wpe_render::{FrameGlobals, Gpu, GpuTexture, SceneRenderer, wgpu};
 use wpe_scene::{OrthoCamera, Scene};
 
 use frame::FrameBuilder;
@@ -49,6 +51,7 @@ pub struct Wallpaper {
     pub fill: FillMode,
     camera: OrthoCamera,
     renderer: SceneRenderer,
+    videos: Vec<(Arc<GpuTexture>, video::VideoStream)>,
     start: Instant,
     /// Cursor over the output, 0..1 with Y down.
     pointer: Vec2,
@@ -70,7 +73,8 @@ impl Wallpaper {
         let files = WallpaperFiles::open_with_assets_dir(assets, path)?;
         let vfs = &files.vfs;
         let mut store = TextureStore::default();
-        let scene = Scene::build(vfs, &files.scene, |name| store.size(vfs, name));
+        let props = wpe_scene::UserProperties::from_project(&files.project);
+        let scene = Scene::build(vfs, &files.scene, &props, |name| store.size(vfs, name));
         tracing::info!(
             "scene {}: {}x{}, {} image layers",
             files.scene_file,
@@ -80,12 +84,13 @@ impl Wallpaper {
         );
 
         let mut builder = FrameBuilder::new(gpu, vfs, store, white_texture());
-        for layer in &scene.layers {
-            builder.layer(layer);
+        builder.layers(&scene.layers);
+        if let Some(bloom) = scene.bloom {
+            builder.bloom(bloom);
         }
         let (real, total) = builder.stats;
         tracing::info!("{real} of {total} draws use their real shader");
-        let (targets, steps) = builder.finish();
+        let frame = builder.finish();
 
         let mut renderer = SceneRenderer::new(gpu, output_format);
         let c = scene.clear_color;
@@ -95,7 +100,7 @@ impl Wallpaper {
             b: c.z as f64,
             a: 1.0,
         };
-        renderer.set_frame(gpu, targets, steps);
+        renderer.set_frame(gpu, frame.targets, frame.steps);
 
         Ok(Self {
             title: files
@@ -106,11 +111,20 @@ impl Wallpaper {
             fill: FillMode::default(),
             camera: scene.camera,
             renderer,
+            videos: frame.videos,
             start: Instant::now(),
             pointer: Vec2::splat(0.5),
             parallax_influence: files.scene.general.cameraparallaxmouseinfluence.value,
             time_override: None,
         })
+    }
+
+    fn upload_video_frames(&mut self, gpu: &Gpu) {
+        for (texture, stream) in &self.videos {
+            if let Some(frame) = stream.take_frame() {
+                texture.write_rgba(gpu, &frame);
+            }
+        }
     }
 
     /// Cursor position over the output, 0..1 with Y down.
@@ -142,12 +156,17 @@ impl Wallpaper {
         output: &wgpu::TextureView,
         size: (u32, u32),
     ) {
+        self.upload_video_frames(gpu);
         let globals = self.globals(size);
         self.renderer.render(gpu, encoder, globals, output, size);
     }
 
     /// Render one frame offscreen and return it as RGBA8 pixels.
     pub fn capture(&mut self, gpu: &Gpu, size: (u32, u32)) -> Vec<u8> {
+        for (_, stream) in &self.videos {
+            stream.wait_started(std::time::Duration::from_secs(5));
+        }
+        self.upload_video_frames(gpu);
         let globals = self.globals(size);
         self.renderer.capture(gpu, globals, size)
     }

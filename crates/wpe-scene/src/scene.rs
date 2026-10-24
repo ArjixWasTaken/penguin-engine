@@ -6,7 +6,7 @@ use wpe_assets::scene::{ImageEffect, ImageObject, ObjectCommon, SceneObject};
 use wpe_assets::{AssetError, ImageModel, load_json};
 use wpe_vfs::Vfs;
 
-use crate::{OrthoCamera, alignment_offset, local_transform};
+use crate::{OrthoCamera, UserProperties, alignment_offset, local_transform};
 
 const DEFAULT_ORTHO: Vec2 = Vec2::new(1920.0, 1080.0);
 
@@ -15,8 +15,19 @@ const DEFAULT_ORTHO: Vec2 = Vec2::new(1920.0, 1080.0);
 pub struct Scene {
     pub camera: OrthoCamera,
     pub clear_color: Vec3,
-    /// Image layers in draw order (back to front).
+    /// Scene-wide bloom post-processing, when enabled.
+    pub bloom: Option<Bloom>,
+    /// Image layers in draw order (back to front), including hidden ones
+    /// other layers may sample.
     pub layers: Vec<ImageLayer>,
+}
+
+/// Wallpaper Engine's legacy (LDR) bloom settings.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Bloom {
+    pub strength: f32,
+    pub threshold: f32,
+    pub tint: Vec3,
 }
 
 /// A textured card resolved from an image object, its model and material.
@@ -24,6 +35,8 @@ pub struct Scene {
 pub struct ImageLayer {
     pub id: i32,
     pub name: String,
+    /// The layer and all its ancestors are visible.
+    pub visible: bool,
     /// World transform of the card centre (alignment already applied).
     pub transform: Mat4,
     /// Card size in scene pixels.
@@ -58,6 +71,8 @@ impl ImageLayer {
 /// Transform-only view of every object, used to resolve parent chains.
 struct Node<'a> {
     common: &'a ObjectCommon,
+    /// A bare group, whose visibility applies to its children.
+    group: bool,
 }
 
 fn vec2(v: [f32; 2]) -> Vec2 {
@@ -96,14 +111,18 @@ impl Scene {
     pub fn build(
         vfs: &Vfs,
         scene: &wpe_assets::Scene,
+        props: &UserProperties,
         mut texture_size: impl FnMut(&str) -> Option<Vec2>,
     ) -> Self {
         let general = &scene.general;
         let nodes: HashMap<i32, Node> = scene
             .objects
             .iter()
-            .filter_map(SceneObject::common)
-            .map(|common| (common.id, Node { common }))
+            .filter_map(|obj| {
+                let common = obj.common()?;
+                let group = matches!(obj, SceneObject::Group(_));
+                Some((common.id, Node { common, group }))
+            })
             .collect();
 
         let mut images = Vec::new();
@@ -135,7 +154,6 @@ impl Scene {
 
         let layers = images
             .into_iter()
-            .filter(|(img, _)| is_visible(&nodes, img.common.id))
             .map(|(img, loaded)| {
                 let (size, transform) = if loaded.fullscreen {
                     (ortho, Mat4::from_translation((ortho / 2.0).extend(0.0)))
@@ -143,30 +161,39 @@ impl Scene {
                     let common = &img.common;
                     let size = loaded
                         .size
-                        .unwrap_or_else(|| vec3(*common.origin.value).truncate() * 2.0);
-                    let origin = vec3(*common.origin.value)
+                        .unwrap_or_else(|| vec3(*props.value(&common.origin)).truncate() * 2.0);
+                    let origin = vec3(*props.value(&common.origin))
                         + alignment_offset(&img.alignment, size).extend(0.0);
                     let local = local_transform(
                         origin,
-                        vec3(*common.scale.value),
-                        vec3(*common.angles.value),
+                        vec3(*props.value(&common.scale)),
+                        vec3(*props.value(&common.angles)),
                     );
-                    (size, parent_transform(&nodes, common.parent, 0) * local)
+                    (
+                        size,
+                        parent_transform(&nodes, props, common.parent, 0) * local,
+                    )
                 };
                 ImageLayer {
                     id: img.common.id,
                     name: img.common.name.clone(),
+                    visible: is_visible(&nodes, props, img.common.id),
                     transform,
                     size,
-                    color: vec3(*img.color.value),
-                    alpha: img.alpha.value,
-                    brightness: img.brightness.value,
+                    color: vec3(*props.value(&img.color)),
+                    alpha: props.value(&img.alpha),
+                    brightness: props.value(&img.brightness),
                     material: loaded.material,
                     solid: loaded.solid,
                     compose: loaded.passthrough,
                     fullscreen: loaded.fullscreen,
                     color_blend_mode: img.color_blend_mode,
-                    effects: img.effects.clone(),
+                    effects: img
+                        .effects
+                        .iter()
+                        .filter(|fx| props.flag(&fx.visible))
+                        .cloned()
+                        .collect(),
                 }
             })
             .collect();
@@ -174,9 +201,14 @@ impl Scene {
         Self {
             camera: OrthoCamera {
                 scene_size: ortho,
-                zoom: general.zoom.value,
+                zoom: props.value(&general.zoom),
             },
-            clear_color: vec3(*general.clearcolor.value),
+            clear_color: vec3(*props.value(&general.clearcolor)),
+            bloom: props.flag(&general.bloom).then(|| Bloom {
+                strength: props.value(&general.bloomstrength),
+                threshold: props.value(&general.bloomthreshold),
+                tint: vec3(*props.value(&general.bloomtint)),
+            }),
             layers,
         }
     }
@@ -233,7 +265,12 @@ fn load_image(
 /// Parent chains deeper than this are treated as cycles.
 const MAX_DEPTH: usize = 64;
 
-fn parent_transform(nodes: &HashMap<i32, Node>, parent: Option<i32>, depth: usize) -> Mat4 {
+fn parent_transform(
+    nodes: &HashMap<i32, Node>,
+    props: &UserProperties,
+    parent: Option<i32>,
+    depth: usize,
+) -> Mat4 {
     let Some(node) = parent.and_then(|id| nodes.get(&id)) else {
         return Mat4::IDENTITY;
     };
@@ -242,21 +279,23 @@ fn parent_transform(nodes: &HashMap<i32, Node>, parent: Option<i32>, depth: usiz
         return Mat4::IDENTITY;
     }
     let c = node.common;
-    parent_transform(nodes, c.parent, depth + 1)
+    parent_transform(nodes, props, c.parent, depth + 1)
         * local_transform(
-            vec3(*c.origin.value),
-            vec3(*c.scale.value),
-            vec3(*c.angles.value),
+            vec3(*props.value(&c.origin)),
+            vec3(*props.value(&c.scale)),
+            vec3(*props.value(&c.angles)),
         )
 }
 
-fn is_visible(nodes: &HashMap<i32, Node>, id: i32) -> bool {
+/// A layer shows when it is visible itself and no ancestor group is hidden;
+/// hidden image parents only anchor their children's transforms.
+fn is_visible(nodes: &HashMap<i32, Node>, props: &UserProperties, id: i32) -> bool {
     let mut current = Some(id);
-    for _ in 0..MAX_DEPTH {
+    for depth in 0..MAX_DEPTH {
         let Some(node) = current.and_then(|id| nodes.get(&id)) else {
             return true;
         };
-        if !node.common.visible.value {
+        if (depth == 0 || node.group) && !props.flag(&node.common.visible) {
             return false;
         }
         current = node.common.parent;
@@ -320,18 +359,19 @@ mod tests {
             ]
         }"#;
         let scene: wpe_assets::Scene = wpe_assets::parse_json(json).unwrap();
-        let built = Scene::build(&vfs(), &scene, |name| {
+        let built = Scene::build(&vfs(), &scene, &UserProperties::default(), |name| {
             (name == "bg").then_some(Vec2::new(64.0, 32.0))
         });
         assert_eq!(built.camera.scene_size, Vec2::new(1000.0, 500.0));
         assert_eq!(built.clear_color, Vec3::new(0.1, 0.2, 0.3));
-        assert_eq!(built.layers.len(), 2);
+        assert_eq!(built.layers.len(), 3);
+        assert!(!built.layers[1].visible);
 
         let bg = &built.layers[0];
         assert_eq!(bg.texture(0), Some("other"));
         assert_eq!(bg.transform.w_axis.truncate(), Vec3::new(600.0, 250.0, 0.0));
 
-        let auto = &built.layers[1];
+        let auto = &built.layers[2];
         assert_eq!(auto.size, Vec2::new(64.0, 32.0));
         assert_eq!(auto.transform.w_axis.truncate(), Vec3::new(42.0, -6.0, 0.0));
     }

@@ -90,7 +90,8 @@ pub fn scan_shaders(
         };
         let mut store = TextureStore::default();
         let vfs = &files.vfs;
-        let scene = Scene::build(vfs, &files.scene, |n| store.size(vfs, n));
+        let props = wpe_scene::UserProperties::from_project(&files.project);
+        let scene = Scene::build(vfs, &files.scene, &props, |n| store.size(vfs, n));
         for layer in &scene.layers {
             let label = format!("{id}/{}", layer.name);
             stats.compile(&files, &mut store, &layer.material, &label);
