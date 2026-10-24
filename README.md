@@ -17,6 +17,21 @@ Work in progress. Much of what Penguin Engine knows about Wallpaper Engine's for
 behaviour comes from
 [CaptSilver/wallpaper-scene-renderer](https://github.com/CaptSilver/wallpaper-scene-renderer).
 
+## Tech stack
+
+- **Rendering:** [wgpu](https://wgpu.rs); Wallpaper Engine's shaders are compiled to SPIR-V with
+  glslang and checked with naga.
+- **Desktop:** smithay-client-toolkit (Wayland layer-shell) and wayland-protocols-plasma (KDE's
+  window list and fake input).
+- **Video:** libmpv (libmpv2), with frames handed to the GPU through EGL.
+- **Web wallpapers:** [Servo](https://servo.org).
+- **SceneScript:** QuickJS (rquickjs).
+- **Audio:** rodio for playback; libpulse and realfft for the audio spectrum.
+- **Text layers:** cosmic-text.
+- **File formats:** binrw, lz4_flex and image.
+- **App UI:** [Preact](https://preactjs.com) and zustand, in a WebKitGTK webview.
+- **Scene viewer:** winit.
+
 ## Requirements
 
 Rendering needs the stock assets shipped with Wallpaper Engine (shaders, effects, materials).
