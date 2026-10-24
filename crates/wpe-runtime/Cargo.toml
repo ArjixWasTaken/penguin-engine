@@ -17,6 +17,7 @@ tracing = "0.1.44"
 wpe-assets = { version = "0.1.0", path = "../wpe-assets" }
 wpe-audio = { version = "0.1.0", path = "../wpe-audio" }
 wpe-mdl = { version = "0.1.0", path = "../wpe-mdl" }
+wpe-media = { version = "0.1.0", path = "../wpe-media" }
 wpe-particles = { version = "0.1.0", path = "../wpe-particles" }
 wpe-render = { version = "0.1.0", path = "../wpe-render" }
 wpe-scene = { version = "0.1.0", path = "../wpe-scene" }

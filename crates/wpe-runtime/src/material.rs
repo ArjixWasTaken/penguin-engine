@@ -69,6 +69,8 @@ pub enum SlotTexture {
     Asset(Arc<Texture>),
     /// A named render target (`_rt_*`), resolved by the renderer.
     RenderTarget(String),
+    /// An engine-provided texture (`$mediaThumbnail`), bound while running.
+    System(String),
 }
 
 /// A material pass ready to draw: compiled program, slot textures and
@@ -102,7 +104,7 @@ fn format_define(format: TexFormat) -> Option<&'static str> {
 fn slot_info(tex: Option<&SlotTexture>) -> TexSlot {
     match tex {
         None => TexSlot::default(),
-        Some(SlotTexture::RenderTarget(_)) => TexSlot {
+        Some(SlotTexture::RenderTarget(_) | SlotTexture::System(_)) => TexSlot {
             enabled: true,
             components: [false; 3],
         },
@@ -138,6 +140,17 @@ pub fn prepare(
                 .and_then(|n| resolve(vfs, store, n))
         })
         .collect();
+    for (slot, user) in pass.usertextures.iter().enumerate() {
+        if let Some(user) = user
+            .as_ref()
+            .filter(|u| u.kind.as_deref() == Some("system"))
+        {
+            if textures.len() <= slot {
+                textures.resize(slot + 1, None);
+            }
+            textures[slot] = Some(SlotTexture::System(user.name.clone()));
+        }
+    }
 
     let slots: Vec<TexSlot> = textures.iter().map(|t| slot_info(t.as_ref())).collect();
     let info = wpe_shader::annotations(vfs, &pass.shader, &slots)?;

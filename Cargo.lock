@@ -4504,6 +4504,7 @@ dependencies = [
  "wpe-assets",
  "wpe-audio",
  "wpe-mdl",
+ "wpe-media",
  "wpe-particles",
  "wpe-render",
  "wpe-scene",

@@ -28,6 +28,8 @@ pub struct Frame {
     pub layer_videos: HashMap<i32, Arc<VideoStream>>,
     /// Layers whose draws start switched off.
     pub hidden: Vec<i32>,
+    /// Engine texture slots to bind while running: step, slot and name.
+    pub system_slots: Vec<(usize, usize, String)>,
     pub bindings: Vec<Binding>,
     pub particles: Vec<ParticleInstance>,
     /// Draws of each on-screen layer, by layer id.
@@ -81,6 +83,8 @@ struct Resolved {
     uv_scale: Vec2,
     sprites: Vec<SpriteAnimation>,
     animated: Vec<(String, Vec<f32>, Animation)>,
+    /// Slots showing engine textures, by name (`$mediaThumbnail`).
+    system: Vec<(usize, String)>,
 }
 
 /// A simulated particle object and the draws its subsystems feed.
@@ -331,6 +335,7 @@ pub struct FrameBuilder<'a> {
     building: Option<i32>,
     /// Layers drawn but initially hidden.
     hidden: Vec<i32>,
+    system_slots: Vec<(usize, usize, String)>,
     bindings: Vec<Binding>,
     parallax: Option<(Parallax, Vec2)>,
     /// Draws using their compiled material, and all draws.
@@ -385,6 +390,7 @@ impl<'a> FrameBuilder<'a> {
             layer_videos: HashMap::new(),
             building: None,
             hidden: Vec::new(),
+            system_slots: Vec::new(),
             bindings: Vec::new(),
             parallax: None,
             particles: Vec::new(),
@@ -400,6 +406,7 @@ impl<'a> FrameBuilder<'a> {
             steps: self.steps,
             layer_videos: self.layer_videos,
             hidden: self.hidden,
+            system_slots: self.system_slots,
             bindings: self.bindings,
             particles: self.particles,
             layer_steps: self.layer_steps,
@@ -508,6 +515,7 @@ impl<'a> FrameBuilder<'a> {
             .ok()?;
         let program = self.program(&prepared.shader, &pass.shader)?;
         let mut reads_frame = false;
+        let mut system = Vec::new();
         let mut sprites = Vec::new();
         let mut textures = Vec::with_capacity(prepared.textures.len());
         for (slot, tex) in prepared.textures.iter().enumerate() {
@@ -518,6 +526,10 @@ impl<'a> FrameBuilder<'a> {
                         sprites.push(self.sprite(t, slot, &label));
                     }
                     Some(TexRef::Asset(self.upload(t, &label)))
+                }
+                Some(SlotTexture::System(name)) => {
+                    system.push((slot, name.clone()));
+                    Some(TexRef::Asset(self.cache.white.clone()))
                 }
                 Some(SlotTexture::RenderTarget(name)) => {
                     let link = link_id(name).and_then(|id| self.links.get(&id).copied());
@@ -555,6 +567,7 @@ impl<'a> FrameBuilder<'a> {
             uv_scale,
             sprites,
             animated: prepared.animated,
+            system,
         })
     }
 
@@ -625,6 +638,9 @@ impl<'a> FrameBuilder<'a> {
         let step = self.steps.len();
         if let Some(steps) = self.current_steps() {
             steps.all.push(step);
+        }
+        for (slot, name) in resolved.system {
+            self.system_slots.push((step, slot, name));
         }
         for (uniform, base, animation) in resolved.animated {
             self.bindings.push(Binding::Constant {

@@ -565,8 +565,16 @@
 			else sp[key] = v;
 		}
 	};
+	const MEDIA_COLORS = ['primaryColor', 'secondaryColor', 'tertiaryColor', 'textColor', 'highContrastColor'];
 	W.call = function (sid, name, arg) {
 		const e = W.scripts.get(sid);
+		if (name === 'mediaThumbnailChanged' && arg && typeof arg === 'object') {
+			arg = Object.assign({}, arg);
+			for (const k of MEDIA_COLORS) {
+				const c = arg[k];
+				if (c && typeof c === 'object' && !(c instanceof Vec3)) arg[k] = new Vec3(+c.x || 0, +c.y || 0, +c.z || 0);
+			}
+		}
 		return within(sid, () => e.ns[name](arg));
 	};
 	W.callValue = function (sid, name, value) {

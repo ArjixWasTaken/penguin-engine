@@ -203,6 +203,11 @@ impl Scripts {
         self.runtime.update(&mut self.host, time, dt, Some(cursor));
     }
 
+    /// Call `handler(arg)` on every script exporting it (media events, ...).
+    pub fn emit(&mut self, handler: &'static str, arg: &Value) {
+        self.runtime.emit(&mut self.host, handler, arg);
+    }
+
     /// Structural changes scripts made since the last call; the frame must be
     /// rebuilt from the edited scene and [`Self::rebind`] called.
     pub fn take_edits(&mut self) -> Vec<SceneEdit> {

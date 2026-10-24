@@ -3,6 +3,7 @@
 mod files;
 mod frame;
 pub mod material;
+mod media;
 mod script;
 mod sound;
 mod video;
@@ -79,6 +80,18 @@ fn render_text_layers(
             }
             Err(e) => tracing::warn!("text layer {:?}: {e}", layer.name),
         }
+    }
+}
+
+/// Bind `texture` to every slot of engine texture `name`.
+fn bind_system(
+    renderer: &mut SceneRenderer,
+    slots: &[(usize, usize, String)],
+    name: &str,
+    texture: &Arc<GpuTexture>,
+) {
+    for (step, slot, _) in slots.iter().filter(|(_, _, n)| n == name) {
+        renderer.set_texture(*step, *slot, texture.clone());
     }
 }
 
@@ -173,6 +186,9 @@ pub struct Wallpaper {
     pub time_override: Option<f32>,
     audio: Option<wpe_audio::AudioCapture>,
     sounds: sound::Sounds,
+    media: Option<media::Media>,
+    /// Engine texture slots of the current frame: step, slot and name.
+    system_slots: Vec<(usize, usize, String)>,
 }
 
 impl Wallpaper {
@@ -219,6 +235,8 @@ impl Wallpaper {
             time_override: None,
             audio: None,
             sounds: sound::Sounds::load(&files, &props),
+            media: None,
+            system_slots: Vec::new(),
             props,
             vfs: files.vfs,
         };
@@ -238,6 +256,9 @@ impl Wallpaper {
             &built.view(&objects, &sounds),
             wallpaper.camera.scene_size,
         );
+        if wallpaper.scripts.is_some() || !wallpaper.system_slots.is_empty() {
+            wallpaper.media = media::Media::start(gpu);
+        }
         wallpaper.sync_scripts(gpu);
         Ok(wallpaper)
     }
@@ -281,6 +302,16 @@ impl Wallpaper {
             for &step in frame.layer_steps.get(id).map_or(&[][..], |s| &s.all) {
                 self.renderer.set_visible(step, false);
             }
+        }
+        self.system_slots = frame.system_slots;
+        if let Some(media) = &mut self.media {
+            let (texture, _) = media.thumbnail(gpu);
+            bind_system(
+                &mut self.renderer,
+                &self.system_slots,
+                media::THUMBNAIL,
+                &texture,
+            );
         }
         self.camera = scene.camera;
         self.bindings = frame.bindings;
@@ -360,6 +391,23 @@ impl Wallpaper {
     }
 
     fn run_scripts(&mut self, gpu: &Gpu, time: f32) {
+        if let Some(media) = &mut self.media {
+            let events = media.poll();
+            if let Some(scripts) = &mut self.scripts {
+                for event in &events {
+                    scripts.emit(event.handler_name(), &event.to_json());
+                }
+            }
+            let (texture, changed) = media.thumbnail(gpu);
+            if changed {
+                bind_system(
+                    &mut self.renderer,
+                    &self.system_slots,
+                    media::THUMBNAIL,
+                    &texture,
+                );
+            }
+        }
         if let Some(scripts) = &mut self.scripts {
             scripts.update(time, self.pointer, self.spectrum);
         }

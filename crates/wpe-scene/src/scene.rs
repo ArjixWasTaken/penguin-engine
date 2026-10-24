@@ -212,6 +212,13 @@ pub fn apply_override(pass: &mut MaterialPass, over: &PassOverride) {
         }
         pass.textures[i] = Some(tex.clone());
     }
+    for (i, tex) in over.usertextures.iter().enumerate() {
+        let Some(tex) = tex else { continue };
+        if pass.usertextures.len() <= i {
+            pass.usertextures.resize(i + 1, None);
+        }
+        pass.usertextures[i] = Some(tex.clone());
+    }
     pass.combos
         .extend(over.combos.iter().map(|(k, v)| (k.clone(), *v)));
     pass.constantshadervalues.extend(
