@@ -57,6 +57,12 @@ impl OrthoCamera {
         }
     }
 
+    /// The mode `fill` amounts to on `output` (`Auto` resolved).
+    pub fn fill_for(&self, output: (u32, u32), fill: FillMode) -> FillMode {
+        let out_aspect = output.0.max(1) as f32 / output.1.max(1) as f32;
+        fill.resolve(self.scene_size.x / self.scene_size.y, out_aspect)
+    }
+
     pub fn view_proj(&self, output: (u32, u32), fill: FillMode) -> Mat4 {
         let half = self.extent(output, fill) / 2.0;
         let c = self.scene_size / 2.0;

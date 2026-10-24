@@ -238,6 +238,8 @@ pub struct Wallpaper {
     pointer: Vec2,
     /// Where the cursor actually is.
     pointer_target: Vec2,
+    /// The pointer camera parallax follows this frame.
+    parallax_pointer: Vec2,
     /// Wall-clock time of the last frame, for pointer smoothing.
     last_frame: Option<Instant>,
     parallax_delay: f32,
@@ -533,6 +535,7 @@ impl PreparedWallpaper {
             project: self.project,
             pointer: Vec2::splat(0.5),
             pointer_target: Vec2::splat(0.5),
+            parallax_pointer: Vec2::splat(0.5),
             last_frame: None,
             parallax_delay: 0.0,
             shake: None,
@@ -1213,7 +1216,7 @@ impl Wallpaper {
     fn animate(&mut self, time: f32) {
         let frame = frame::FrameState {
             time,
-            pointer: self.pointer,
+            parallax: self.parallax_pointer,
         };
         let mut clocks = self.clocks.borrow_mut();
         let mut bones = self.bones.borrow_mut();
@@ -1266,6 +1269,16 @@ impl Wallpaper {
         self.pointer_target = pointer;
     }
 
+    /// The pointer camera parallax follows: the centre while the whole
+    /// scene is shown (fitted), where parallax made to pan a cropped scene
+    /// would only push it off the output.
+    fn parallax_pointer(&self, size: (u32, u32)) -> Vec2 {
+        match self.camera.fill_for(size, self.fill) {
+            FillMode::Fit => Vec2::splat(0.5),
+            _ => self.pointer,
+        }
+    }
+
     /// Move the smoothed pointer towards the cursor (`cameraparallaxdelay`).
     fn smooth_pointer(&mut self) {
         let now = Instant::now();
@@ -1301,7 +1314,7 @@ impl Wallpaper {
 
     fn globals(&self, size: (u32, u32)) -> FrameGlobals {
         let now = chrono::Local::now().time();
-        let centred = Vec2::new(self.pointer.x - 0.5, 0.5 - self.pointer.y);
+        let centred = Vec2::new(self.parallax_pointer.x - 0.5, 0.5 - self.parallax_pointer.y);
         let time = self.time_override.unwrap_or_else(|| self.clock_time());
         let mut camera = self.camera;
         let script_camera = self.scripts.as_ref().and_then(|s| s.camera());
@@ -1361,6 +1374,7 @@ impl Wallpaper {
         self.upload_video_frames(gpu);
         self.smooth_pointer();
         self.advance_camera_path();
+        self.parallax_pointer = self.parallax_pointer(size);
         let globals = self.globals(size);
         self.animate(globals.time);
         self.light_fx.select(&mut self.renderer, &globals);
@@ -1380,6 +1394,9 @@ impl Wallpaper {
         self.update_web(gpu, size, Some(std::time::Duration::from_secs(10)));
         self.upload_video_frames(gpu);
         self.advance_camera_path();
+        // No wall clock to smooth over: the pointer is where it was put.
+        self.pointer = self.pointer_target;
+        self.parallax_pointer = self.parallax_pointer(size);
         let globals = self.globals(size);
         self.animate(globals.time);
         self.light_fx.select(&mut self.renderer, &globals);

@@ -414,8 +414,9 @@ impl LayerParallax {
 #[derive(Debug, Clone, Copy)]
 pub struct FrameState {
     pub time: f32,
-    /// Smoothed cursor position over the output, 0..1 with Y down.
-    pub pointer: Vec2,
+    /// The pointer camera parallax follows: the smoothed cursor over the
+    /// output, 0..1 with Y down (the centre while the scene is fitted).
+    pub parallax: Vec2,
 }
 
 impl Binding {
@@ -531,7 +532,7 @@ impl Binding {
                 };
                 if let Some(p) = parallax {
                     model =
-                        Mat4::from_translation(p.offset(motion.position(), frame.pointer)) * model;
+                        Mat4::from_translation(p.offset(motion.position(), frame.parallax)) * model;
                 }
                 renderer.set_model(*step, model);
             }
