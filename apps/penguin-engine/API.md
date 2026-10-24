@@ -26,7 +26,7 @@ Errors reject with a message string.
 | `conditions` | `{conditions: {name: expr}, values: {name: value}}` | `{name: bool}`: which properties show (`Property.condition`) with these values. |
 | `resolution` | `{id}` | `[width, height]` or null. Reads the wallpaper's files: ask for the selected item only. |
 | `resolutions` | | `{id: [width, height]}` for every wallpaper with a known size. The first call reads every wallpaper (a second or two). |
-| `folders` | | `Folder[]`: `{name, items: id[], folders: Folder[]}`. The first time, Wallpaper Engine's own folders are imported. |
+| `folders` | | `Folder[]`: `{name, items: id[], folders: Folder[]}`. Wallpaper Engine's own folders, read from its `config.json` each time; without Wallpaper Engine, the ones `save_folders` saved. |
 | `save_folders` | `{folders}` | |
 | `autostart` | | Whether the daemon's systemd units are enabled. |
 | `set_autostart` | `{enabled}` | Enables or disables them. |

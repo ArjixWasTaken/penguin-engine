@@ -247,21 +247,20 @@ pub async fn resolution(
         .map_err(|e| e.to_string())
 }
 
-/// The user's folders. The first time, Wallpaper Engine's own folders are
-/// imported (and saved).
+/// The user's folders: Wallpaper Engine's own, as its `config.json` has
+/// them now; without Wallpaper Engine, the ones saved here.
 #[tauri::command]
 pub fn folders() -> Result<Vec<Folder>, String> {
-    let path = folders::default_path().ok_or("no config directory")?;
-    if path.exists() {
-        return folders::load(&path).map_err(|e| e.to_string());
-    }
-    let imported = steam::we_dir()
+    let we_config = steam::we_dir()
         .map(|dir| dir.join("config.json"))
-        .filter(|c| c.is_file())
-        .and_then(|c| folders::import_we_folders(&c).ok())
-        .unwrap_or_default();
-    folders::save(&path, &imported).map_err(|e| e.to_string())?;
-    Ok(imported)
+        .filter(|c| c.is_file());
+    if let Some(config) = we_config {
+        return folders::import_we_folders(&config).map_err(|e| e.to_string());
+    }
+    match folders::default_path().filter(|p| p.exists()) {
+        Some(path) => folders::load(&path).map_err(|e| e.to_string()),
+        None => Ok(Vec::new()),
+    }
 }
 
 #[tauri::command]
