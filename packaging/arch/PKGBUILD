@@ -13,30 +13,29 @@ depends=(
   'cairo'
   'dbus'
   'fontconfig'
-  'freetype2'
-  'gcc-libs'
   'gdk-pixbuf2'
   'glib2'
   'glibc'
-  'glslang'
   'gst-plugins-bad-libs'
   'gst-plugins-base-libs'
   'gstreamer'
   'gtk3'
+  'libgcc'
   'libglvnd'
   'libpulse'
   'libsoup3'
-  'mesa'
+  'libstdc++'
   'mpv'
-  'shaderc'
   'vulkan-icd-loader'
   'wayland'
   'webkit2gtk-4.1'
+  'zlib'
 )
 makedepends=('cargo' 'clang' 'git' 'nodejs' 'pnpm' 'python')
 optdepends=(
   'steam: Wallpaper Engine, whose assets and workshop wallpapers are played'
   'vulkan-driver: GPU rendering'
+  'mesa: video and web frames handed to the GPU without a copy (EGL)'
 )
 provides=("$_pkgname")
 conflicts=("$_pkgname")
