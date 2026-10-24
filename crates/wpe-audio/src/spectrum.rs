@@ -39,6 +39,26 @@ impl Default for AudioSpectrum {
 }
 
 impl AudioSpectrum {
+    /// A moving test pattern, for exercising audio-reactive wallpapers
+    /// without sound.
+    pub fn synthetic(time: f32) -> Self {
+        let band = |i: usize, n: usize, phase: f32| {
+            let x = i as f32 / n as f32;
+            (0.5 + 0.5 * (time * 3.0 + x * 12.0 + phase).sin()) * (1.0 - 0.6 * x)
+        };
+        let mut s = Self::default();
+        for i in 0..64 {
+            (s.left64[i], s.right64[i]) = (band(i, 64, 0.0), band(i, 64, 1.0));
+        }
+        for i in 0..32 {
+            (s.left32[i], s.right32[i]) = (band(i, 32, 0.0), band(i, 32, 1.0));
+        }
+        for i in 0..16 {
+            (s.left16[i], s.right16[i]) = (band(i, 16, 0.0), band(i, 16, 1.0));
+        }
+        s
+    }
+
     /// `(uniform name, values)` for every spectrum uniform.
     pub fn uniforms(&self) -> [(&'static str, &[f32]); 6] {
         [

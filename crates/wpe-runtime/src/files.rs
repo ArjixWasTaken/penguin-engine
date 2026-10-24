@@ -22,6 +22,8 @@ pub struct WallpaperFiles {
     pub project: Project,
     pub scene_file: String,
     pub scene: wpe_assets::Scene,
+    /// The scene document as JSON, which scripts edit (`createLayer`, ...).
+    pub scene_json: serde_json::Value,
 }
 
 impl WallpaperFiles {
@@ -69,11 +71,13 @@ impl WallpaperFiles {
         };
         let scene_file = scene_file.unwrap_or_else(|| resolve_scene_file(&project, &vfs));
         let scene = load_json(&vfs, &scene_file)?;
+        let scene_json = load_json(&vfs, &scene_file)?;
         Ok(Self {
             vfs,
             project,
             scene_file,
             scene,
+            scene_json,
         })
     }
 

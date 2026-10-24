@@ -31,6 +31,10 @@ struct Args {
     /// Scene time in seconds for --screenshot.
     #[arg(long, default_value_t = 0.0)]
     time: f32,
+    /// With --screenshot, run this many frames at 30 fps from --time first,
+    /// clicking across the scene now and then (exercises scripts).
+    #[arg(long, default_value_t = 1)]
+    frames: u32,
     /// Play sound layers and react to system audio (window mode).
     #[arg(long)]
     audio: bool,
@@ -117,7 +121,22 @@ fn screenshot(args: &Args, assets: &std::path::Path, out: &std::path::Path) -> R
         &args.wallpaper,
     )?;
     wallpaper.fill = args.fill.into();
-    wallpaper.time_override = Some(args.time);
+    for frame in 1..args.frames {
+        wallpaper.time_override = Some(args.time + frame as f32 / 30.0);
+        // Every half second, press and release somewhere on a 4x4 grid.
+        let click = frame / 15;
+        match frame % 15 {
+            7 => {
+                let cell = glam::Vec2::new((click % 4) as f32, (click / 4 % 4) as f32);
+                wallpaper.set_pointer((cell + 0.5) / 4.0);
+                wallpaper.mouse_button(true);
+            }
+            8 => wallpaper.mouse_button(false),
+            _ => {}
+        }
+        wallpaper.capture(&gpu, (64, 64));
+    }
+    wallpaper.time_override = Some(args.time + args.frames.saturating_sub(1) as f32 / 30.0);
     let pixels = wallpaper.capture(&gpu, args.size);
     image::RgbaImage::from_raw(args.size.0, args.size.1, pixels)
         .context("capture size mismatch")?

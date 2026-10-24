@@ -1,231 +1,48 @@
 //! SceneScript: the scene state scripts read and write, and applying their
 //! writes to the renderer.
 
+mod audit;
+mod edit;
+mod host;
+
 use std::collections::HashMap;
 use std::sync::Arc;
 
 use glam::{Vec2, Vec3};
-use wpe_assets::scene::{SceneObject, TextObject};
+use serde_json::Value;
+use wpe_assets::scene::SceneObject;
 use wpe_assets::value::Dynamic;
 use wpe_render::{CardMesh, Gpu, GpuTexture, SceneRenderer};
 use wpe_scene::{ImageLayer, Motion};
-use wpe_script::{
-    CursorEvent, CursorEventKind, CursorState, LayerInfo, LayerKind, LogLevel, SceneHost,
-    ScriptRuntime, ScriptValue,
-};
+use wpe_script::{CursorEvent, CursorEventKind, CursorState, ScriptRuntime, ScriptValue};
 use wpe_vfs::Vfs;
 
+pub use edit::{SceneEdit, apply as apply_edits, resolve_paths};
+use host::{LayerState, ScriptHost, vec3};
+
 use crate::frame::LayerSteps;
+use crate::sound::{SoundCommand, SoundState};
 use crate::video::VideoStream;
 
-/// What scripts can see and change of one scene object.
-struct LayerState {
-    info: LayerInfo,
-    steps: LayerSteps,
-    motion: Motion,
-    size: Vec2,
-    visible: bool,
-    origin: Vec3,
-    scale: Vec3,
-    angles: Vec3,
-    alpha: f32,
-    color: Vec3,
-    text: Option<String>,
-    text_object: Option<Box<TextObject>>,
-    /// No ancestor group is hidden, so the layer shows when `visible`.
-    ancestors_visible: bool,
-    dirty_visible: bool,
-    dirty_transform: bool,
-    dirty_color: bool,
-    dirty_text: bool,
+/// A built frame as scripts see it: the scene document and the layers,
+/// draws and videos built from it.
+pub struct SceneView<'a> {
+    pub doc: &'a wpe_assets::Scene,
+    /// The document's objects as JSON, for their configurations.
+    pub objects: &'a [Value],
+    pub layers: &'a [ImageLayer],
+    pub steps: &'a HashMap<i32, LayerSteps>,
+    pub videos: &'a HashMap<i32, Arc<VideoStream>>,
+    pub sounds: &'a HashMap<i32, SoundState>,
 }
 
-/// The [`SceneHost`] scripts run against.
-pub struct ScriptHost {
-    layers: Vec<LayerState>,
-    by_id: HashMap<i32, usize>,
-    canvas: [f32; 2],
-    spectrum: Option<wpe_audio::AudioSpectrum>,
-    /// Each layer's video, for `getVideoTexture()`.
-    videos: HashMap<i32, Arc<VideoStream>>,
-}
-
-/// A `getVideoTexture()` member; `None` lets the script see its default.
-fn video_call(video: &VideoStream, method: &str, args: &[ScriptValue]) -> Option<ScriptValue> {
-    let arg = || args.first().and_then(ScriptValue::as_f64);
-    Some(match method {
-        "exists" => ScriptValue::Bool(true),
-        "play" => {
-            video.set_paused(false);
-            return None;
-        }
-        "pause" => {
-            video.set_paused(true);
-            return None;
-        }
-        "stop" => {
-            video.stop();
-            return None;
-        }
-        "setCurrentTime" => {
-            video.seek(arg()?);
-            return None;
-        }
-        "setRate" => {
-            video.set_rate(arg()?);
-            return None;
-        }
-        "setLoop" => {
-            video.set_looping(args.first()?.as_bool()?);
-            return None;
-        }
-        "isPlaying" => ScriptValue::Bool(video.is_playing()),
-        "getCurrentTime" => ScriptValue::Number(video.position()),
-        "duration" => ScriptValue::Number(video.duration()),
-        "rate" => ScriptValue::Number(video.rate()),
-        "loop" => ScriptValue::Bool(video.looping()),
-        _ => return None,
-    })
-}
-
-fn vec3(v: Vec3) -> ScriptValue {
-    ScriptValue::Vec3([v.x as f64, v.y as f64, v.z as f64])
-}
-
-fn to_vec3(v: &ScriptValue) -> Option<Vec3> {
-    let c = v.components()?;
-    match c.len() {
-        0 => None,
-        1 => Some(Vec3::splat(c[0] as f32)),
-        2 => Some(Vec3::new(c[0] as f32, c[1] as f32, 0.0)),
-        _ => Some(Vec3::new(c[0] as f32, c[1] as f32, c[2] as f32)),
-    }
-}
-
-fn kind(obj: &SceneObject) -> LayerKind {
-    match obj {
-        SceneObject::Image(_) => LayerKind::Image,
-        SceneObject::Text(_) => LayerKind::Text,
-        SceneObject::Particle(_) => LayerKind::Particle,
-        SceneObject::Sound(_) => LayerKind::Sound,
-        SceneObject::Light(_) => LayerKind::Light,
-        SceneObject::Model(_) => LayerKind::Model,
-        SceneObject::Group(_) => LayerKind::Group,
-        SceneObject::Unknown(_) => LayerKind::Other,
-    }
-}
-
-impl SceneHost for ScriptHost {
-    fn layers(&self) -> Vec<LayerInfo> {
-        self.layers.iter().map(|l| l.info.clone()).collect()
-    }
-
-    fn get(&self, layer: i32, property: &str) -> Option<ScriptValue> {
-        let l = &self.layers[*self.by_id.get(&layer)?];
-        Some(match property {
-            "visible" => ScriptValue::Bool(l.visible),
-            "origin" => vec3(l.origin),
-            "scale" => vec3(l.scale),
-            "angles" => vec3(l.angles),
-            "alpha" | "opacity" => ScriptValue::Number(l.alpha as f64),
-            "color" => vec3(l.color),
-            "size" => ScriptValue::Vec2([l.size.x as f64, l.size.y as f64]),
-            "name" => ScriptValue::String(l.info.name.clone()),
-            "text" => ScriptValue::String(l.text.clone()?),
-            _ => return None,
-        })
-    }
-
-    fn set(&mut self, layer: i32, property: &str, value: ScriptValue) {
-        let Some(&index) = self.by_id.get(&layer) else {
-            return;
-        };
-        let l = &mut self.layers[index];
-        match property {
-            "visible" => {
-                if let Some(v) = value.as_bool() {
-                    l.dirty_visible |= v != l.visible;
-                    l.visible = v;
-                }
-            }
-            "origin" | "scale" | "angles" => {
-                let Some(v) = to_vec3(&value) else { return };
-                let slot = match property {
-                    "origin" => &mut l.origin,
-                    "scale" => &mut l.scale,
-                    _ => &mut l.angles,
-                };
-                l.dirty_transform |= *slot != v;
-                *slot = v;
-            }
-            "alpha" | "opacity" => {
-                if let Some(v) = value.as_f64() {
-                    l.dirty_color |= v as f32 != l.alpha;
-                    l.alpha = v as f32;
-                }
-            }
-            "color" => {
-                if let Some(v) = to_vec3(&value) {
-                    l.dirty_color |= v != l.color;
-                    l.color = v;
-                }
-            }
-            "text" => {
-                let text = match &value {
-                    ScriptValue::String(s) => s.clone(),
-                    ScriptValue::Number(n) => n.to_string(),
-                    _ => return,
-                };
-                if l.text.as_deref() != Some(text.as_str()) {
-                    l.text = Some(text);
-                    l.dirty_text = true;
-                }
-            }
-            _ => {}
-        }
-    }
-
-    fn invoke(
-        &mut self,
-        layer: i32,
-        target: &str,
-        method: &str,
-        args: &[ScriptValue],
-    ) -> Option<ScriptValue> {
-        match target {
-            "video" => {
-                tracing::trace!("layer {layer} video.{method}({args:?})");
-                video_call(self.videos.get(&layer)?, method, args)
-            }
-            _ => None,
-        }
-    }
-
-    fn canvas_size(&self) -> [f32; 2] {
-        self.canvas
-    }
-
-    fn audio_spectrum(&self, left: &mut [f32], right: &mut [f32]) {
-        let Some(s) = &self.spectrum else { return };
-        let (l, r): (&[f32], &[f32]) = match left.len() {
-            16 => (&s.left16, &s.right16),
-            32 => (&s.left32, &s.right32),
-            _ => (&s.left64, &s.right64),
-        };
-        for (dst, src) in left.iter_mut().zip(l) {
-            *dst = *src;
-        }
-        for (dst, src) in right.iter_mut().zip(r) {
-            *dst = *src;
-        }
-    }
-
-    fn log(&mut self, level: LogLevel, message: &str) {
-        match level {
-            LogLevel::Error => tracing::warn!("script: {message}"),
-            LogLevel::Warn => tracing::info!("script: {message}"),
-            LogLevel::Info => tracing::debug!("script: {message}"),
-        }
+impl SceneView<'_> {
+    fn config(&self, id: i32) -> Value {
+        self.objects
+            .iter()
+            .find(|o| o.get("id").and_then(Value::as_i64) == Some(id as i64))
+            .cloned()
+            .unwrap_or(Value::Null)
     }
 }
 
@@ -233,8 +50,7 @@ impl SceneHost for ScriptHost {
 pub struct Scripts {
     runtime: ScriptRuntime,
     host: ScriptHost,
-    text: Option<wpe_text::TextRenderer>,
-    user: serde_json::Map<String, serde_json::Value>,
+    user: serde_json::Map<String, Value>,
     last_time: f64,
     pressed: bool,
 }
@@ -243,7 +59,7 @@ pub struct Scripts {
 type Scripted<'a> = (
     &'static str,
     Option<&'a str>,
-    Option<&'a serde_json::Value>,
+    Option<&'a Value>,
     ScriptValue,
 );
 
@@ -295,19 +111,15 @@ fn scripted(obj: &SceneObject) -> Vec<Scripted<'_>> {
 }
 
 impl Scripts {
-    /// Load every script of `scene`, or `None` when it has none.
-    #[allow(clippy::too_many_arguments)]
+    /// Load every script of the scene, or `None` when it has none. Scripts'
+    /// `init` runs here and may already queue [`Self::take_edits`].
     pub fn load(
         assets: &Vfs,
         project: &wpe_assets::Project,
-        scene: &wpe_assets::Scene,
-        layers: &[ImageLayer],
-        steps: &HashMap<i32, LayerSteps>,
-        videos: HashMap<i32, Arc<VideoStream>>,
+        view: &SceneView,
         canvas: Vec2,
-        text: Option<wpe_text::TextRenderer>,
     ) -> Option<Self> {
-        let scripts: Vec<_> = scene.objects.iter().map(scripted).collect();
+        let scripts: Vec<_> = view.doc.objects.iter().map(scripted).collect();
         if scripts.iter().all(Vec::is_empty) {
             return None;
         }
@@ -320,58 +132,27 @@ impl Scripts {
         })
         .inspect_err(|e| tracing::warn!("scripts disabled: {e}"))
         .ok()?;
-        let user: serde_json::Map<String, serde_json::Value> = project
+        let user: serde_json::Map<String, Value> = project
             .general
             .properties
             .iter()
             .map(|(k, p)| (k.clone(), p.value.clone()))
             .collect();
-        runtime.set_user_properties(&serde_json::Value::Object(user.clone()));
+        runtime.set_user_properties(&Value::Object(user.clone()));
 
-        let by_layer: HashMap<i32, &ImageLayer> = layers.iter().map(|l| (l.id, l)).collect();
-        let mut host = ScriptHost {
-            layers: Vec::new(),
-            by_id: HashMap::new(),
-            canvas: canvas.to_array(),
-            spectrum: None,
-            videos,
-        };
-        for obj in &scene.objects {
+        let by_layer: HashMap<i32, &ImageLayer> = view.layers.iter().map(|l| (l.id, l)).collect();
+        let mut host = ScriptHost::new(canvas, view.videos.clone());
+        host.sounds = view.sounds.clone();
+        for obj in &view.doc.objects {
             let Some(c) = obj.common() else { continue };
-            let layer = by_layer.get(&c.id);
-            let motion = layer.map(|l| l.motion.clone()).unwrap_or_default();
-            host.by_id.insert(c.id, host.layers.len());
-            host.layers.push(LayerState {
-                info: LayerInfo {
-                    id: c.id,
-                    name: c.name.clone(),
-                    kind: kind(obj),
-                    parent: c.parent,
-                    effects: obj.effects().iter().map(|e| e.name.clone()).collect(),
-                },
-                steps: steps.get(&c.id).cloned().unwrap_or_default(),
-                size: layer.map_or(Vec2::ONE, |l| l.size),
-                visible: layer.map_or(c.visible.value, |l| l.self_visible),
-                ancestors_visible: layer.is_none_or(|l| l.ancestors_visible),
-                origin: motion.origin,
-                scale: motion.scale,
-                angles: motion.angles,
-                alpha: layer.map_or(1.0, |l| l.alpha),
-                color: layer.map_or(Vec3::ONE, |l| l.color),
-                text: match obj {
-                    SceneObject::Text(t) => Some(t.text.value.clone()),
-                    _ => None,
-                },
-                text_object: layer.and_then(|l| l.text.clone()),
-                motion,
-                dirty_visible: false,
-                dirty_transform: false,
-                dirty_color: false,
-                dirty_text: false,
-            });
+            let steps = view.steps.get(&c.id).cloned().unwrap_or_default();
+            let layer = by_layer.get(&c.id).copied();
+            if let Some(state) = LayerState::new(obj, view.config(c.id), layer, steps) {
+                host.push(state);
+            }
         }
 
-        for (obj, entries) in scene.objects.iter().zip(scripts) {
+        for (obj, entries) in view.doc.objects.iter().zip(scripts) {
             let Some(c) = obj.common() else { continue };
             for (property, source, props, initial) in entries {
                 let Some(source) = source else { continue };
@@ -385,7 +166,6 @@ impl Scripts {
         Some(Self {
             runtime,
             host,
-            text,
             user,
             last_time: 0.0,
             pressed: false,
@@ -401,16 +181,9 @@ impl Scripts {
         }
     }
 
-    /// Run the scripts' frame and push what they changed to the renderer.
-    pub fn update(
-        &mut self,
-        gpu: &Gpu,
-        vfs: &Vfs,
-        renderer: &mut SceneRenderer,
-        time: f32,
-        pointer: Vec2,
-        spectrum: Option<wpe_audio::AudioSpectrum>,
-    ) {
+    /// Run the scripts' frame. Follow with [`Self::take_edits`] and
+    /// [`Self::apply`].
+    pub fn update(&mut self, time: f32, pointer: Vec2, spectrum: Option<wpe_audio::AudioSpectrum>) {
         let time = time as f64;
         let dt = (time - self.last_time).clamp(0.0, 0.25);
         self.last_time = time;
@@ -428,7 +201,28 @@ impl Scripts {
         }
         let cursor = self.cursor_state(pointer);
         self.runtime.update(&mut self.host, time, dt, Some(cursor));
-        self.apply(gpu, vfs, renderer);
+    }
+
+    /// Structural changes scripts made since the last call; the frame must be
+    /// rebuilt from the edited scene and [`Self::rebind`] called.
+    pub fn take_edits(&mut self) -> Vec<SceneEdit> {
+        std::mem::take(&mut self.host.edits)
+    }
+
+    /// What scripts did to sound layers since the last call.
+    pub fn take_sound_commands(&mut self) -> Vec<(i32, SoundCommand)> {
+        std::mem::take(&mut self.host.sound_commands)
+    }
+
+    /// Attach to a rebuilt frame, keeping what scripts have set.
+    pub fn rebind(&mut self, view: &SceneView) {
+        let by_layer: HashMap<i32, &ImageLayer> = view.layers.iter().map(|l| (l.id, l)).collect();
+        for l in &mut self.host.layers {
+            let id = l.info.id;
+            let steps = view.steps.get(&id).cloned().unwrap_or_default();
+            l.rebind(by_layer.get(&id).copied(), steps);
+        }
+        self.host.videos = view.videos.clone();
     }
 
     /// Deliver a mouse button press or release at `pointer`.
@@ -455,7 +249,7 @@ impl Scripts {
     }
 
     fn hit(&self, id: i32, world: Vec2) -> bool {
-        let Some(l) = self.host.by_id.get(&id).map(|&i| &self.host.layers[i]) else {
+        let Some(l) = self.host.layer(id) else {
             return false;
         };
         if !l.visible {
@@ -468,18 +262,25 @@ impl Scripts {
         local.x.abs() <= l.size.x / 2.0 && local.y.abs() <= l.size.y / 2.0
     }
 
-    fn apply(&mut self, gpu: &Gpu, vfs: &Vfs, renderer: &mut SceneRenderer) {
+    /// Push what scripts changed to the renderer.
+    pub fn apply(
+        &mut self,
+        gpu: &Gpu,
+        vfs: &Vfs,
+        renderer: &mut SceneRenderer,
+        mut text: Option<&mut wpe_text::TextRenderer>,
+    ) {
         let user = |name: &str| self.user.get(name).cloned();
         for l in &mut self.host.layers {
             if l.dirty_text
-                && let (Some(text), Some(obj), Some(renderer_text)) = (
+                && let (Some(string), Some(obj), Some(text)) = (
                     l.text.as_deref(),
                     l.text_object.as_deref(),
-                    self.text.as_mut(),
+                    text.as_deref_mut(),
                 )
             {
                 let style = wpe_text::TextStyle::from_object(obj, user);
-                match renderer_text.render(vfs, &style, text) {
+                match text.render(vfs, &style, string) {
                     Ok(image) => {
                         let texture =
                             Arc::new(upload_rgba(gpu, image.width, image.height, image.pixels));

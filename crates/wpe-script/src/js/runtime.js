@@ -148,6 +148,9 @@
 		get worldScale() { return this._read('worldScale') || this.scale; }
 		isObjectValid() { return this.__id >= 0 && infoById(this.__id) !== null; }
 		getInitialLayerConfig() {
+			// The object's scene configuration, as createLayer accepts it.
+			const config = hostGet(this.__id, '__config');
+			if (config && typeof config === 'object') return config;
 			this._captureInitial();
 			const i = this.__initial;
 			return { name: this.name, origin: i.origin.copy(), scale: i.scale.copy(), angles: i.angles.copy(),
@@ -374,6 +377,9 @@
 			if (typeof config === 'string') desc = config;
 			else if (config && config.__asset !== undefined) desc = config.__asset;
 			else desc = JSON.parse(stringify(config || {}));
+			// Workshop assets name their files relative to their own folder.
+			const workshop = W.workshopId();
+			if (typeof desc === 'string' && workshop) desc = { __path: desc, __workshop: workshop };
 			const id = N.create(stringify(desc));
 			W.invalidateLayers();
 			if (typeof id !== 'number' || id < 0) return nullLayer(config);
@@ -512,7 +518,21 @@
 	};
 
 	// --------------------------------------------------------------- scripts
+	// The script being run, for what depends on the caller (its workshop id).
+	W.current = null;
+	function within(sid, f) {
+		const previous = W.current;
+		W.current = sid;
+		try { return f(); } finally { W.current = previous; }
+	}
+	/** The calling script's `__workshopId` export, if any. */
+	W.workshopId = function () {
+		const e = W.current === null ? null : W.scripts.get(W.current);
+		const id = e && e.ns ? e.ns.__workshopId : undefined;
+		return id === undefined || id === null || id === '' ? null : String(id);
+	};
 	W.register = function (sid, layerId, property, kind) {
+		W.current = sid;
 		const layer = layerId === null ? null : proxy(layerId);
 		let obj = layer;
 		const m = /^effects\/(\d+)\//.exec(property);
@@ -547,11 +567,11 @@
 	};
 	W.call = function (sid, name, arg) {
 		const e = W.scripts.get(sid);
-		return e.ns[name](arg);
+		return within(sid, () => e.ns[name](arg));
 	};
 	W.callValue = function (sid, name, value) {
 		const e = W.scripts.get(sid);
-		const r = e.ns[name](value);
+		const r = within(sid, () => e.ns[name](value));
 		if (r === undefined || r === null) return undefined;
 		if (e.kind === 's') {
 			if (typeof r === 'number' && !Number.isFinite(r)) return undefined;
@@ -564,7 +584,7 @@
 		const world = new Vec3(wx, wy, 0);
 		const origin = e.layer ? e.layer.origin : new Vec3(0, 0, 0);
 		const ev = { worldPosition: world, screenPosition: new Vec2(sx, sy), localPosition: world.subtract(origin), button: 0, x: wx, y: wy };
-		return e.ns[name](ev);
+		return within(sid, () => e.ns[name](ev));
 	};
 	W.videoEnded = function (layerId) {
 		const p = W.proxies.get(layerId);

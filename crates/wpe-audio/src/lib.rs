@@ -6,5 +6,5 @@ mod player;
 mod spectrum;
 
 pub use capture::{AudioCapture, CaptureError};
-pub use player::{Playback, PlaybackError, SoundOutput};
+pub use player::{Playback, PlaybackError, SoundOutput, TrackId};
 pub use spectrum::{Analyzer, AudioSpectrum, FFT_SIZE};

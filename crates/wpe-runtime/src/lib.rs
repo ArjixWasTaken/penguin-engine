@@ -4,6 +4,7 @@ mod files;
 mod frame;
 pub mod material;
 mod script;
+mod sound;
 mod video;
 
 use std::path::Path;
@@ -16,7 +17,7 @@ use wpe_assets::tex::{Mip, TexFormat, TexImage, Texture};
 use wpe_render::{FrameGlobals, Gpu, GpuTexture, SceneRenderer, wgpu};
 use wpe_scene::{OrthoCamera, Scene};
 
-use frame::FrameBuilder;
+use frame::{FrameBuilder, FrameCache};
 
 pub use files::{LoadError, WallpaperFiles};
 pub use material::{SlotTexture, TextureStore};
@@ -53,11 +54,12 @@ fn render_text_layers(
     props: &wpe_scene::UserProperties,
     scene: &mut Scene,
     store: &mut TextureStore,
-) -> Option<wpe_text::TextRenderer> {
+    text: &mut Option<wpe_text::TextRenderer>,
+) {
     if !scene.layers.iter().any(|l| l.text.is_some()) {
-        return None;
+        return;
     }
-    let mut renderer = wpe_text::TextRenderer::new();
+    let renderer = text.get_or_insert_with(wpe_text::TextRenderer::new);
     let user = |name: &str| props.get(name).cloned();
     for layer in &mut scene.layers {
         let Some(obj) = layer.text.as_deref() else {
@@ -78,7 +80,39 @@ fn render_text_layers(
             Err(e) => tracing::warn!("text layer {:?}: {e}", layer.name),
         }
     }
-    Some(renderer)
+}
+
+/// The objects of scene JSON `doc`.
+fn objects(doc: &serde_json::Value) -> Vec<serde_json::Value> {
+    doc.get("objects")
+        .and_then(serde_json::Value::as_array)
+        .cloned()
+        .unwrap_or_default()
+}
+
+/// What a frame build produced that scripts attach to.
+struct Built {
+    doc: wpe_assets::Scene,
+    layers: Vec<wpe_scene::ImageLayer>,
+    steps: std::collections::HashMap<i32, frame::LayerSteps>,
+    videos: std::collections::HashMap<i32, Arc<video::VideoStream>>,
+}
+
+impl Built {
+    fn view<'a>(
+        &'a self,
+        objects: &'a [serde_json::Value],
+        sounds: &'a std::collections::HashMap<i32, sound::SoundState>,
+    ) -> script::SceneView<'a> {
+        script::SceneView {
+            doc: &self.doc,
+            objects,
+            layers: &self.layers,
+            steps: &self.steps,
+            videos: &self.videos,
+            sounds,
+        }
+    }
 }
 
 fn white_texture() -> Texture {
@@ -111,7 +145,12 @@ pub struct Wallpaper {
     pub fill: FillMode,
     camera: OrthoCamera,
     renderer: SceneRenderer,
-    videos: Vec<(Arc<GpuTexture>, Arc<video::VideoStream>)>,
+    /// The scene document, as scripts have edited it.
+    scene_json: serde_json::Value,
+    props: wpe_scene::UserProperties,
+    /// Taken while a frame builds.
+    cache: Option<FrameCache>,
+    text: Option<wpe_text::TextRenderer>,
     bindings: Vec<frame::Binding>,
     particles: Vec<frame::ParticleInstance>,
     scripts: Option<script::Scripts>,
@@ -133,51 +172,7 @@ pub struct Wallpaper {
     /// Fixed scene time in seconds instead of the wall clock.
     pub time_override: Option<f32>,
     audio: Option<wpe_audio::AudioCapture>,
-    sounds: Option<wpe_audio::SoundOutput>,
-    /// Encoded files and settings of each sound layer, played on demand.
-    sound_layers: Vec<SoundLayer>,
-}
-
-struct SoundLayer {
-    files: Vec<Vec<u8>>,
-    volume: f32,
-    mode: wpe_audio::Playback,
-}
-
-fn sound_layers(files: &WallpaperFiles, props: &wpe_scene::UserProperties) -> Vec<SoundLayer> {
-    files
-        .scene
-        .objects
-        .iter()
-        .filter_map(|obj| match obj {
-            wpe_assets::scene::SceneObject::Sound(s) => Some(s),
-            _ => None,
-        })
-        .filter(|s| !s.startsilent && props.flag(&s.common.visible))
-        .filter_map(|s| {
-            let data: Vec<Vec<u8>> = s
-                .sound
-                .iter()
-                .filter_map(|path| {
-                    files
-                        .vfs
-                        .read(path)
-                        .inspect_err(|e| tracing::warn!("sound {path}: {e}"))
-                        .ok()
-                        .map(|b| b.into_owned())
-                })
-                .collect();
-            let mode = match s.playbackmode.as_deref() {
-                Some("single") => wpe_audio::Playback::Single,
-                _ => wpe_audio::Playback::Loop,
-            };
-            (!data.is_empty()).then_some(SoundLayer {
-                files: data,
-                volume: props.value(&s.volume),
-                mode,
-            })
-        })
-        .collect()
+    sounds: sound::Sounds,
 }
 
 impl Wallpaper {
@@ -190,89 +185,155 @@ impl Wallpaper {
         path: &Path,
     ) -> Result<Self, LoadError> {
         let files = WallpaperFiles::open_with_assets_dir(assets, path)?;
-        let vfs = &files.vfs;
-        let mut store = TextureStore::default();
         let props = wpe_scene::UserProperties::from_project(&files.project);
-        let mut scene = Scene::build(vfs, &files.scene, &props, |name| store.size(vfs, name));
-        let text_renderer = render_text_layers(vfs, &props, &mut scene, &mut store);
-        tracing::info!(
-            "scene {}: {}x{}, {} image layers",
-            files.scene_file,
-            scene.camera.scene_size.x,
-            scene.camera.scene_size.y,
-            scene.layers.len()
-        );
-
-        let mut builder = FrameBuilder::new(gpu, vfs, store, white_texture());
-        builder.set_parallax(scene.parallax, scene.camera.scene_size);
-        builder.layers(&scene.layers);
-        if let Some(bloom) = scene.bloom {
-            builder.bloom(bloom);
-        }
-        let (real, total) = builder.stats;
-        tracing::info!("{real} of {total} draws use their real shader");
-        let frame = builder.finish();
-
-        let mut renderer = SceneRenderer::new(gpu, output_format);
-        let c = scene.clear_color;
-        renderer.clear_color = wgpu::Color {
-            r: c.x as f64,
-            g: c.y as f64,
-            b: c.z as f64,
-            a: 1.0,
-        };
-        renderer.set_frame(gpu, frame.targets, frame.steps);
-        for id in &frame.hidden {
-            for &step in frame.layer_steps.get(id).map_or(&[][..], |s| &s.all) {
-                renderer.set_visible(step, false);
-            }
-        }
-        let scripts = script::Scripts::load(
-            vfs,
-            &files.project,
-            &files.scene,
-            &scene.layers,
-            &frame.layer_steps,
-            frame.layer_videos,
-            scene.camera.scene_size,
-            text_renderer,
-        );
-
-        Ok(Self {
+        let mut wallpaper = Self {
             title: files
                 .project
                 .title
                 .clone()
                 .unwrap_or(files.scene_file.clone()),
             fill: FillMode::default(),
-            camera: scene.camera,
-            renderer,
-            videos: frame.videos,
-            bindings: frame.bindings,
-            particles: frame.particles,
-            scripts,
+            camera: OrthoCamera {
+                scene_size: Vec2::ONE,
+                zoom: 1.0,
+            },
+            renderer: SceneRenderer::new(gpu, output_format),
+            scene_json: files.scene_json.clone(),
+            cache: Some(FrameCache::new(
+                gpu,
+                TextureStore::default(),
+                white_texture(),
+            )),
+            text: None,
+            bindings: Vec::new(),
+            particles: Vec::new(),
+            scripts: None,
             spectrum: None,
             start: Instant::now(),
             pointer: Vec2::splat(0.5),
             pointer_target: Vec2::splat(0.5),
             last_frame: None,
-            parallax_delay: scene.parallax.map_or(0.0, |p| p.delay),
-            shake: scene.shake,
+            parallax_delay: 0.0,
+            shake: None,
             parallax_influence: files.scene.general.cameraparallaxmouseinfluence.value,
             time_override: None,
             audio: None,
-            sounds: None,
-            sound_layers: sound_layers(&files, &props),
+            sounds: sound::Sounds::load(&files, &props),
+            props,
             vfs: files.vfs,
-        })
+        };
+        let built = wallpaper.build_frame(gpu, files.scene);
+        tracing::info!(
+            "scene {}: {}x{}, {} image layers",
+            files.scene_file,
+            wallpaper.camera.scene_size.x,
+            wallpaper.camera.scene_size.y,
+            built.layers.len()
+        );
+        let objects = objects(&wallpaper.scene_json);
+        let sounds = wallpaper.sounds.states();
+        wallpaper.scripts = script::Scripts::load(
+            &wallpaper.vfs,
+            &files.project,
+            &built.view(&objects, &sounds),
+            wallpaper.camera.scene_size,
+        );
+        wallpaper.sync_scripts(gpu);
+        Ok(wallpaper)
+    }
+
+    /// Build the frame for `doc` (the parsed scene JSON) and make it current.
+    fn build_frame(&mut self, gpu: &Gpu, doc: wpe_assets::Scene) -> Built {
+        let vfs = &self.vfs;
+        let mut cache = self
+            .cache
+            .take()
+            .expect("the cache returns after each build");
+        let mut scene = Scene::build(vfs, &doc, &self.props, |name| cache.store.size(vfs, name));
+        render_text_layers(
+            vfs,
+            &self.props,
+            &mut scene,
+            &mut cache.store,
+            &mut self.text,
+        );
+
+        let mut builder = FrameBuilder::new(gpu, vfs, cache);
+        builder.set_parallax(scene.parallax, scene.camera.scene_size);
+        builder.layers(&scene.layers);
+        if let Some(bloom) = scene.bloom {
+            builder.bloom(bloom);
+        }
+        let (real, total) = builder.stats;
+        tracing::debug!("{real} of {total} draws use their real shader");
+        let (frame, cache) = builder.finish();
+        self.cache = Some(cache);
+
+        let c = scene.clear_color;
+        self.renderer.clear_color = wgpu::Color {
+            r: c.x as f64,
+            g: c.y as f64,
+            b: c.z as f64,
+            a: 1.0,
+        };
+        self.renderer.set_frame(gpu, frame.targets, frame.steps);
+        for id in &frame.hidden {
+            for &step in frame.layer_steps.get(id).map_or(&[][..], |s| &s.all) {
+                self.renderer.set_visible(step, false);
+            }
+        }
+        self.camera = scene.camera;
+        self.bindings = frame.bindings;
+        self.particles = frame.particles;
+        self.parallax_delay = scene.parallax.map_or(0.0, |p| p.delay);
+        self.shake = scene.shake;
+        Built {
+            doc,
+            layers: scene.layers,
+            steps: frame.layer_steps,
+            videos: frame.layer_videos,
+        }
+    }
+
+    /// Apply the scene changes scripts queued (rebuilding the frame when the
+    /// structure changed) and push their writes to the renderer.
+    fn sync_scripts(&mut self, gpu: &Gpu) {
+        let Some(mut scripts) = self.scripts.take() else {
+            return;
+        };
+        let mut edits = scripts.take_edits();
+        if !edits.is_empty() {
+            script::resolve_paths(&mut edits, |path| self.vfs.read(path).is_ok());
+            script::apply_edits(&mut self.scene_json, &edits);
+            match serde_json::from_value::<wpe_assets::Scene>(self.scene_json.clone()) {
+                Ok(doc) => {
+                    let started = Instant::now();
+                    let built = self.build_frame(gpu, doc);
+                    tracing::debug!(
+                        "rebuilt the frame for {} script edits ({} layers) in {:?}",
+                        edits.len(),
+                        built.layers.len(),
+                        started.elapsed()
+                    );
+                    let objects = objects(&self.scene_json);
+                    scripts.rebind(&built.view(&objects, &self.sounds.states()));
+                }
+                Err(e) => tracing::warn!("scene edited by scripts doesn't parse: {e}"),
+            }
+        }
+        for (id, command) in scripts.take_sound_commands() {
+            self.sounds.apply(id, command);
+        }
+        scripts.apply(gpu, &self.vfs, &mut self.renderer, self.text.as_mut());
+        self.scripts = Some(scripts);
     }
 
     /// Start or stop audio: playing the wallpaper's sound layers and
     /// analysing system audio for audio-reactive shaders.
     pub fn set_audio(&mut self, enabled: bool) {
+        self.sounds.enable(enabled);
         if !enabled {
             self.audio = None;
-            self.sounds = None;
             return;
         }
         if self.audio.is_none() {
@@ -280,26 +341,18 @@ impl Wallpaper {
                 .inspect_err(|e| tracing::warn!("audio capture unavailable: {e}"))
                 .ok();
         }
-        if self.sounds.is_none() && !self.sound_layers.is_empty() {
-            match wpe_audio::SoundOutput::open() {
-                Ok(mut out) => {
-                    for layer in &self.sound_layers {
-                        if let Err(e) = out.play(layer.files.clone(), layer.volume, layer.mode) {
-                            tracing::warn!("sound layer: {e}");
-                        }
-                    }
-                    self.sounds = Some(out);
-                }
-                Err(e) => tracing::warn!("audio output unavailable: {e}"),
-            }
-        }
     }
 
-    fn update_audio(&mut self) {
-        let Some(capture) = &mut self.audio else {
-            return;
+    /// Refresh the audio spectrum. Without capture, `WPE_FAKE_AUDIO` feeds a
+    /// test pattern (for audio-reactive wallpapers in headless runs).
+    fn update_audio(&mut self, time: f32) {
+        let spectrum = match &mut self.audio {
+            Some(capture) => capture.spectrum(),
+            None if std::env::var_os("WPE_FAKE_AUDIO").is_some() => {
+                wpe_audio::AudioSpectrum::synthetic(time)
+            }
+            None => return,
         };
-        let spectrum = capture.spectrum();
         self.spectrum = Some(spectrum);
         for (name, values) in spectrum.uniforms() {
             self.renderer.set_global_uniform(name, values);
@@ -308,15 +361,14 @@ impl Wallpaper {
 
     fn run_scripts(&mut self, gpu: &Gpu, time: f32) {
         if let Some(scripts) = &mut self.scripts {
-            scripts.update(
-                gpu,
-                &self.vfs,
-                &mut self.renderer,
-                time,
-                self.pointer,
-                self.spectrum,
-            );
+            scripts.update(time, self.pointer, self.spectrum);
         }
+        self.sync_scripts(gpu);
+    }
+
+    /// Video textures and the streams feeding them.
+    fn videos(&self) -> &[(Arc<GpuTexture>, Arc<video::VideoStream>)] {
+        self.cache.as_ref().map_or(&[], |c| &c.videos)
     }
 
     /// The left mouse button was pressed or released at the current pointer.
@@ -342,7 +394,7 @@ impl Wallpaper {
     }
 
     fn upload_video_frames(&mut self, gpu: &Gpu) {
-        for (texture, stream) in &self.videos {
+        for (texture, stream) in self.videos() {
             stream.update(gpu, texture);
         }
     }
@@ -399,19 +451,20 @@ impl Wallpaper {
         self.smooth_pointer();
         let globals = self.globals(size);
         self.animate(globals.time);
-        self.update_audio();
+        self.update_audio(globals.time);
         self.run_scripts(gpu, globals.time);
         self.renderer.render(gpu, encoder, globals, output, size);
     }
 
     /// Render one frame offscreen and return it as RGBA8 pixels.
     pub fn capture(&mut self, gpu: &Gpu, size: (u32, u32)) -> Vec<u8> {
-        for (_, stream) in &self.videos {
+        for (_, stream) in self.videos() {
             stream.wait_started(std::time::Duration::from_secs(5));
         }
         self.upload_video_frames(gpu);
         let globals = self.globals(size);
         self.animate(globals.time);
+        self.update_audio(globals.time);
         self.run_scripts(gpu, globals.time);
         self.renderer.capture(gpu, globals, size)
     }

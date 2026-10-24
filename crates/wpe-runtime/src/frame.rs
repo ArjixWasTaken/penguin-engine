@@ -20,11 +20,10 @@ use wpe_vfs::Vfs;
 use crate::material::{self, SlotTexture, TextureStore};
 use crate::video::VideoStream;
 
-/// A built frame: render targets, steps and the video streams to feed.
+/// A built frame: render targets, steps and what animates them.
 pub struct Frame {
     pub targets: Vec<TargetDesc>,
     pub steps: Vec<Step>,
-    pub videos: Vec<(Arc<GpuTexture>, Arc<VideoStream>)>,
     /// The video each layer shows, by layer id, for scripts.
     pub layer_videos: HashMap<i32, Arc<VideoStream>>,
     /// Layers whose draws start switched off.
@@ -316,10 +315,7 @@ type ProgramCache = HashMap<String, Option<Arc<ShaderProgram>>>;
 pub struct FrameBuilder<'a> {
     gpu: &'a Gpu,
     vfs: &'a Vfs,
-    store: TextureStore,
-    uploaded: HashMap<usize, Arc<GpuTexture>>,
-    programs: ProgramCache,
-    white: Arc<GpuTexture>,
+    cache: FrameCache,
     targets: Vec<TargetDesc>,
     steps: Vec<Step>,
     frame_copy: Option<TargetId>,
@@ -329,14 +325,6 @@ pub struct FrameBuilder<'a> {
     /// The on-screen layer whose draws are being added.
     current_layer: Option<i32>,
     layer_steps: HashMap<i32, LayerSteps>,
-    /// Parsed puppet models by path; `None` caches a failure.
-    mdls: HashMap<String, Option<Arc<wpe_mdl::Mdl>>>,
-    /// Sprite-sheet pages after the first, by texture and page index.
-    pages: HashMap<(usize, usize), Arc<GpuTexture>>,
-    /// Video textures and the streams feeding them.
-    videos: Vec<(Arc<GpuTexture>, Arc<VideoStream>)>,
-    /// Streams by the texture they play, keyed like `uploaded`.
-    video_textures: HashMap<usize, Arc<VideoStream>>,
     /// The first video each layer uploads (its own texture comes first).
     layer_videos: HashMap<i32, Arc<VideoStream>>,
     /// The layer being built, on screen or not.
@@ -349,28 +337,56 @@ pub struct FrameBuilder<'a> {
     pub stats: (usize, usize),
 }
 
-impl<'a> FrameBuilder<'a> {
-    pub fn new(gpu: &'a Gpu, vfs: &'a Vfs, store: TextureStore, white: Texture) -> Self {
+/// What outlives one build of a wallpaper's frame: loaded textures, GPU
+/// uploads, compiled shaders, puppets and video streams, so rebuilding after
+/// scripts change the scene's structure is cheap.
+pub struct FrameCache {
+    pub store: TextureStore,
+    /// Uploads by source texture address; the source is kept alive so the
+    /// address can't be reused by another texture.
+    uploaded: HashMap<usize, (Arc<Texture>, Arc<GpuTexture>)>,
+    programs: ProgramCache,
+    white: Arc<GpuTexture>,
+    /// Parsed puppet models by path; `None` caches a failure.
+    mdls: HashMap<String, Option<Arc<wpe_mdl::Mdl>>>,
+    /// Sprite-sheet pages after the first, by texture and page index.
+    pages: HashMap<(usize, usize), Arc<GpuTexture>>,
+    /// Video textures and the streams feeding them.
+    pub videos: Vec<(Arc<GpuTexture>, Arc<VideoStream>)>,
+    /// Streams by the texture they play, keyed like `uploaded`.
+    video_textures: HashMap<usize, Arc<VideoStream>>,
+}
+
+impl FrameCache {
+    pub fn new(gpu: &Gpu, store: TextureStore, white: Texture) -> Self {
         Self {
-            gpu,
-            vfs,
             store,
             uploaded: HashMap::new(),
             programs: HashMap::new(),
             white: Arc::new(upload_texture(gpu, &white, "white")),
+            mdls: HashMap::new(),
+            pages: HashMap::new(),
+            videos: Vec::new(),
+            video_textures: HashMap::new(),
+        }
+    }
+}
+
+impl<'a> FrameBuilder<'a> {
+    pub fn new(gpu: &'a Gpu, vfs: &'a Vfs, cache: FrameCache) -> Self {
+        Self {
+            gpu,
+            vfs,
+            cache,
             targets: Vec::new(),
             steps: Vec::new(),
             frame_copy: None,
             links: HashMap::new(),
-            videos: Vec::new(),
-            video_textures: HashMap::new(),
             layer_videos: HashMap::new(),
             building: None,
             hidden: Vec::new(),
             bindings: Vec::new(),
             parallax: None,
-            pages: HashMap::new(),
-            mdls: HashMap::new(),
             particles: Vec::new(),
             current_layer: None,
             layer_steps: HashMap::new(),
@@ -378,17 +394,17 @@ impl<'a> FrameBuilder<'a> {
         }
     }
 
-    pub fn finish(self) -> Frame {
-        Frame {
+    pub fn finish(self) -> (Frame, FrameCache) {
+        let frame = Frame {
             targets: self.targets,
             steps: self.steps,
-            videos: self.videos,
             layer_videos: self.layer_videos,
             hidden: self.hidden,
             bindings: self.bindings,
             particles: self.particles,
             layer_steps: self.layer_steps,
-        }
+        };
+        (frame, self.cache)
     }
 
     fn target(&mut self, name: String, size: TargetSize, format: wgpu::TextureFormat) -> TargetId {
@@ -412,7 +428,7 @@ impl<'a> FrameBuilder<'a> {
     fn upload(&mut self, tex: &Arc<Texture>, label: &str) -> Arc<GpuTexture> {
         let key = Arc::as_ptr(tex) as usize;
         let gpu_tex = self.upload_once(tex, key, label);
-        if let (Some(id), Some(stream)) = (self.building, self.video_textures.get(&key)) {
+        if let (Some(id), Some(stream)) = (self.building, self.cache.video_textures.get(&key)) {
             self.layer_videos
                 .entry(id)
                 .or_insert_with(|| stream.clone());
@@ -421,7 +437,7 @@ impl<'a> FrameBuilder<'a> {
     }
 
     fn upload_once(&mut self, tex: &Arc<Texture>, key: usize, label: &str) -> Arc<GpuTexture> {
-        if let Some(t) = self.uploaded.get(&key) {
+        if let Some((_, t)) = self.cache.uploaded.get(&key) {
             return t.clone();
         }
         let gpu_tex = match &tex.video {
@@ -435,8 +451,8 @@ impl<'a> FrameBuilder<'a> {
                 match VideoStream::start(self.gpu, mp4, &gpu_tex) {
                     Ok(stream) => {
                         let stream = Arc::new(stream);
-                        self.video_textures.insert(key, stream.clone());
-                        self.videos.push((gpu_tex.clone(), stream));
+                        self.cache.video_textures.insert(key, stream.clone());
+                        self.cache.videos.push((gpu_tex.clone(), stream));
                     }
                     Err(e) => tracing::warn!("{label}: video playback unavailable: {e}"),
                 }
@@ -444,7 +460,9 @@ impl<'a> FrameBuilder<'a> {
             }
             None => Arc::new(upload_texture(self.gpu, tex, label)),
         };
-        self.uploaded.insert(key, gpu_tex.clone());
+        self.cache
+            .uploaded
+            .insert(key, (tex.clone(), gpu_tex.clone()));
         gpu_tex
     }
 
@@ -454,7 +472,8 @@ impl<'a> FrameBuilder<'a> {
         name: &str,
     ) -> Option<Arc<ShaderProgram>> {
         let key = format!("{name}{:?}", shader.combos);
-        self.programs
+        self.cache
+            .programs
             .entry(key)
             .or_insert_with(|| {
                 ShaderProgram::new(self.gpu, name, shader)
@@ -484,7 +503,7 @@ impl<'a> FrameBuilder<'a> {
         targets: &HashMap<String, TargetId>,
         combos: &BTreeMap<String, String>,
     ) -> Option<Resolved> {
-        let prepared = material::prepare(self.vfs, &mut self.store, pass, combos)
+        let prepared = material::prepare(self.vfs, &mut self.cache.store, pass, combos)
             .inspect_err(|e| tracing::warn!("{label} ({}): {e}", pass.shader))
             .ok()?;
         let program = self.program(&prepared.shader, &pass.shader)?;
@@ -547,7 +566,8 @@ impl<'a> FrameBuilder<'a> {
                 if page == 0 {
                     return self.upload(tex, label);
                 }
-                self.pages
+                self.cache
+                    .pages
                     .entry((key, page))
                     .or_insert_with(|| {
                         let mut single = (**tex).clone();
@@ -860,6 +880,7 @@ impl<'a> FrameBuilder<'a> {
     fn puppet(&mut self, layer: &ImageLayer) -> Option<Arc<LayerPuppet>> {
         let path = layer.puppet.as_deref()?;
         let mdl = self
+            .cache
             .mdls
             .entry(path.to_owned())
             .or_insert_with(|| {
@@ -994,11 +1015,11 @@ impl<'a> FrameBuilder<'a> {
     /// The built-in stand-in shader, for layers whose material failed.
     fn fallback(&mut self, layer: &ImageLayer) {
         let texture = match layer.texture(0) {
-            Some(name) if !name.starts_with("_rt_") => match self.store.get(self.vfs, name) {
+            Some(name) if !name.starts_with("_rt_") => match self.cache.store.get(self.vfs, name) {
                 Some(tex) => self.upload(&tex, name),
                 None => return,
             },
-            None if layer.solid => self.white.clone(),
+            None if layer.solid => self.cache.white.clone(),
             _ => return,
         };
         self.stats.1 += 1;
