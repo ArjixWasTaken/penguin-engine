@@ -281,6 +281,16 @@ impl ScriptRuntime {
         });
     }
 
+    /// Restore `localStorage` saved earlier (as given to
+    /// [`SceneHost::storage_changed`]); call before loading scripts.
+    pub fn set_local_storage(&mut self, data: &serde_json::Value) {
+        let json = data.to_string();
+        let _ = self.run_js(None, "localStorage", |_, w| {
+            w.get::<_, Function>("setStorage")?
+                .call::<_, ()>((json.as_str(),))
+        });
+    }
+
     /// Load the script attached to `layer`'s `property`.
     ///
     /// `property` is the scene-JSON path of the value relative to the object
@@ -533,6 +543,8 @@ impl ScriptRuntime {
         };
         let slot = self.host.clone();
         let _guard = slot.enter(host);
+        // Scripts see their `init` before any change.
+        self.init_pending();
         self.set_user_properties(changed);
         for i in 0..self.scripts.len() {
             if self.scripts[i].disabled {
@@ -1040,6 +1052,15 @@ fn install_natives<'js>(ctx: &Ctx<'js>, host: Rc<HostSlot>) -> rquickjs::Result<
             let mut right = vec![0.0f32; n];
             h.with(|h| h.audio_spectrum(&mut left, &mut right));
             left.iter().chain(&right).map(|&v| f64::from(v)).collect()
+        })?,
+    )?;
+    let h = host.clone();
+    n.set(
+        "storage",
+        Function::new(ctx.clone(), move |json: String| {
+            if let Ok(data) = serde_json::from_str::<serde_json::Value>(&json) {
+                h.with(|h| h.storage_changed(&data));
+            }
         })?,
     )?;
     let h = host;

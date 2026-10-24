@@ -31,6 +31,8 @@ pub struct SceneView<'a> {
     pub doc: &'a wpe_assets::Scene,
     /// The document's objects as JSON, for their configurations.
     pub objects: &'a [Value],
+    /// The document's `general` settings as JSON.
+    pub general: &'a Value,
     pub layers: &'a [ImageLayer],
     pub steps: &'a HashMap<i32, LayerSteps>,
     pub videos: &'a HashMap<i32, Arc<VideoStream>>,
@@ -115,6 +117,7 @@ impl Scripts {
         canvas: Vec2,
         clocks: SharedClocks,
         bones: SharedBones,
+        storage: Option<Value>,
     ) -> Option<Self> {
         let scripts: Vec<_> = view.objects.iter().map(scripted).collect();
         if scripts.iter().all(Vec::is_empty) {
@@ -136,10 +139,14 @@ impl Scripts {
             .map(|(k, p)| (k.clone(), p.value.clone()))
             .collect();
         runtime.set_user_properties(&Value::Object(user.clone()));
+        if let Some(storage) = &storage {
+            runtime.set_local_storage(storage);
+        }
 
         let by_layer: HashMap<i32, &ImageLayer> = view.layers.iter().map(|l| (l.id, l)).collect();
         let mut host = ScriptHost::new(canvas, view.videos.clone());
         host.sounds = view.sounds.clone();
+        host.general = view.general.clone();
         host.clocks = clocks;
         host.bones = bones;
         for obj in &view.doc.objects {
@@ -168,6 +175,8 @@ impl Scripts {
                 }
             }
         }
+        // As Wallpaper Engine does, `init` runs as the wallpaper loads.
+        runtime.init(&mut host);
         Some(Self {
             runtime,
             host,
@@ -217,6 +226,14 @@ impl Scripts {
         self.runtime.update(&mut self.host, time, dt, Some(cursor));
     }
 
+    /// A user property changed: scripts bound to it and their
+    /// `applyUserProperties` see the new value.
+    pub fn user_property_changed(&mut self, name: &str, value: Value) {
+        self.user.insert(name.to_owned(), value.clone());
+        let changed = serde_json::json!({ name: value });
+        self.runtime.apply_user_properties(&mut self.host, &changed);
+    }
+
     /// Call `handler(arg)` on every script exporting it (media events, ...).
     pub fn emit(&mut self, handler: &'static str, arg: &Value) {
         self.runtime.emit(&mut self.host, handler, arg);
@@ -226,6 +243,11 @@ impl Scripts {
     /// rebuilt from the edited scene and [`Self::rebind`] called.
     pub fn take_edits(&mut self) -> Vec<SceneEdit> {
         std::mem::take(&mut self.host.edits)
+    }
+
+    /// `localStorage` contents, when scripts changed them since the last call.
+    pub fn take_storage(&mut self) -> Option<Value> {
+        self.host.storage.take()
     }
 
     /// What scripts did to particle systems since the last call.

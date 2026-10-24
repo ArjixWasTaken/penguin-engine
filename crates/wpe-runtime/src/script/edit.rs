@@ -27,6 +27,11 @@ pub enum SceneEdit {
         key: String,
         value: Value,
     },
+    /// Set a scene-wide `general` setting (`bloom`, `camerashake`, ...).
+    General {
+        key: String,
+        value: Value,
+    },
 }
 
 fn id_of(obj: &Value) -> Option<i32> {
@@ -99,6 +104,13 @@ fn set_path(obj: &mut Value, path: &str, value: Value) {
 
 /// Apply `edits` in order to the `objects` of scene JSON `doc`.
 pub fn apply(doc: &mut Value, edits: &[SceneEdit]) {
+    for edit in edits {
+        if let SceneEdit::General { key, value } = edit
+            && let Some(general) = doc.get_mut("general")
+        {
+            set_path(general, key, value.clone());
+        }
+    }
     let Some(objects) = doc.get_mut("objects").and_then(Value::as_array_mut) else {
         return;
     };
@@ -132,6 +144,7 @@ pub fn apply(doc: &mut Value, edits: &[SceneEdit]) {
                     None => obj.remove("parent"),
                 };
             }
+            SceneEdit::General { .. } => {}
             SceneEdit::Set { id, key, value } => {
                 if let Some(at) = position(objects, *id) {
                     set_path(&mut objects[at], key, value.clone());

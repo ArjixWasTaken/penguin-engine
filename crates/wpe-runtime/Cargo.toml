@@ -6,6 +6,7 @@ license.workspace = true
 
 [dependencies]
 chrono = { version = "0.4.45", default-features = false, features = ["clock"] }
+dirs = "7.0.0"
 glam = "0.34.1"
 glow = "0.18.0"
 khronos-egl = { version = "6.0.0", features = ["static"] }

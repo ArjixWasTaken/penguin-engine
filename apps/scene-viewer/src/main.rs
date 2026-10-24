@@ -44,6 +44,16 @@ struct Args {
     /// Frame rate cap (0 = follow the display).
     #[arg(long, default_value_t = 0)]
     fps: u32,
+    /// Set a user property, as the settings would: `name=value`, the value
+    /// as JSON (`true`, `0.5`, `"1 0 0"`) or else a string. Repeatable.
+    #[arg(long = "property", value_name = "NAME=VALUE", value_parser = parse_property)]
+    properties: Vec<(String, serde_json::Value)>,
+}
+
+fn parse_property(s: &str) -> Result<(String, serde_json::Value), String> {
+    let (name, value) = s.split_once('=').ok_or("expected NAME=VALUE")?;
+    let value = serde_json::from_str(value).unwrap_or_else(|_| value.into());
+    Ok((name.to_owned(), value))
 }
 
 #[derive(Clone, Copy, clap::ValueEnum)]
@@ -120,6 +130,9 @@ fn screenshot(args: &Args, assets: &std::path::Path, out: &std::path::Path) -> R
         assets,
         &args.wallpaper,
     )?;
+    for (name, value) in &args.properties {
+        wallpaper.set_user_property(&gpu, name, value.clone());
+    }
     wallpaper.fill = args.fill.into();
     for frame in 1..args.frames {
         wallpaper.time_override = Some(args.time + frame as f32 / 30.0);
@@ -202,6 +215,9 @@ impl App {
         surface.configure(&gpu.device, &config);
 
         let mut wallpaper = Wallpaper::load(&gpu, format, &self.assets, &self.args.wallpaper)?;
+        for (name, value) in &self.args.properties {
+            wallpaper.set_user_property(&gpu, name, value.clone());
+        }
         wallpaper.fill = self.args.fill.into();
         wallpaper.set_audio(self.args.audio);
         window.set_title(&format!("{} — scene-viewer", wallpaper.title));

@@ -8,6 +8,7 @@ pub mod material;
 mod media;
 mod script;
 mod sound;
+mod storage;
 mod video;
 
 use std::path::Path;
@@ -119,11 +120,13 @@ impl Built {
     fn view<'a>(
         &'a self,
         objects: &'a [serde_json::Value],
+        general: &'a serde_json::Value,
         sounds: &'a std::collections::HashMap<i32, sound::SoundState>,
     ) -> script::SceneView<'a> {
         script::SceneView {
             doc: &self.doc,
             objects,
+            general,
             layers: &self.layers,
             steps: &self.steps,
             videos: &self.videos,
@@ -198,6 +201,8 @@ pub struct Wallpaper {
     bones: bones::SharedBones,
     /// Draws showing a layer's sprite sheet: layer id and step.
     sprite_steps: Vec<(i32, usize)>,
+    /// Scripts' `localStorage` between runs.
+    storage: storage::Storage,
 }
 
 impl Wallpaper {
@@ -249,6 +254,7 @@ impl Wallpaper {
             clocks: Default::default(),
             bones: Default::default(),
             sprite_steps: Vec::new(),
+            storage: storage::Storage::for_wallpaper(path),
             props,
             vfs: files.vfs,
         };
@@ -272,10 +278,11 @@ impl Wallpaper {
         wallpaper.scripts = script::Scripts::load(
             &wallpaper.vfs,
             &files.project,
-            &built.view(&objects, &sounds),
+            &built.view(&objects, &wallpaper.scene_json["general"], &sounds),
             wallpaper.camera.scene_size,
             wallpaper.clocks.clone(),
             wallpaper.bones.clone(),
+            wallpaper.storage.load(),
         );
         if wallpaper.scripts.is_some() || !wallpaper.system_slots.is_empty() {
             wallpaper.media = media::Media::start();
@@ -388,12 +395,16 @@ impl Wallpaper {
                         started.elapsed()
                     );
                     let objects = objects(&self.scene_json);
-                    scripts.rebind(&built.view(&objects, &self.sounds.states()));
+                    let sounds = self.sounds.states();
+                    scripts.rebind(&built.view(&objects, &self.scene_json["general"], &sounds));
                     // The new frame's draws haven't been animated yet.
                     self.animate(time);
                 }
                 Err(e) => tracing::warn!("scene edited by scripts doesn't parse: {e}"),
             }
+        }
+        if let Some(data) = scripts.take_storage() {
+            self.storage.changed(data);
         }
         for (id, command) in scripts.take_sound_commands() {
             self.sounds.apply(id, command);
@@ -408,6 +419,27 @@ impl Wallpaper {
         }
         scripts.apply(gpu, &self.vfs, &mut self.renderer, self.text.as_mut());
         self.scripts = Some(scripts);
+    }
+
+    /// Change a user property, as a settings UI does: the scene is rebuilt
+    /// with the new value and scripts get `applyUserProperties`. `value` is
+    /// the property's value (`true`, `0.5`, `"1 0 0"`, ...).
+    pub fn set_user_property(&mut self, gpu: &Gpu, name: &str, value: serde_json::Value) {
+        self.props.set(name, value.clone());
+        let doc = match serde_json::from_value::<wpe_assets::Scene>(self.scene_json.clone()) {
+            Ok(doc) => doc,
+            Err(e) => {
+                tracing::warn!("scene doesn't parse: {e}");
+                return;
+            }
+        };
+        let built = self.build_frame(gpu, doc);
+        if let Some(scripts) = &mut self.scripts {
+            let objects = objects(&self.scene_json);
+            let sounds = self.sounds.states();
+            scripts.rebind(&built.view(&objects, &self.scene_json["general"], &sounds));
+            scripts.user_property_changed(name, value);
+        }
     }
 
     /// Start or stop audio: playing the wallpaper's sound layers and

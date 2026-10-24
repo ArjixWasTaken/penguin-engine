@@ -146,6 +146,11 @@ pub trait SceneHost {
         left.fill(0.0);
         right.fill(0.0);
     }
+    /// `localStorage` changed: `{"global": {...}, "screen": {...}}`, to keep
+    /// for [`crate::ScriptRuntime::set_local_storage`] next time.
+    fn storage_changed(&mut self, data: &serde_json::Value) {
+        let _ = data;
+    }
     /// A `console.*` message.
     fn log(&mut self, level: LogLevel, message: &str) {
         match level {

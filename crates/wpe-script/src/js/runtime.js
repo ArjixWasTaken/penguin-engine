@@ -452,15 +452,31 @@
 	global.shared = {};
 	global.input = { cursorWorldPosition: new Vec3(0, 0, 0), cursorScreenPosition: new Vec2(0, 0), cursorLeftDown: false };
 
-	const storage = { global: {}, screen: {} };
+	let storage = { global: {}, screen: {} };
 	const loc = l => (l === 'global' || l === 0 ? 'global' : 'screen');
+	// The host keeps storage between runs; values are stored as JSON.
+	const saveStorage = () => N.storage(JSON.stringify(storage));
+	W.setStorage = function (json) {
+		const data = JSON.parse(json) || {};
+		storage = { global: data.global || {}, screen: data.screen || {} };
+	};
 	global.localStorage = {
 		LOCATION_GLOBAL: 'global', LOCATION_SCREEN: 'screen',
 		get(k, l) { const s = storage[loc(l)]; return Object.prototype.hasOwnProperty.call(s, k) ? s[k] : undefined; },
-		set(k, v, l) { storage[loc(l)][String(k)] = v; },
-		delete(k, l) { const s = storage[loc(l)]; const had = Object.prototype.hasOwnProperty.call(s, k); delete s[k]; return had; },
+		set(k, v, l) { storage[loc(l)][String(k)] = v; saveStorage(); },
+		delete(k, l) {
+			const s = storage[loc(l)];
+			const had = Object.prototype.hasOwnProperty.call(s, k);
+			delete s[k];
+			if (had) saveStorage();
+			return had;
+		},
 		remove(k, l) { return this.delete(k, l); },
-		clear(l) { if (l === undefined) { storage.global = {}; storage.screen = {}; } else storage[loc(l)] = {}; },
+		clear(l) {
+			if (l === undefined) storage = { global: {}, screen: {} };
+			else storage[loc(l)] = {};
+			saveStorage();
+		},
 	};
 
 	// ---------------------------------------------------------------- timers

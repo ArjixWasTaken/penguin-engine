@@ -14,6 +14,7 @@ struct MockHost {
     spectrum: f32,
     /// Layer 1 has a video; calls made on it.
     video_calls: Vec<(String, Vec<ScriptValue>)>,
+    storage: Option<serde_json::Value>,
 }
 
 impl MockHost {
@@ -77,6 +78,9 @@ impl SceneHost for MockHost {
             "duration" => Some(ScriptValue::Number(8.0)),
             _ => None,
         }
+    }
+    fn storage_changed(&mut self, data: &serde_json::Value) {
+        self.storage = Some(data.clone());
     }
     fn canvas_size(&self) -> [f32; 2] {
         [1920.0, 1080.0]
@@ -623,4 +627,51 @@ fn video_texture_controls_and_ended_callbacks() {
         Some(&ScriptValue::String("true 1".into()))
     );
     assert!(rt.take_failures().is_empty());
+}
+
+#[test]
+fn local_storage_persists_through_the_host() {
+    let mut host = MockHost::with_layers(&["t"]);
+    let mut rt = ScriptRuntime::new().unwrap();
+    let src = r#"
+        export function init() {
+            localStorage.set('clicks', (localStorage.get('clicks') || 0) + 1);
+            localStorage.set('theme', 'dark', localStorage.LOCATION_GLOBAL);
+        }
+        export function update() { return String(localStorage.get('clicks')); }
+    "#;
+    add(
+        &mut rt,
+        &mut host,
+        1,
+        "text",
+        src,
+        None,
+        ScriptValue::String(String::new()),
+    );
+    rt.update(&mut host, 0.0, 0.016, None);
+    let saved = host
+        .storage
+        .clone()
+        .unwrap_or_else(|| panic!("not saved: {:?} {:?}", rt.take_failures(), host.logs));
+    assert_eq!(
+        saved,
+        json!({"global": {"theme": "dark"}, "screen": {"clicks": 1}})
+    );
+
+    // Next run: restored before the scripts load.
+    let mut host = MockHost::with_layers(&["t"]);
+    let mut rt = ScriptRuntime::new().unwrap();
+    rt.set_local_storage(&saved);
+    add(
+        &mut rt,
+        &mut host,
+        1,
+        "text",
+        src,
+        None,
+        ScriptValue::String(String::new()),
+    );
+    rt.update(&mut host, 0.0, 0.016, None);
+    assert_eq!(host.prop(1, "text"), Some(&ScriptValue::String("2".into())));
 }

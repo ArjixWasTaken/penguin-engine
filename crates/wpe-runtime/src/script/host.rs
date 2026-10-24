@@ -377,6 +377,10 @@ pub struct ScriptHost {
     pub videos: HashMap<i32, Arc<VideoStream>>,
     /// Structural changes waiting for the next frame rebuild.
     pub edits: Vec<SceneEdit>,
+    /// The scene's `general` settings, as scripts have changed them.
+    pub general: Value,
+    /// `localStorage` contents changed since the runtime last took them.
+    pub storage: Option<Value>,
     /// Id for the next created layer.
     pub next_id: i32,
     /// Sound layers' play state, and what scripts did to them.
@@ -401,6 +405,8 @@ impl ScriptHost {
             spectrum: None,
             videos,
             edits: Vec::new(),
+            general: Value::Null,
+            storage: None,
             next_id: 1,
             sounds: HashMap::new(),
             sound_commands: Vec::new(),
@@ -1035,12 +1041,38 @@ impl SceneHost for ScriptHost {
     }
 
     fn scene_get(&self, property: &str) -> Option<ScriptValue> {
-        self.unhandled("scene_get", property);
-        None
+        let Some(v) = self.general.get(property) else {
+            self.unhandled("scene_get", property);
+            return None;
+        };
+        let v = v.get("value").unwrap_or(v);
+        Some(ScriptValue::from_scene_json(property, v))
     }
 
-    fn scene_set(&mut self, property: &str, _value: ScriptValue) {
-        self.unhandled("scene_set", property);
+    fn scene_set(&mut self, property: &str, value: ScriptValue) {
+        if property == "cameratransforms" {
+            self.unhandled("scene_set", property);
+            return;
+        }
+        let json = scene_json(&value);
+        let current = self
+            .general
+            .get(property)
+            .map(|v| v.get("value").unwrap_or(v));
+        if current == Some(&json) {
+            return;
+        }
+        if let Some(general) = self.general.as_object_mut() {
+            general.insert(property.to_owned(), json.clone());
+        }
+        self.edits.push(SceneEdit::General {
+            key: property.to_owned(),
+            value: json,
+        });
+    }
+
+    fn storage_changed(&mut self, data: &Value) {
+        self.storage = Some(data.clone());
     }
 
     fn canvas_size(&self) -> [f32; 2] {
