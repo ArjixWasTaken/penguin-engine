@@ -38,6 +38,9 @@ pub struct LayerState {
     pub steps: LayerSteps,
     pub motion: Motion,
     pub size: Vec2,
+    /// Takes cursor clicks (`solid`); scripts turn it off to let clicks
+    /// through to what is underneath.
+    pub solid: bool,
     pub visible: bool,
     pub origin: Vec3,
     pub scale: Vec3,
@@ -95,6 +98,7 @@ impl LayerState {
         steps: LayerSteps,
     ) -> Option<Self> {
         let c = obj.common()?;
+        let solid = config.get("solid").and_then(Value::as_bool).unwrap_or(true);
         let motion = layer.map(|l| l.motion.clone()).unwrap_or_else(|| Motion {
             origin: Vec3::from_array(*c.origin.value),
             scale: Vec3::from_array(*c.scale.value),
@@ -113,6 +117,7 @@ impl LayerState {
             config,
             steps,
             size: layer.map_or(Vec2::ONE, |l| l.size),
+            solid,
             visible: layer.map_or(c.visible.value, |l| l.self_visible),
             ancestors_visible: layer.is_none_or(|l| l.ancestors_visible),
             origin: motion.origin,
@@ -1284,6 +1289,7 @@ impl SceneHost for ScriptHost {
         let l = self.layer(layer)?;
         Some(match property {
             "visible" => ScriptValue::Bool(l.visible),
+            "solid" => ScriptValue::Bool(l.solid),
             "origin" => vec3(l.origin),
             "scale" => vec3(l.scale),
             "angles" => vec3(l.angles),
@@ -1334,6 +1340,13 @@ impl SceneHost for ScriptHost {
             if sound.volume != v {
                 sound.volume = v;
                 self.sound_commands.push((layer, SoundCommand::Volume(v)));
+            }
+            return;
+        }
+        if property == "solid" {
+            // Input only: no rebuild.
+            if let (Some(l), ScriptValue::Bool(solid)) = (self.layer_mut(layer), &value) {
+                l.solid = *solid;
             }
             return;
         }

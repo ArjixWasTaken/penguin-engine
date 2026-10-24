@@ -374,13 +374,14 @@ impl Scripts {
     fn cursor_event(&mut self, kind: CursorEventKind, pointer: Vec2) {
         let state = self.cursor_state(pointer);
         let world = Vec2::from_array(state.world);
-        let hits: Vec<i32> = self
+        // Topmost (last drawn) first.
+        let mut hits: Vec<i32> = self
             .runtime
             .interactive_layers()
             .into_iter()
-            .rev()
             .filter(|id| self.hit(*id, world))
             .collect();
+        hits.sort_by_key(|id| std::cmp::Reverse(self.host.by_id.get(id).copied()));
         tracing::trace!("cursor {kind:?} at {world}: hits {hits:?}");
         self.runtime.cursor_event(
             &mut self.host,
@@ -394,6 +395,10 @@ impl Scripts {
         let Some(l) = self.host.layer(id) else {
             return false;
         };
+        // Non-solid layers let clicks through.
+        if !l.solid {
+            return false;
+        }
         let local = l
             .motion_now()
             .transform_at(0.0)
