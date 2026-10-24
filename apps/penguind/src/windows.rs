@@ -31,7 +31,7 @@ const NOT_APPLICATIONS: &[&str] = &[
     "org.kde.krunner",
     "org.kde.polkit-kde-authentication-agent-1",
     "penguin-engine",
-    "com.github.arjixwastaken.penguin-engine",
+    "dev.arjix.penguin-engine",
 ];
 
 struct Window {
