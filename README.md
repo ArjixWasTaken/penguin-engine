@@ -1,5 +1,8 @@
 # Penguin Engine
 
+> [!WARNING]
+> This project is vibe-slop: it was written almost entirely by an AI coding agent.
+
 Animated desktop wallpapers for Linux: plays [Wallpaper Engine](https://www.wallpaperengine.io/)
 wallpapers (scene, video and web) as the desktop background on Wayland. Written in Rust on
 [wgpu](https://wgpu.rs). Penguin Engine is an independent project, not affiliated with
