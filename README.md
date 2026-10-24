@@ -10,9 +10,9 @@ Wallpaper Engine.
 - `penguin-engine`: the app to browse your wallpaper library, apply wallpapers and change
   their properties and the settings
 
-Work in progress. Format and behaviour knowledge is derived from
-[CaptSilver/wallpaper-scene-renderer](https://github.com/CaptSilver/wallpaper-scene-renderer)
-(C++/Vulkan, GPL-2.0), so this project is licensed GPL-2.0 as well.
+Work in progress. Much of what Penguin Engine knows about Wallpaper Engine's formats and
+behaviour comes from
+[CaptSilver/wallpaper-scene-renderer](https://github.com/CaptSilver/wallpaper-scene-renderer).
 
 ## Requirements
 
@@ -153,15 +153,11 @@ reach the wallpaper (parallax, script cursor events) unless `--passthrough` is g
 KDE Plasma (6, Wayland): KWin maps the layer-shell `background` layer to its desktop layer,
 the same layer as plasmashell's desktop window (wallpaper, icons, desktop widgets), and
 stacks windows within a layer by mapping order. Started after plasmashell, `penguind` on
-`background` therefore shows above Plasma's own wallpaper — and above desktop icons and
-widgets, and it takes the desktop's clicks (right-click menu) unless `--passthrough`. If
-plasmashell restarts afterwards it covers the wallpaper again; restart `penguind` then.
-`bottom` maps to KWin's below layer: always above Plasma's desktop, still under normal
-windows and panels. Other players handle Plasma the same way or avoid layer-shell there:
-linux-wallpaperengine users disable the desktop icons (the "Desktop" layout) and add window
-rules, and the usual recommendation is a Plasma wallpaper plugin (e.g.
-[wallpaper-engine-kde-plugin](https://github.com/catsout/wallpaper-engine-kde-plugin)),
-which renders inside plasmashell instead.
+`background` therefore shows above Plasma's own wallpaper, and above desktop icons and
+widgets. It takes the desktop's left clicks unless `--passthrough`; right clicks still reach the
+desktop and open its menu. If plasmashell restarts afterwards it covers the wallpaper again;
+restart `penguind` then. `bottom` maps to KWin's below layer: always above Plasma's desktop,
+still under normal windows and panels.
 
 ### Control socket
 
@@ -340,3 +336,7 @@ cargo run -p wpe-cli -- scan-tex --assets <WE assets> --workshop <workshop dir>
 cargo run -p wpe-cli -- scan-scenes --assets <WE assets> --workshop <workshop dir>
 cargo run -p wpe-cli -- scan-shaders --assets <WE assets> --workshop <workshop dir>
 ```
+
+## License
+
+GPL-2.0-only; see `LICENSE`.
