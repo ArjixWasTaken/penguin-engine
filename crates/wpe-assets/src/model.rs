@@ -43,10 +43,50 @@ pub struct ImageModel {
     pub cropoffset: Option<Vec2>,
 }
 
+/// The `.mdl` a model object's `model` path names. Wallpaper Engine's
+/// model objects point straight at the mesh (`models/rock.mdl`), and that is
+/// all the reference renderer accepts; a model JSON in its place is followed
+/// through its `model` (or `puppet`) key. `read` fetches a file's bytes.
+pub fn model_mdl_path(path: &str, read: impl FnOnce(&str) -> Option<Vec<u8>>) -> Option<String> {
+    if path.is_empty() {
+        return None;
+    }
+    if path.to_ascii_lowercase().ends_with(".mdl") {
+        return Some(path.to_owned());
+    }
+    let bytes = read(path)?;
+    if bytes.starts_with(b"MDLV") {
+        return Some(path.to_owned());
+    }
+    let json: serde_json::Value = crate::parse_json(std::str::from_utf8(&bytes).ok()?).ok()?;
+    ["model", "puppet"]
+        .iter()
+        .find_map(|k| json.get(k)?.as_str().filter(|s| !s.is_empty()))
+        .map(str::to_owned)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::parse_json;
+
+    #[test]
+    fn resolves_mdl_paths() {
+        let never = |_: &str| -> Option<Vec<u8>> { panic!("no read expected") };
+        assert_eq!(
+            model_mdl_path("models/a.MDL", never).as_deref(),
+            Some("models/a.MDL")
+        );
+        assert_eq!(model_mdl_path("", never), None);
+        let json = |_: &str| Some(br#"{"model": "models/b.mdl"}"#.to_vec());
+        assert_eq!(
+            model_mdl_path("models/b.json", json).as_deref(),
+            Some("models/b.mdl")
+        );
+        let raw = |_: &str| Some(b"MDLV0023\0".to_vec());
+        assert_eq!(model_mdl_path("models/c", raw).as_deref(), Some("models/c"));
+        assert_eq!(model_mdl_path("models/d.json", |_| None), None);
+    }
 
     #[test]
     fn parses_model() {

@@ -10,8 +10,8 @@ mod texture;
 pub use gpu::{Gpu, GpuError};
 pub use image_pipeline::BlendMode;
 pub use material::{
-    Camera, CardMesh, FrameGlobals, MaterialDraw, Mesh, MeshData, ProgramError, ShaderProgram,
-    SpriteAnimation, SpriteFrame, TexRef,
+    Camera, CardMesh, CullMode, FrameGlobals, MaterialDraw, Mesh, MeshData, ProgramError,
+    RasterState, ShaderProgram, SpriteAnimation, SpriteFrame, TexRef,
 };
 pub use renderer::{Draw, ImageDraw, SceneRenderer, Step};
 pub use targets::{DEFAULT_FORMAT, TargetDesc, TargetId, TargetSize};

@@ -210,6 +210,65 @@ impl Toggle {
     }
 }
 
+/// Render state a 3D model submesh's material pass resolves to.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ModelMaterialDefaults {
+    pub depthtest: Toggle,
+    pub depthwrite: Toggle,
+    pub blending: Blending,
+    pub cullmode: CullMode,
+}
+
+/// Wallpaper Engine's defaults for model materials, which differ from the 2D
+/// ones [`MaterialPass`] parses with: depth test and write are enabled,
+/// blending is `normal` (opaque), and faces are back-culled unless the pass
+/// is `translucent`. Keys the raw `pass` JSON spells out are kept.
+pub fn model_material_defaults(pass: &Value) -> ModelMaterialDefaults {
+    let get = |keys: &[&str]| {
+        keys.iter()
+            .find_map(|k| pass.get(*k).filter(|v| !v.is_null()))
+    };
+    let text = |v: &Value| match v {
+        Value::String(s) => s.clone(),
+        other => other.to_string(),
+    };
+    let toggle = |keys: &[&str]| get(keys).map_or(Toggle::Enabled, |v| Toggle::parse(&text(v)));
+    let blending = get(&["blending"]).map_or(Blending::Normal, |v| Blending::parse(&text(v)));
+    let cullmode = match get(&["cullmode", "culling"]) {
+        Some(v) => CullMode::parse(&text(v)),
+        None if blending == Blending::Translucent => CullMode::NoCull,
+        None => CullMode::Normal,
+    };
+    ModelMaterialDefaults {
+        depthtest: toggle(&["depthtest", "depthtesting"]),
+        depthwrite: toggle(&["depthwrite", "depthwriting"]),
+        blending,
+        cullmode,
+    }
+}
+
+impl ModelMaterialDefaults {
+    pub fn apply(self, pass: &mut MaterialPass) {
+        pass.depthtest = self.depthtest;
+        pass.depthwrite = self.depthwrite;
+        pass.blending = self.blending;
+        pass.cullmode = self.cullmode;
+    }
+}
+
+/// Parse a model submesh's material file with [`model_material_defaults`]
+/// applied to every pass.
+pub fn parse_model_material(text: &str) -> Result<Material, crate::JsonError> {
+    let raw: Value = crate::parse_json(text)?;
+    let mut material: Material = serde_path_to_error::deserialize(&raw)?;
+    let passes = raw.get("passes").and_then(Value::as_array);
+    for (i, pass) in material.passes.iter_mut().enumerate() {
+        let json = passes.and_then(|p| p.get(i)).unwrap_or(&Value::Null);
+        model_material_defaults(json).apply(pass);
+    }
+    Ok(material)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -267,6 +326,34 @@ mod tests {
         assert_eq!(p.depthtest, Toggle::Disabled);
         assert!(p.textures.is_empty());
         assert_eq!(Blending::default(), Blending::Translucent);
+    }
+
+    #[test]
+    fn model_defaults() {
+        let m = parse_model_material(
+            r#"{"passes": [{"shader": "generic4"},
+                           {"shader": "generic4", "blending": "translucent"},
+                           {"shader": "skybox", "depthtesting": "disabled", "depthwrite": "disabled",
+                            "cullmode": "nocull", "blending": "additive"}]}"#,
+        )
+        .unwrap();
+        let [opaque, glass, sky] = &m.passes[..] else {
+            panic!()
+        };
+        assert!(opaque.depthtest.is_enabled() && opaque.depthwrite.is_enabled());
+        assert_eq!(
+            (&opaque.blending, &opaque.cullmode),
+            (&Blending::Normal, &CullMode::Normal)
+        );
+        assert_eq!(
+            (&glass.blending, &glass.cullmode),
+            (&Blending::Translucent, &CullMode::NoCull)
+        );
+        assert!(!sky.depthtest.is_enabled() && !sky.depthwrite.is_enabled());
+        assert_eq!(
+            (&sky.blending, &sky.cullmode),
+            (&Blending::Additive, &CullMode::NoCull)
+        );
     }
 
     #[test]

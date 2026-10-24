@@ -547,17 +547,24 @@ fn string_list<'de, D: Deserializer<'de>>(d: D) -> Result<Vec<String>, D::Error>
     })
 }
 
-/// A point/spot/directional light.
+/// A point/spot/tube/directional light.
 #[derive(Debug, Clone, Deserialize)]
 #[serde(default)]
 pub struct LightObject {
     #[serde(skip)]
     pub common: ObjectCommon,
-    /// Light type, e.g. `lpoint`, `lspot`, `ldirectional`.
+    /// Light type: `lpoint`, `lspot`, `ltube`, `ldirectional`, or the legacy `point`.
     pub light: String,
     pub color: Dynamic<Vec3>,
     pub radius: Dynamic<f32>,
     pub intensity: Dynamic<f32>,
+    /// Falloff power: `pow(saturate(1 - distance / radius), exponent)`.
+    pub exponent: Dynamic<f32>,
+    /// Spot light cone half-angles, in degrees.
+    #[serde(alias = "innerCone")]
+    pub innercone: Option<Dynamic<f32>>,
+    #[serde(alias = "outerCone")]
+    pub outercone: Option<Dynamic<f32>>,
     #[serde(flatten)]
     pub extra: Map<String, Value>,
 }
@@ -568,8 +575,11 @@ impl Default for LightObject {
             common: ObjectCommon::default(),
             light: String::new(),
             color: d(VecN::splat(1.0)),
-            radius: d(0.0),
+            radius: d(1000.0),
             intensity: d(1.0),
+            exponent: d(1.0),
+            innercone: None,
+            outercone: None,
             extra: Map::new(),
         }
     }
@@ -581,8 +591,11 @@ impl Default for LightObject {
 pub struct ModelObject {
     #[serde(skip)]
     pub common: ObjectCommon,
-    /// Model JSON path.
+    /// Model path, usually the `.mdl` itself (see [`crate::model::model_mdl_path`]).
     pub model: String,
+    /// Parent-puppet attachment point this model rigs to.
+    #[serde(deserialize_with = "lenient_opt_string")]
+    pub attachment: Option<String>,
     #[serde(flatten)]
     pub extra: Map<String, Value>,
 }
@@ -682,7 +695,7 @@ mod tests {
             {"id": 4, "sound": ["sounds/a.mp3", ""], "volume": {"user": "vol", "value": 0.5},
              "playbackmode": "loop"},
             {"id": 5, "light": "lpoint", "color": "1 0.5 0", "radius": 300, "intensity": 2},
-            {"id": 6, "model": "models/x.json", "origin": {"animation": {"c0": []}, "value": "1 2 3"}},
+            {"id": 6, "model": "models/x.mdl", "attachment": "hand", "origin": {"animation": {"c0": []}, "value": "1 2 3"}},
             {"id": 7, "text": {"script": "...", "value": "12:00"}, "font": "fonts/a.ttf",
              "pointsize": {"user": "size", "value": 40}, "padding": 32},
             {"id": 10, "name": "group", "origin": "1 1 1"},
@@ -783,10 +796,14 @@ mod tests {
             panic!()
         };
         assert_eq!((l.radius.value, l.intensity.value), (300.0, 2.0));
+        assert_eq!(l.exponent.value, 1.0);
+        assert!(l.innercone.is_none());
         let SceneObject::Model(m) = &s.objects[5] else {
             panic!()
         };
         assert!(m.common.origin.animation.is_some());
+        assert_eq!(m.attachment.as_deref(), Some("hand"));
+        assert!(m.extra.is_empty());
         let SceneObject::Text(t) = &s.objects[6] else {
             panic!()
         };

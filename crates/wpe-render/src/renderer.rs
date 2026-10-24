@@ -3,8 +3,10 @@ use std::sync::Arc;
 use glam::{Mat4, Vec2, Vec4};
 
 use crate::image_pipeline::{ImagePipelines, ImageUniforms};
-use crate::material::{FrameGlobals, MaterialDraw, Placeholders, PreparedMaterialDraw};
-use crate::targets::{DEFAULT_FORMAT, TargetDesc, TargetId, Targets};
+use crate::material::{
+    FrameGlobals, MaterialDraw, PassDepth, Placeholders, PreparedMaterialDraw, RasterState,
+};
+use crate::targets::{DEFAULT_FORMAT, DepthBuffers, TargetDesc, TargetId, Targets, depth_view};
 use crate::{BlendMode, Gpu, GpuTexture};
 
 /// One textured card drawn with the built-in stand-in shader.
@@ -62,6 +64,23 @@ impl PreparedStep {
             Self::Copy { .. } => None,
         }
     }
+
+    /// Depth and culling the step draws with; only materials use depth.
+    fn raster(&self) -> RasterState {
+        match self {
+            Self::Material(_, d) => d.draw.raster,
+            _ => RasterState::default(),
+        }
+    }
+}
+
+/// Whether a pass over `steps` needs a depth attachment: any draw in it
+/// that is shown uses depth.
+fn needs_depth(steps: &[PreparedStep], hidden: &[bool]) -> bool {
+    steps
+        .iter()
+        .zip(hidden)
+        .any(|(step, hidden)| !hidden && step.raster().uses_depth())
 }
 
 /// Executes a scene's frame steps over its render targets and presents
@@ -72,6 +91,8 @@ pub struct SceneRenderer {
     blit_layout: wgpu::BindGroupLayout,
     blit_bind_group: Option<(u64, wgpu::BindGroup)>,
     targets: Targets,
+    /// Depth buffers of targets that 3D draws render into.
+    depth: DepthBuffers,
     steps: Vec<PreparedStep>,
     /// Steps skipped this frame.
     hidden: Vec<bool>,
@@ -140,6 +161,7 @@ impl SceneRenderer {
             blit_layout,
             blit_bind_group: None,
             targets: Targets::new(gpu),
+            depth: DepthBuffers::default(),
             steps: Vec::new(),
             hidden: Vec::new(),
             placeholders: Placeholders::new(gpu),
@@ -403,7 +425,6 @@ impl SceneRenderer {
                     };
                     gpu.queue
                         .write_buffer(&d.uniforms, 0, bytemuck::bytes_of(&uniforms));
-                    self.images.get(&gpu.device, d.draw.blend);
                 }
                 PreparedStep::Material(_, d) => d.update(
                     gpu,
@@ -435,6 +456,7 @@ impl SceneRenderer {
             });
         }
         let mut written = vec![false; self.targets.len()];
+        self.depth.begin_frame(self.targets.len());
         let mut i = 0;
         while i < self.steps.len() {
             if self.hidden[i] && matches!(self.steps[i], PreparedStep::Copy { .. }) {
@@ -474,10 +496,32 @@ impl SceneRenderer {
             };
             written[target.0] = true;
             let format = self.targets.format(target);
+            let color = self.targets.get(target);
+            let depth = if needs_depth(&self.steps[i..end], &self.hidden[i..end]) {
+                let (view, first) = self
+                    .depth
+                    .get(target, color.size, |size| depth_view(gpu, size));
+                let load = if first {
+                    wgpu::LoadOp::Clear(1.0)
+                } else {
+                    wgpu::LoadOp::Load
+                };
+                Some(wgpu::RenderPassDepthStencilAttachment {
+                    view,
+                    depth_ops: Some(wgpu::Operations {
+                        load,
+                        store: wgpu::StoreOp::Store,
+                    }),
+                    stencil_ops: None,
+                })
+            } else {
+                None
+            };
+            let depth_attached = depth.is_some();
             let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: Some("scene"),
                 color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                    view: &self.targets.get(target).view,
+                    view: &color.view,
                     depth_slice: None,
                     resolve_target: None,
                     ops: wgpu::Operations {
@@ -485,6 +529,7 @@ impl SceneRenderer {
                         store: wgpu::StoreOp::Store,
                     },
                 })],
+                depth_stencil_attachment: depth,
                 ..Default::default()
             });
             for (step, hidden) in self.steps[i..end].iter().zip(&self.hidden[i..end]) {
@@ -493,15 +538,14 @@ impl SceneRenderer {
                 }
                 match step {
                     PreparedStep::Image(_, d) if format == DEFAULT_FORMAT => {
-                        pass.set_pipeline(
-                            self.images
-                                .cached(d.draw.blend)
-                                .expect("pipelines created above"),
-                        );
+                        let depth = PassDepth::new(RasterState::default(), depth_attached);
+                        pass.set_pipeline(&self.images.get(&gpu.device, d.draw.blend, depth));
                         pass.set_bind_group(0, &d.bind_group, &[]);
                         pass.draw(0..4, 0..1);
                     }
-                    PreparedStep::Material(_, d) => d.record(&gpu.device, &mut pass, format),
+                    PreparedStep::Material(_, d) => {
+                        d.record(&gpu.device, &mut pass, format, depth_attached)
+                    }
                     _ => {}
                 }
             }
@@ -521,6 +565,148 @@ impl SceneRenderer {
                 })],
                 ..Default::default()
             });
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::HashMap;
+
+    use wpe_shader::glslang::{self, Stage};
+    use wpe_shader::{CompiledShader, Reflection};
+
+    use super::*;
+    use crate::material::{Camera, CullMode, Mesh, MeshData, ShaderProgram};
+
+    const BLOCK: &str = "layout(set = 0, binding = 0) uniform Globals {
+        mat4 g_ModelViewProjectionMatrix; vec4 g_Color; };";
+
+    fn flat_program(gpu: &Gpu) -> Arc<ShaderProgram> {
+        let vert = format!(
+            "#version 450\n{BLOCK}\nlayout(location = 0) in vec3 a_Position;\n\
+             void main() {{ gl_Position = g_ModelViewProjectionMatrix * vec4(a_Position, 1.0); }}"
+        );
+        let frag = format!(
+            "#version 450\n{BLOCK}\nlayout(location = 0) out vec4 o;\n\
+             void main() {{ o = g_Color; }}"
+        );
+        let spirv = glslang::compile(&[(Stage::Vertex, &vert), (Stage::Fragment, &frag)])
+            .expect("test shaders compile");
+        let mut reflection = Reflection::default();
+        for (stage, words) in [(Stage::Vertex, &spirv[0]), (Stage::Fragment, &spirv[1])] {
+            let module = wpe_shader::reflect::parse_spirv(words).unwrap();
+            reflection.add_stage(stage, &module).unwrap();
+        }
+        let shader = CompiledShader {
+            info: Default::default(),
+            combos: Default::default(),
+            vertex: spirv[0].clone(),
+            fragment: spirv[1].clone(),
+            reflection,
+        };
+        Arc::new(ShaderProgram::new(gpu, "flat", &shader).unwrap())
+    }
+
+    /// A quad over `x0..x1` × `y0..y1` in clip space at depth `z`.
+    fn quad(x0: f32, x1: f32, y0: f32, y1: f32, z: f32) -> Mesh {
+        Mesh::Triangles(MeshData {
+            vertex_count: 6,
+            attributes: vec![(
+                "a_Position".to_owned(),
+                3,
+                [[x0, y0], [x1, y0], [x1, y1], [x0, y0], [x1, y1], [x0, y1]]
+                    .iter()
+                    .flat_map(|[x, y]| [*x, *y, z])
+                    .collect(),
+            )],
+            indices: None,
+        })
+    }
+
+    fn draw(
+        program: &Arc<ShaderProgram>,
+        mesh: Mesh,
+        color: [f32; 4],
+        raster: RasterState,
+    ) -> Step {
+        Step::Draw {
+            target: TargetId::DEFAULT,
+            draw: Draw::Material(MaterialDraw {
+                program: program.clone(),
+                textures: Vec::new(),
+                constants: HashMap::from([("g_Color".to_owned(), color.to_vec())]),
+                model: Mat4::IDENTITY,
+                mesh,
+                blend: BlendMode::Normal,
+                camera: Camera::Fixed(Mat4::IDENTITY),
+                sprites: Vec::new(),
+                raster,
+            }),
+        }
+    }
+
+    #[test]
+    fn depth_tested_draws_share_a_pass_with_flat_ones() {
+        let instance =
+            wgpu::Instance::new(wgpu::InstanceDescriptor::new_without_display_handle_from_env());
+        let Ok(gpu) = pollster::block_on(Gpu::new(instance, None)) else {
+            eprintln!("no GPU; skipped");
+            return;
+        };
+        let program = flat_program(&gpu);
+        let model = RasterState {
+            depth_test: true,
+            depth_write: true,
+            cull: CullMode::Back,
+        };
+        let behind = RasterState {
+            depth_write: false,
+            ..model
+        };
+        let mut renderer = SceneRenderer::new(&gpu, DEFAULT_FORMAT);
+        renderer.set_frame(
+            &gpu,
+            Vec::new(),
+            vec![
+                // Near red on the left, then far green everywhere: green
+                // only shows on the right.
+                draw(
+                    &program,
+                    quad(-1.0, 0.0, -1.0, 1.0, 0.2),
+                    [1., 0., 0., 1.],
+                    model,
+                ),
+                draw(
+                    &program,
+                    quad(-1.0, 1.0, -1.0, 1.0, 0.6),
+                    [0., 1., 0., 1.],
+                    behind,
+                ),
+                // A flat draw ignores depth: blue over the bottom right.
+                draw(
+                    &program,
+                    quad(0.0, 1.0, -1.0, 0.0, 0.9),
+                    [0., 0., 1., 1.],
+                    RasterState::default(),
+                ),
+                // Clockwise, so culled.
+                draw(
+                    &program,
+                    quad(-1.0, 1.0, 1.0, -1.0, 0.0),
+                    [1., 1., 1., 1.],
+                    model,
+                ),
+            ],
+        );
+        let globals = FrameGlobals::default();
+        for _ in 0..2 {
+            let pixels = renderer.capture(&gpu, globals, (4, 4));
+            let at = |x: usize, y: usize| &pixels[(y * 4 + x) * 4..][..3];
+            assert_eq!(at(0, 0), [255, 0, 0]);
+            assert_eq!(at(1, 3), [255, 0, 0]);
+            assert_eq!(at(3, 0), [0, 255, 0]);
+            assert_eq!(at(3, 3), [0, 0, 255]);
         }
     }
 }

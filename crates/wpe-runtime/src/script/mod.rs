@@ -114,6 +114,7 @@ fn scripted(config: &Value) -> Vec<Scripted<'_>> {
 impl Scripts {
     /// Load every script of the scene, or `None` when it has none. Scripts'
     /// `init` runs here and may already queue [`Self::take_edits`].
+    #[allow(clippy::too_many_arguments)]
     pub fn load(
         assets: &Vfs,
         project: &wpe_assets::Project,
@@ -121,6 +122,7 @@ impl Scripts {
         canvas: Vec2,
         clocks: SharedClocks,
         bones: SharedBones,
+        model_data: crate::model_data::SharedModelDatas,
         storage: Option<Value>,
     ) -> Option<Self> {
         let scripts: Vec<_> = view.objects.iter().map(scripted).collect();
@@ -153,6 +155,7 @@ impl Scripts {
         host.general = view.general.clone();
         host.clocks = clocks;
         host.bones = bones;
+        host.model_data = model_data;
         for obj in &view.doc.objects {
             let Some(c) = obj.common() else { continue };
             let steps = view.steps.get(&c.id).cloned().unwrap_or_default();

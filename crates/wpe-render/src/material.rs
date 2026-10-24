@@ -142,17 +142,18 @@ impl ShaderProgram {
         })
     }
 
-    fn pipeline(
-        &self,
-        device: &wgpu::Device,
-        blend: BlendMode,
-        format: wgpu::TextureFormat,
-        topology: wgpu::PrimitiveTopology,
-    ) -> Option<wgpu::RenderPipeline> {
+    fn pipeline(&self, device: &wgpu::Device, key: PipelineKey) -> Option<wgpu::RenderPipeline> {
         let mut pipelines = self.pipelines.lock().unwrap_or_else(|e| e.into_inner());
         pipelines
-            .entry((blend, format, topology))
+            .entry(key)
             .or_insert_with(|| {
+                let PipelineKey {
+                    blend,
+                    format,
+                    topology,
+                    cull,
+                    depth,
+                } = key;
                 let scope = device.push_error_scope(wgpu::ErrorFilter::Validation);
                 let pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
                     label: Some("material"),
@@ -169,9 +170,10 @@ impl ShaderProgram {
                     },
                     primitive: wgpu::PrimitiveState {
                         topology,
+                        cull_mode: cull.face(),
                         ..Default::default()
                     },
-                    depth_stencil: None,
+                    depth_stencil: depth.state(),
                     multisample: Default::default(),
                     fragment: Some(wgpu::FragmentState {
                         module: &self.fragment,
@@ -198,7 +200,111 @@ impl ShaderProgram {
     }
 }
 
-type PipelineKey = (BlendMode, wgpu::TextureFormat, wgpu::PrimitiveTopology);
+/// Everything a material pipeline varies by besides its program.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+struct PipelineKey {
+    blend: BlendMode,
+    format: wgpu::TextureFormat,
+    topology: wgpu::PrimitiveTopology,
+    cull: CullMode,
+    depth: PassDepth,
+}
+
+/// Format of the depth buffers 3D draws test against.
+pub(crate) const DEPTH_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Depth32Float;
+
+/// Which triangles a draw skips, by winding (counter-clockwise is front, as
+/// in OpenGL). Materials say `"cullmode": "nocull" | "normal" | "back" | "front"`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
+pub enum CullMode {
+    #[default]
+    None,
+    Back,
+    Front,
+}
+
+impl CullMode {
+    /// A material's `cullmode`; `"normal"` culls back faces and anything
+    /// unknown culls nothing.
+    pub fn parse(value: &str) -> Self {
+        match value {
+            "normal" | "back" => Self::Back,
+            "front" => Self::Front,
+            _ => Self::None,
+        }
+    }
+
+    fn face(self) -> Option<wgpu::Face> {
+        match self {
+            Self::None => None,
+            Self::Back => Some(wgpu::Face::Back),
+            Self::Front => Some(wgpu::Face::Front),
+        }
+    }
+}
+
+/// Depth and culling state of a draw. The default (no depth, no culling) is
+/// how every 2D layer draws.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
+pub struct RasterState {
+    /// Skip fragments behind what is already drawn (`depthtest`).
+    pub depth_test: bool,
+    /// Record this draw's depth for later draws (`depthwrite`).
+    pub depth_write: bool,
+    pub cull: CullMode,
+}
+
+impl RasterState {
+    /// Whether the draw needs a depth buffer on its target.
+    pub fn uses_depth(&self) -> bool {
+        self.depth_test || self.depth_write
+    }
+}
+
+/// The depth state a pipeline is built with: from its draw, and whether the
+/// pass it is recorded in has a depth attachment. Every pipeline in a pass
+/// with one must declare it, so draws without depth get an always-pass,
+/// no-write state there.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
+pub(crate) enum PassDepth {
+    /// The pass has no depth attachment.
+    #[default]
+    None,
+    Attached {
+        test: bool,
+        write: bool,
+    },
+}
+
+impl PassDepth {
+    pub(crate) fn new(raster: RasterState, attached: bool) -> Self {
+        if attached {
+            Self::Attached {
+                test: raster.depth_test,
+                write: raster.depth_write,
+            }
+        } else {
+            Self::None
+        }
+    }
+
+    pub(crate) fn state(self) -> Option<wgpu::DepthStencilState> {
+        let Self::Attached { test, write } = self else {
+            return None;
+        };
+        Some(wgpu::DepthStencilState {
+            format: DEPTH_FORMAT,
+            depth_write_enabled: Some(write),
+            depth_compare: Some(if test {
+                wgpu::CompareFunction::LessEqual
+            } else {
+                wgpu::CompareFunction::Always
+            }),
+            stencil: Default::default(),
+            bias: Default::default(),
+        })
+    }
+}
 
 /// Named per-vertex attribute streams, matched to shader inputs by name
 /// (`a_Position`, `a_TexCoord`, ...), drawn as an indexed or plain triangle list.
@@ -309,12 +415,22 @@ impl UniformBlock {
         } else {
             member.size as usize
         };
+        // A `vec3` array may be given as `vec4`s (a fourth value per element
+        // that other shaders declaring `vec4` read), which is then skipped.
+        let given = if ty.rows == 3 && ty.columns == 1 && values.len() == ty.count as usize * 4 {
+            4
+        } else {
+            per_element.max(1)
+        };
         for (i, v) in values.iter().enumerate() {
-            let elem = i / per_element.max(1);
+            let elem = i / given;
             if elem >= ty.count as usize {
                 break;
             }
-            let within = i % per_element.max(1);
+            let within = i % given;
+            if within >= per_element {
+                continue;
+            }
             let (col, row) = (within / ty.rows as usize, within % ty.rows as usize);
             let at = member.offset as usize
                 + elem * elem_stride
@@ -335,7 +451,7 @@ impl UniformBlock {
 }
 
 /// Values every material may read, refreshed each frame.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, Default)]
 pub struct FrameGlobals {
     pub time: f32,
     /// Fraction of the day elapsed, 0..1.
@@ -347,6 +463,13 @@ pub struct FrameGlobals {
     /// Size of the output being drawn into.
     pub screen: Vec2,
     pub eye: Vec3,
+    /// View-projection of the scene's perspective camera ([`Camera::Perspective`]).
+    pub perspective: Mat4,
+    /// Its view and projection halves, for programs that declare them.
+    pub perspective_view: Mat4,
+    pub perspective_proj: Mat4,
+    /// Its position in world space (`g_EyePosition`).
+    pub perspective_eye: Vec3,
 }
 
 /// Where a texture slot's image comes from.
@@ -403,6 +526,52 @@ pub enum Camera {
     Scene,
     /// A fixed matrix (layer-local or effect cameras).
     Fixed(Mat4),
+    /// The scene's perspective camera (3D models), from
+    /// [`FrameGlobals::perspective`].
+    Perspective,
+}
+
+/// A draw's camera resolved for one frame.
+struct View {
+    view: Mat4,
+    proj: Mat4,
+    view_proj: Mat4,
+    eye: Vec3,
+}
+
+impl Camera {
+    /// Orthographic cameras have no separate view: it is the identity and
+    /// the projection is the whole matrix.
+    fn resolve(self, globals: &FrameGlobals) -> View {
+        let flat = |m: Mat4| View {
+            view: Mat4::IDENTITY,
+            proj: m,
+            view_proj: m,
+            eye: globals.eye,
+        };
+        match self {
+            Self::Scene => flat(globals.view_proj),
+            Self::Fixed(m) => flat(m),
+            Self::Perspective => View {
+                view: globals.perspective_view,
+                proj: globals.perspective_proj,
+                view_proj: globals.perspective,
+                eye: globals.perspective_eye,
+            },
+        }
+    }
+}
+
+/// Inverse transpose of `model`'s linear part, scaled back to unit
+/// determinant: normals follow a non-uniform scale's shape but not its size,
+/// so the tangents stock shaders never renormalize keep their length.
+fn normal_matrix(model: Mat4) -> Mat3 {
+    let linear = Mat3::from_mat4(model);
+    let det = linear.determinant();
+    if det.abs() <= 1e-12 {
+        return linear;
+    }
+    linear.inverse().transpose() * det.abs().cbrt()
 }
 
 /// One draw with a compiled program.
@@ -417,6 +586,8 @@ pub struct MaterialDraw {
     pub blend: BlendMode,
     pub camera: Camera,
     pub sprites: Vec<SpriteAnimation>,
+    /// Depth testing/writing and face culling.
+    pub raster: RasterState,
 }
 
 pub(crate) struct PreparedMaterialDraw {
@@ -651,25 +822,37 @@ impl PreparedMaterialDraw {
         let Some(buffer) = &self.uniforms else { return };
         let r = &self.draw.program.reflection;
         let model = self.draw.model;
-        let view_proj = match self.draw.camera {
-            Camera::Scene => globals.view_proj,
-            Camera::Fixed(m) => m,
-        };
+        let camera = self.draw.camera.resolve(globals);
+        let view_proj = camera.view_proj;
         let mvp = view_proj * model;
+        let perspective = matches!(self.draw.camera, Camera::Perspective);
+        // 2D layers keep the plain inverse transpose they always had.
+        let normal = if perspective {
+            normal_matrix(model)
+        } else {
+            Mat3::from_mat4(model.inverse().transpose())
+        };
         let mat4 = |m: Mat4| m.to_cols_array().to_vec();
         let mat3 = |m: Mat3| m.to_cols_array().to_vec();
-        let values: [(&str, Vec<f32>); 16] = [
+        let values: [(&str, Vec<f32>); 23] = [
             ("g_ModelViewProjectionMatrix", mat4(mvp)),
             ("g_ModelViewProjectionMatrixInverse", mat4(mvp.inverse())),
             ("g_ModelMatrix", mat4(model)),
             ("g_ModelMatrixInverse", mat4(model.inverse())),
             ("g_AltModelMatrix", mat4(model)),
             ("g_ViewProjectionMatrix", mat4(view_proj)),
+            ("g_ViewProjectionMatrixInverse", mat4(view_proj.inverse())),
             ("g_AltViewProjectionMatrix", mat4(view_proj)),
+            ("g_ViewMatrix", mat4(camera.view)),
+            ("g_ViewMatrixInverse", mat4(camera.view.inverse())),
+            ("g_ProjectionMatrix", mat4(camera.proj)),
+            ("g_ProjectionMatrixInverse", mat4(camera.proj.inverse())),
+            ("g_ModelViewMatrix", mat4(camera.view * model)),
             (
-                "g_NormalModelMatrix",
-                mat3(Mat3::from_mat4(model.inverse().transpose())),
+                "g_ModelViewMatrixInverse",
+                mat4((camera.view * model).inverse()),
             ),
+            ("g_NormalModelMatrix", mat3(normal)),
             ("g_Time", vec![globals.time]),
             ("g_DayTime", vec![globals.daytime]),
             ("g_PointerPosition", globals.pointer.to_array().to_vec()),
@@ -690,11 +873,26 @@ impl PreparedMaterialDraw {
                     globals.screen.x / globals.screen.y,
                 ],
             ),
-            ("g_EyePosition", globals.eye.to_array().to_vec()),
+            ("g_EyePosition", camera.eye.to_array().to_vec()),
         ];
         for (name, v) in values {
             if let Some(member) = r.uniforms.get(name) {
                 self.block.write(member, &v);
+            }
+        }
+        // The camera's axes in world space (billboards, rim lighting). Other
+        // cameras leave them to the draw's constants (particles set them).
+        if perspective {
+            let rows = camera.view.transpose();
+            for (name, axis) in [
+                ("g_ViewRight", rows.x_axis),
+                ("g_ViewUp", rows.y_axis),
+                ("g_ViewForward", -rows.z_axis),
+            ] {
+                if let Some(member) = r.uniforms.get(name) {
+                    self.block
+                        .write(member, &axis.truncate().normalize_or_zero().to_array());
+                }
             }
         }
         for name in [
@@ -724,11 +922,14 @@ impl PreparedMaterialDraw {
         gpu.queue.write_buffer(buffer, 0, &self.block.data);
     }
 
+    /// Draw into `pass`, whose colour attachment is `format`;
+    /// `depth_attached` when it has a depth attachment too.
     pub fn record(
         &self,
         device: &wgpu::Device,
         pass: &mut wgpu::RenderPass,
         format: wgpu::TextureFormat,
+        depth_attached: bool,
     ) {
         let Some((_, group)) = &self.bind_group else {
             return;
@@ -736,12 +937,14 @@ impl PreparedMaterialDraw {
         let Some(geometry) = &self.geometry else {
             return;
         };
-        let topology = self.draw.mesh.topology();
-        let Some(pipeline) = self
-            .draw
-            .program
-            .pipeline(device, self.draw.blend, format, topology)
-        else {
+        let key = PipelineKey {
+            blend: self.draw.blend,
+            format,
+            topology: self.draw.mesh.topology(),
+            cull: self.draw.raster.cull,
+            depth: PassDepth::new(self.draw.raster, depth_attached),
+        };
+        let Some(pipeline) = self.draw.program.pipeline(device, key) else {
             return;
         };
         pass.set_pipeline(&pipeline);
@@ -924,5 +1127,93 @@ mod tests {
         let mut b = UniformBlock::new(32);
         b.write(&member(0, 1, 1, 2, 16), &[5.0, 6.0]);
         assert_eq!(floats(&b), [5., 0., 0., 0., 6., 0., 0., 0.]);
+
+        // `vec3[2]` given as `vec4`s: the fourth values are skipped.
+        let mut b = UniformBlock::new(32);
+        b.write(&member(0, 3, 1, 2, 16), &[1., 2., 3., 9., 4., 5., 6., 9.]);
+        assert_eq!(floats(&b), [1., 2., 3., 0., 4., 5., 6., 0.]);
+    }
+
+    #[test]
+    fn parses_cull_modes() {
+        assert_eq!(CullMode::parse("nocull"), CullMode::None);
+        assert_eq!(CullMode::parse("normal"), CullMode::Back);
+        assert_eq!(CullMode::parse("back"), CullMode::Back);
+        assert_eq!(CullMode::parse("front"), CullMode::Front);
+        assert_eq!(CullMode::parse("weird"), CullMode::None);
+    }
+
+    #[test]
+    fn pass_depth_keys_and_states() {
+        let flat = RasterState::default();
+        let model = RasterState {
+            depth_test: true,
+            depth_write: true,
+            cull: CullMode::Back,
+        };
+        assert!(!flat.uses_depth() && model.uses_depth());
+
+        // Without an attachment nothing declares depth, as before.
+        assert_eq!(PassDepth::new(model, false), PassDepth::None);
+        assert!(PassDepth::None.state().is_none());
+
+        // In a depth pass a 2D draw passes always and writes nothing.
+        let state = PassDepth::new(flat, true).state().unwrap();
+        assert_eq!(state.format, DEPTH_FORMAT);
+        assert_eq!(state.depth_compare, Some(wgpu::CompareFunction::Always));
+        assert_eq!(state.depth_write_enabled, Some(false));
+        let state = PassDepth::new(model, true).state().unwrap();
+        assert_eq!(state.depth_compare, Some(wgpu::CompareFunction::LessEqual));
+        assert_eq!(state.depth_write_enabled, Some(true));
+
+        let key = |cull, depth| PipelineKey {
+            blend: BlendMode::Normal,
+            format: wgpu::TextureFormat::Rgba8Unorm,
+            topology: wgpu::PrimitiveTopology::TriangleList,
+            cull,
+            depth,
+        };
+        let base = key(CullMode::None, PassDepth::None);
+        assert_ne!(base, key(CullMode::Back, PassDepth::None));
+        assert_ne!(base, key(CullMode::None, PassDepth::new(flat, true)));
+        assert_ne!(
+            key(CullMode::None, PassDepth::new(flat, true)),
+            key(CullMode::None, PassDepth::new(model, true))
+        );
+    }
+
+    #[test]
+    fn perspective_camera_resolves_from_globals() {
+        let view = Mat4::from_translation(Vec3::new(0.0, 0.0, -5.0));
+        let proj = Mat4::from_scale(Vec3::new(1.5, 1.0, -0.5));
+        let globals = FrameGlobals {
+            view_proj: Mat4::from_scale(Vec3::splat(2.0)),
+            eye: Vec3::new(1.0, 2.0, 3.0),
+            perspective: proj * view,
+            perspective_view: view,
+            perspective_proj: proj,
+            perspective_eye: Vec3::new(0.0, 0.0, 5.0),
+            ..Default::default()
+        };
+        let v = Camera::Perspective.resolve(&globals);
+        assert_eq!(v.view_proj, proj * view);
+        assert_eq!((v.view, v.proj), (view, proj));
+        assert_eq!(v.eye, globals.perspective_eye);
+
+        let v = Camera::Scene.resolve(&globals);
+        assert_eq!((v.view, v.proj), (Mat4::IDENTITY, globals.view_proj));
+        assert_eq!(v.eye, globals.eye);
+    }
+
+    #[test]
+    fn normal_matrix_has_unit_determinant() {
+        let model = Mat4::from_scale(Vec3::new(2.0, 4.0, 8.0));
+        let n = normal_matrix(model);
+        assert!((n.determinant() - 1.0).abs() < 1e-5);
+        // Shape of the inverse scale: x stretched most.
+        assert!((n.x_axis.x / n.z_axis.z - 4.0).abs() < 1e-5);
+        // A flattened model stays finite.
+        let flat = normal_matrix(Mat4::from_scale(Vec3::new(1.0, 1.0, 0.0)));
+        assert!(flat.to_cols_array().iter().all(|v| v.is_finite()));
     }
 }

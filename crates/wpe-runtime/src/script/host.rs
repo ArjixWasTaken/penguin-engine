@@ -307,7 +307,8 @@ fn scene_json(v: &ScriptValue) -> Value {
 fn layout_default(property: &str) -> Option<ScriptValue> {
     Some(match property {
         "alignment" => ScriptValue::String("center".into()),
-        "perspective" => ScriptValue::Bool(false),
+        "perspective" | "rootmotion" => ScriptValue::Bool(false),
+        "fov" => ScriptValue::Number(50.0),
         "parallaxDepth" => ScriptValue::Vec2([0.0, 0.0]),
         "horizontalalign" | "verticalalign" => ScriptValue::String("center".into()),
         "anchor" => ScriptValue::String("none".into()),
@@ -351,6 +352,8 @@ fn new_layer_config(config: &Value) -> Option<Value> {
         Value::String(path) => {
             let key = if path.starts_with("particles/") {
                 "particle"
+            } else if path.ends_with(".mdl") || path.starts_with(crate::model_data::PREFIX) {
+                "model"
             } else {
                 "image"
             };
@@ -427,6 +430,8 @@ pub struct ScriptHost {
     /// Animation clocks and puppet bones, shared with the frame's bindings.
     pub clocks: SharedClocks,
     pub bones: SharedBones,
+    /// Script geometry (`createModelData`), shared with the frame.
+    pub model_data: crate::model_data::SharedModelDatas,
     pub audit: Option<Audit>,
 }
 
@@ -456,6 +461,7 @@ impl ScriptHost {
             particle_commands: Vec::new(),
             clocks: Default::default(),
             bones: Default::default(),
+            model_data: Default::default(),
             audit: Audit::from_env(),
         }
     }
@@ -1470,6 +1476,28 @@ impl SceneHost for ScriptHost {
             key: "attachment".to_owned(),
             value: attachment.map_or(Value::Null, Value::from),
         });
+    }
+
+    fn model_data(&mut self, op: &str, id: i32, data: &Value) -> Option<i32> {
+        let result = self.model_data.borrow_mut().call(op, id, data);
+        if op == "replace" {
+            // New layouts or materials need the layers drawing it rebuilt.
+            let model = Value::from(format!("{}{id}", crate::model_data::PREFIX));
+            let users: Vec<i32> = self
+                .layers
+                .iter()
+                .filter(|l| l.config.get("model") == Some(&model))
+                .map(|l| l.info.id)
+                .collect();
+            for layer in users {
+                self.edits.push(SceneEdit::Set {
+                    id: layer,
+                    key: "model".to_owned(),
+                    value: model.clone(),
+                });
+            }
+        }
+        result
     }
 
     fn open_user_shortcut(&mut self, name: &str) -> bool {

@@ -1,5 +1,7 @@
 use std::collections::HashMap;
 
+use crate::material::PassDepth;
+
 /// How a layer's output is combined with what is already in its target.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
 pub enum BlendMode {
@@ -47,13 +49,14 @@ pub(crate) struct ImageUniforms {
     pub size_uv: [f32; 4],
 }
 
-/// Pipelines for the built-in image shader, one per blend mode.
+/// Pipelines for the built-in image shader, one per blend mode and pass
+/// depth state.
 pub(crate) struct ImagePipelines {
     pub layout: wgpu::BindGroupLayout,
     module: wgpu::ShaderModule,
     pipeline_layout: wgpu::PipelineLayout,
     target_format: wgpu::TextureFormat,
-    pipelines: HashMap<BlendMode, wgpu::RenderPipeline>,
+    pipelines: HashMap<(BlendMode, PassDepth), wgpu::RenderPipeline>,
 }
 
 impl ImagePipelines {
@@ -104,12 +107,15 @@ impl ImagePipelines {
         }
     }
 
-    pub fn cached(&self, blend: BlendMode) -> Option<&wgpu::RenderPipeline> {
-        self.pipelines.get(&blend)
-    }
-
-    pub fn get(&mut self, device: &wgpu::Device, blend: BlendMode) -> &wgpu::RenderPipeline {
-        self.pipelines.entry(blend).or_insert_with(|| {
+    /// The pipeline for `blend` in a pass with `depth` (images never test
+    /// or write depth, but must match the pass's attachment).
+    pub fn get(
+        &mut self,
+        device: &wgpu::Device,
+        blend: BlendMode,
+        depth: PassDepth,
+    ) -> wgpu::RenderPipeline {
+        let pipeline = self.pipelines.entry((blend, depth)).or_insert_with(|| {
             device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
                 label: Some("image"),
                 layout: Some(&self.pipeline_layout),
@@ -123,7 +129,7 @@ impl ImagePipelines {
                     topology: wgpu::PrimitiveTopology::TriangleStrip,
                     ..Default::default()
                 },
-                depth_stencil: None,
+                depth_stencil: depth.state(),
                 multisample: Default::default(),
                 fragment: Some(wgpu::FragmentState {
                     module: &self.module,
@@ -138,6 +144,7 @@ impl ImagePipelines {
                 multiview_mask: None,
                 cache: None,
             })
-        })
+        });
+        pipeline.clone()
     }
 }

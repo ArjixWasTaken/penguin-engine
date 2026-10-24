@@ -15,6 +15,8 @@ struct MockHost {
     /// Layer 1 has a video; calls made on it.
     video_calls: Vec<(String, Vec<ScriptValue>)>,
     storage: Option<serde_json::Value>,
+    /// `createModelData` calls: operation, id and data.
+    model_data: Vec<(String, i32, serde_json::Value)>,
 }
 
 impl MockHost {
@@ -78,6 +80,10 @@ impl SceneHost for MockHost {
             "duration" => Some(ScriptValue::Number(8.0)),
             _ => None,
         }
+    }
+    fn model_data(&mut self, op: &str, id: i32, data: &serde_json::Value) -> Option<i32> {
+        self.model_data.push((op.to_owned(), id, data.clone()));
+        Some(if op == "create" { 7 } else { id })
     }
     fn storage_changed(&mut self, data: &serde_json::Value) {
         self.storage = Some(data.clone());
@@ -674,4 +680,68 @@ fn local_storage_persists_through_the_host() {
     );
     rt.update(&mut host, 0.0, 0.016, None);
     assert_eq!(host.prop(1, "text"), Some(&ScriptValue::String("2".into())));
+}
+
+#[test]
+fn model_data_crosses_as_plain_arrays() {
+    let mut host = MockHost::with_layers(&["a"]);
+    let mut rt = ScriptRuntime::new().unwrap();
+    let src = r#"
+        let data;
+        export function init() {
+            data = thisScene.createModelData({ shapes: [{
+                vertexFormat: [IModelData.POSITION, IModelData.UV],
+                vertexBuffer: new Float32Array([0, 0, 0, 0, 1, 1, 0, 0, 1, 0, 0, 1, 0, 0, 1]),
+                indexBuffer: new Uint16Array([0, 1, 2]),
+                material: engine.registerAsset('materials/x.json'),
+            }] });
+            thisScene.createLayer({ model: data, perspective: true });
+            thisScene.createLayer(data);
+        }
+        export function update(v) {
+            data.applyData({ vertexBuffer: new Float32Array([2, 0, 0, 0, 1]) });
+            let threw = false;
+            try { data.replaceData([]); } catch (e) { threw = true; }
+            return threw;
+        }
+    "#;
+    add(
+        &mut rt,
+        &mut host,
+        1,
+        "visible",
+        src,
+        None,
+        ScriptValue::Bool(false),
+    );
+    rt.update(&mut host, 0.0, 0.016, None);
+    assert!(rt.take_failures().is_empty());
+    let (op, _, data) = &host.model_data[0];
+    assert_eq!(op, "create");
+    assert_eq!(
+        data["shapes"][0],
+        json!({
+            "vertexFormat": ["position", "uv"],
+            "vertexBuffer": [0, 0, 0, 0, 1, 1, 0, 0, 1, 0, 0, 1, 0, 0, 1],
+            "indexBuffer": [0, 1, 2],
+            "material": "materials/x.json",
+        })
+    );
+    assert_eq!(
+        host.created[0],
+        json!({ "model": "modeldata:7", "perspective": true })
+    );
+    assert_eq!(host.created[1], json!({ "model": "modeldata:7" }));
+    assert_eq!(host.model_data[1].0, "apply");
+    assert_eq!(host.model_data[1].1, 7);
+    assert_eq!(
+        host.model_data[1].2["shapes"][0]["vertexBuffer"],
+        json!([2, 0, 0, 0, 1])
+    );
+    assert_eq!(
+        host.model_data.len(),
+        2,
+        "replaceData refused inside update"
+    );
+    assert_eq!(host.prop(1, "visible"), Some(&ScriptValue::Bool(true)));
 }

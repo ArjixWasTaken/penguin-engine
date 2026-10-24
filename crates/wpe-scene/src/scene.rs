@@ -3,21 +3,33 @@ use std::collections::HashMap;
 use glam::{Mat4, Vec2, Vec3};
 use wpe_assets::material::{Material, MaterialPass, PassOverride};
 use wpe_assets::scene::{
-    ImageEffect, ImageObject, ObjectCommon, ParticleObject, SceneObject, TextObject,
+    GroupObject, ImageEffect, ImageObject, LightObject, ModelObject, ObjectCommon, ParticleObject,
+    SceneObject, TextObject,
 };
 use wpe_assets::{AssetError, ImageModel, load_json};
 
 use crate::AnimationTime;
 use wpe_vfs::Vfs;
 
-use crate::{Animation, OrthoCamera, UserProperties, alignment_offset, local_transform};
+use crate::{
+    Animation, LightKind, LightUniforms, OrthoCamera, PerspectiveCamera, SceneLight,
+    UserProperties, alignment_offset, light_uniforms, local_transform,
+};
 
 const DEFAULT_ORTHO: Vec2 = Vec2::new(1920.0, 1080.0);
 
 /// A scene resolved from its JSON: camera, clear colour and drawable layers.
 #[derive(Debug, Clone)]
 pub struct Scene {
+    /// The flat camera image layers draw with. In 3D scenes it is the overlay
+    /// for flat layers, sized to `orthogonalprojection` (1920×1080 when absent).
     pub camera: OrthoCamera,
+    /// `general.orthogonalprojection` is null or absent: models and
+    /// `perspective` layers draw with [`Scene::perspective`].
+    pub is_3d: bool,
+    /// 3D scenes' camera, or 2D scenes' `"global_perspective"` one for
+    /// `perspective` layers (lined up with `camera` on the z = 0 plane).
+    pub perspective: PerspectiveCamera,
     pub clear_color: Vec3,
     /// Scene-wide bloom post-processing, when enabled.
     pub bloom: Option<Bloom>,
@@ -30,6 +42,58 @@ pub struct Scene {
     pub layers: Vec<ImageLayer>,
     /// Each group's own visibility (hidden groups hide their descendants).
     pub groups: HashMap<i32, bool>,
+    /// 3D model objects, in object order.
+    pub models: Vec<ModelLayer>,
+    /// Image, text and particle layers and models interleaved in draw order
+    /// (back to front): scene object order.
+    pub draw_order: Vec<DrawItem>,
+    /// Light objects, in object order (hidden ones included).
+    pub lights: Vec<SceneLight>,
+    /// `general.ambientcolor` and `general.skylightcolor`.
+    pub ambient_color: Vec3,
+    pub skylight_color: Vec3,
+}
+
+/// One entry of [`Scene::draw_order`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DrawItem {
+    /// Index into [`Scene::layers`].
+    Layer(usize),
+    /// Index into [`Scene::models`].
+    Model(usize),
+}
+
+/// A 3D model object.
+#[derive(Debug, Clone)]
+pub struct ModelLayer {
+    pub id: i32,
+    pub name: String,
+    /// The object's `model` path as written.
+    pub model: String,
+    /// The `.mdl` it resolves to (see [`wpe_assets::model::model_mdl_path`]).
+    pub mdl: Option<String>,
+    /// The model and all its ancestors are visible.
+    pub visible: bool,
+    /// The model's own flag, ancestors aside.
+    pub self_visible: bool,
+    /// No ancestor group is hidden.
+    pub ancestors_visible: bool,
+    /// World transform: parent chain · translate · Rz · Ry · Rx · scale.
+    pub transform: Mat4,
+    /// What `transform` is made of, for animation.
+    pub motion: Motion,
+    /// Parent object, and the parent puppet's attachment point this model
+    /// rigs to (`attachment`).
+    pub parent: Option<i32>,
+    pub attachment: Option<String>,
+    pub parallax_depth: Vec2,
+    /// Draw with the perspective camera (always in 3D scenes).
+    pub perspective: bool,
+    /// The object's `animationlayers`, for skinned models.
+    pub animation_layers: Vec<serde_json::Value>,
+    /// Position in the scene's object list, the draw-order key shared with
+    /// [`ImageLayer::object_index`].
+    pub object_index: usize,
 }
 
 /// Wallpaper Engine's legacy (LDR) bloom settings.
@@ -116,6 +180,11 @@ pub struct ImageLayer {
     /// Puppet `.mdl` deforming the image, and the object's animation layers.
     pub puppet: Option<String>,
     pub animation_layers: Vec<serde_json::Value>,
+    /// Draw with [`Scene::perspective`] rather than the flat camera.
+    pub perspective: bool,
+    /// Position in the scene's object list, the draw-order key shared with
+    /// [`ModelLayer::object_index`].
+    pub object_index: usize,
 }
 
 /// A particle object's definition path and `instanceoverride`.
@@ -295,11 +364,10 @@ impl Scene {
                 .filter_map(|(_, _, l)| l.size)
                 .max_by(|a, b| (a.x * a.y).total_cmp(&(b.x * b.y)))
                 .unwrap_or(DEFAULT_ORTHO),
-            None => {
-                tracing::warn!("perspective scenes are not supported yet; using a flat camera");
-                DEFAULT_ORTHO
-            }
+            // 3D scene: flat layers keep WE's default projection size.
+            None => DEFAULT_ORTHO,
         };
+        let is_3d = general.orthogonalprojection.is_none();
 
         let mut layers: Vec<(usize, ImageLayer)> = images
             .into_iter()
@@ -373,27 +441,61 @@ impl Scene {
                     particle: None,
                     puppet: loaded.puppet,
                     animation_layers: img.animationlayers.clone(),
+                    perspective: img.perspective,
+                    object_index: index,
                 };
                 (index, layer)
             })
             .collect();
+        let mut models = Vec::new();
+        let mut lights = Vec::new();
         for (index, obj) in scene.objects.iter().enumerate() {
             match obj {
                 SceneObject::Text(text) => layers.push((index, text_layer(&nodes, props, text))),
                 SceneObject::Particle(p) if !p.particle.is_empty() => {
                     layers.push((index, particle_layer(&nodes, props, p)))
                 }
+                SceneObject::Model(m) => models.push(model_layer(vfs, &nodes, props, m, index)),
+                SceneObject::Light(l) => lights.push(scene_light(&nodes, props, l)),
                 _ => {}
             }
         }
         layers.sort_by_key(|(index, _)| *index);
-        let layers = layers.into_iter().map(|(_, l)| l).collect();
+        let layers: Vec<ImageLayer> = layers
+            .into_iter()
+            .map(|(index, mut l)| {
+                l.object_index = index;
+                l
+            })
+            .collect();
+        let mut draw_order: Vec<(usize, DrawItem)> = layers
+            .iter()
+            .enumerate()
+            .map(|(i, l)| (l.object_index, DrawItem::Layer(i)))
+            .chain(
+                models
+                    .iter()
+                    .enumerate()
+                    .map(|(i, m): (usize, &ModelLayer)| (m.object_index, DrawItem::Model(i))),
+            )
+            .collect();
+        draw_order.sort_by_key(|(index, _)| *index);
+
+        let camera = OrthoCamera {
+            scene_size: ortho,
+            zoom: props.value(&general.zoom),
+        };
+        let (near, far) = (props.value(&general.nearz), props.value(&general.farz));
+        let perspective = if is_3d {
+            scene_camera(scene, &nodes, props, near, far)
+        } else {
+            PerspectiveCamera::global_perspective(camera, near, far)
+        };
 
         Self {
-            camera: OrthoCamera {
-                scene_size: ortho,
-                zoom: props.value(&general.zoom),
-            },
+            camera,
+            is_3d,
+            perspective,
             clear_color: vec3(*props.value(&general.clearcolor)),
             parallax: props.flag(&general.cameraparallax).then(|| Parallax {
                 amount: props.value(&general.cameraparallaxamount),
@@ -416,8 +518,170 @@ impl Scene {
                 .map(|(&id, n)| (id, props.flag(&n.common.visible)))
                 .collect(),
             layers,
+            models,
+            draw_order: draw_order.into_iter().map(|(_, d)| d).collect(),
+            lights,
+            ambient_color: vec3(*props.value(&general.ambientcolor)),
+            skylight_color: vec3(*props.value(&general.skylightcolor)),
         }
     }
+
+    /// [`light_uniforms`] of the scene's lights and ambient colours.
+    pub fn light_uniforms(&self) -> LightUniforms {
+        light_uniforms(&self.lights, self.ambient_color, self.skylight_color)
+    }
+}
+
+/// A camera object: a bare node carrying `"camera": "<name>"`. Wallpaper
+/// Engine keeps the runtime camera there; the scene's `camera` block is the
+/// editor's saved viewport and may sit elsewhere.
+fn camera_object(scene: &wpe_assets::Scene) -> Option<&GroupObject> {
+    scene.objects.iter().find_map(|obj| match obj {
+        SceneObject::Group(g) if g.extra.get("camera").is_some_and(|v| v.is_string()) => Some(&**g),
+        _ => None,
+    })
+}
+
+/// A 3D scene's camera: the camera object's placement and fov when there is
+/// one, else the scene's `camera` block with `perspectiveoverridefov` or `fov`.
+fn scene_camera(
+    scene: &wpe_assets::Scene,
+    nodes: &HashMap<i32, Node>,
+    props: &UserProperties,
+    near: f32,
+    far: f32,
+) -> PerspectiveCamera {
+    let general = &scene.general;
+    let scene_fov = general
+        .perspectiveoverridefov
+        .as_ref()
+        .map(|f| props.value(f))
+        .filter(|&f| f > 0.0)
+        .unwrap_or_else(|| props.value(&general.fov));
+    let mut camera = PerspectiveCamera {
+        eye: vec3(*scene.camera.eye),
+        center: vec3(*scene.camera.center),
+        up: vec3(*scene.camera.up),
+        fov: scene_fov,
+        near,
+        far,
+        fit: None,
+    };
+    if let Some(obj) = camera_object(scene) {
+        let c = &obj.common;
+        // Orientation only: the object's scale must not skew the basis.
+        let world = parent_transform(nodes, props, c.parent, 0)
+            * local_transform(
+                vec3(*props.value(&c.origin)),
+                Vec3::ONE,
+                vec3(*props.value(&c.angles)),
+            );
+        camera.eye = world.transform_point3(Vec3::ZERO);
+        camera.center = camera.eye + world.transform_vector3(-Vec3::Z).normalize_or(-Vec3::Z);
+        camera.up = world.transform_vector3(Vec3::Y).normalize_or(Vec3::Y);
+        if let Some(fov) = obj
+            .extra
+            .get("fov")
+            .and_then(|v| v.as_f64())
+            .filter(|&f| f > 0.0)
+        {
+            camera.fov = fov as f32;
+        }
+    }
+    camera
+}
+
+fn model_layer(
+    vfs: &Vfs,
+    nodes: &HashMap<i32, Node>,
+    props: &UserProperties,
+    m: &ModelObject,
+    object_index: usize,
+) -> ModelLayer {
+    let common = &m.common;
+    let anim = |a: &Option<serde_json::Value>| a.as_ref().and_then(Animation::parse);
+    let motion = Motion {
+        parent: parent_transform(nodes, props, common.parent, 0),
+        origin: vec3(*props.value(&common.origin)),
+        scale: vec3(*props.value(&common.scale)),
+        angles: vec3(*props.value(&common.angles)),
+        origin_animation: anim(&common.origin.animation),
+        scale_animation: anim(&common.scale.animation),
+        angles_animation: anim(&common.angles.animation),
+        ..Default::default()
+    };
+    // Script geometry (`createModelData`) has no file behind it.
+    let scripted = m.model.starts_with("modeldata:");
+    let mdl = (!scripted)
+        .then(|| wpe_assets::model::model_mdl_path(&m.model, |p| vfs.read(p).ok().map(Vec::from)))
+        .flatten();
+    if mdl.is_none() && !scripted {
+        tracing::warn!("model {:?}: no mesh for {:?}", common.name, m.model);
+    }
+    ModelLayer {
+        id: common.id,
+        name: common.name.clone(),
+        model: m.model.clone(),
+        mdl,
+        visible: is_visible(nodes, props, common.id),
+        self_visible: props.flag(&common.visible),
+        ancestors_visible: ancestors_visible(nodes, props, common.id),
+        transform: motion.transform_at(0.0),
+        motion,
+        parent: common.parent,
+        attachment: m.attachment.clone().filter(|a| !a.is_empty()),
+        parallax_depth: vec2(*props.value(&common.parallax_depth)),
+        perspective: m.extra.get("perspective").is_some_and(|v| {
+            v.as_bool()
+                .or_else(|| v.get("value").and_then(serde_json::Value::as_bool))
+                .unwrap_or(false)
+        }),
+        animation_layers: m
+            .extra
+            .get("animationlayers")
+            .and_then(serde_json::Value::as_array)
+            .cloned()
+            .unwrap_or_default(),
+        object_index,
+    }
+}
+
+fn scene_light(nodes: &HashMap<i32, Node>, props: &UserProperties, l: &LightObject) -> SceneLight {
+    let common = &l.common;
+    let anim = |a: &Option<serde_json::Value>| a.as_ref().and_then(Animation::parse);
+    let motion = Motion {
+        parent: parent_transform(nodes, props, common.parent, 0),
+        origin: vec3(*props.value(&common.origin)),
+        scale: vec3(*props.value(&common.scale)),
+        angles: vec3(*props.value(&common.angles)),
+        origin_animation: anim(&common.origin.animation),
+        scale_animation: anim(&common.scale.animation),
+        angles_animation: anim(&common.angles.animation),
+        color_animation: anim(&l.color.animation),
+        ..Default::default()
+    };
+    let cone = |c: &Option<wpe_assets::value::Dynamic<f32>>, default: f32| {
+        c.as_ref().map_or(default, |c| props.value(c))
+    };
+    let mut light = SceneLight {
+        id: common.id,
+        name: common.name.clone(),
+        kind: LightKind::parse(&l.light),
+        visible: is_visible(nodes, props, common.id),
+        transform: Mat4::IDENTITY,
+        position: Vec3::ZERO,
+        direction: -Vec3::Z,
+        color: vec3(*props.value(&l.color)),
+        radius: props.value(&l.radius),
+        intensity: props.value(&l.intensity),
+        exponent: props.value(&l.exponent),
+        inner_cone: cone(&l.innercone, 30.0),
+        outer_cone: cone(&l.outercone, 45.0),
+        parent: common.parent,
+        motion,
+    };
+    light.set_transform(light.motion.transform_at(0.0));
+    light
 }
 
 struct LoadedImage {
@@ -490,6 +754,8 @@ fn text_layer(nodes: &HashMap<i32, Node>, props: &UserProperties, text: &TextObj
         particle: None,
         puppet: None,
         animation_layers: Vec::new(),
+        perspective: false,
+        object_index: 0,
     }
 }
 
@@ -539,6 +805,8 @@ fn particle_layer(
         }),
         puppet: None,
         animation_layers: Vec::new(),
+        perspective: false,
+        object_index: 0,
     }
 }
 
@@ -637,6 +905,7 @@ mod tests {
     use std::borrow::Cow;
 
     use super::*;
+    use std::f32::consts::FRAC_PI_2;
     use wpe_vfs::{FileSystem, VfsError};
 
     struct MemFs(HashMap<&'static str, &'static str>);
@@ -703,5 +972,103 @@ mod tests {
         let auto = &built.layers[2];
         assert_eq!(auto.size, Vec2::new(64.0, 32.0));
         assert_eq!(auto.transform.w_axis.truncate(), Vec3::new(42.0, -6.0, 0.0));
+
+        assert!(!built.is_3d && built.perspective.fit == Some(built.camera));
+        assert_eq!(built.perspective.eye(), Vec3::new(500.0, 250.0, 1000.0));
+        assert_eq!(built.draw_order.len(), 3);
+    }
+
+    fn build(json: &str) -> Scene {
+        let scene: wpe_assets::Scene = wpe_assets::parse_json(json).unwrap();
+        Scene::build(&vfs(), &scene, &UserProperties::default(), |_| None)
+    }
+
+    #[test]
+    fn models_lights_and_draw_order() {
+        let built = build(
+            r#"{
+            "general": {"orthogonalprojection": null, "ambientcolor": "0.1 0.1 0.1",
+                        "skylightcolor": "0.4 0.5 0.6", "fov": 60, "nearz": 1, "farz": 500},
+            "camera": {"eye": "0 0 10", "center": "0 0 0", "up": "0 1 0"},
+            "objects": [
+                {"id": 1, "name": "rig", "origin": "10 0 0", "angles": "0 0 1.5707964"},
+                {"id": 2, "name": "bg", "image": "models/bg.json", "perspective": true},
+                {"id": 3, "name": "rock", "model": "models/rock.mdl", "parent": 1,
+                 "origin": "1 0 0", "angles": "0.5 0.25 0", "attachment": "hand"},
+                {"id": 4, "name": "front", "image": "models/bg.json"},
+                {"id": 5, "light": "lspot", "parent": 1, "origin": "0 2 0", "color": "1 0 0",
+                 "radius": 50, "intensity": 2, "exponent": 0.5, "visible": false},
+                {"id": 6, "light": "lpoint", "origin": "3 4 5"}
+            ]
+        }"#,
+        );
+        assert!(built.is_3d);
+        assert_eq!(built.camera.scene_size, DEFAULT_ORTHO);
+        let cam = built.perspective;
+        assert_eq!(
+            (cam.eye, cam.fov, cam.near, cam.far),
+            (Vec3::new(0.0, 0.0, 10.0), 60.0, 1.0, 500.0)
+        );
+        assert!(cam.fit.is_none());
+
+        assert!(built.layers[0].perspective && !built.layers[1].perspective);
+        let rock = &built.models[0];
+        assert_eq!(rock.mdl.as_deref(), Some("models/rock.mdl"));
+        assert_eq!(rock.attachment.as_deref(), Some("hand"));
+        assert!(rock.visible);
+        let expected = local_transform(
+            Vec3::new(10.0, 0.0, 0.0),
+            Vec3::ONE,
+            Vec3::new(0.0, 0.0, FRAC_PI_2),
+        ) * local_transform(Vec3::X, Vec3::ONE, Vec3::new(0.5, 0.25, 0.0));
+        assert!(rock.transform.abs_diff_eq(expected, 1e-5));
+        assert!((rock.transform.w_axis.truncate() - Vec3::new(10.0, 1.0, 0.0)).length() < 1e-5);
+        assert_eq!(
+            built.draw_order,
+            [DrawItem::Layer(0), DrawItem::Model(0), DrawItem::Layer(1)]
+        );
+
+        let [spot, point] = &built.lights[..] else {
+            panic!()
+        };
+        assert_eq!((spot.kind, spot.visible), (LightKind::Spot, false));
+        assert_eq!(
+            (spot.radius, spot.intensity, spot.exponent),
+            (50.0, 2.0, 0.5)
+        );
+        // The rig's quarter turn about Z carries the light to (8, 0, 0).
+        assert!((spot.position - Vec3::new(8.0, 0.0, 0.0)).length() < 1e-5);
+        assert_eq!((point.kind, point.radius), (LightKind::LPoint, 1000.0));
+        assert_eq!(built.ambient_color, Vec3::splat(0.1));
+        assert_eq!(built.skylight_color, Vec3::new(0.4, 0.5, 0.6));
+
+        let u = built.light_uniforms();
+        assert_eq!(
+            &u.uniform("g_LightsPosition").unwrap()[..4],
+            [3.0, 4.0, 5.0, 1.0]
+        );
+        assert_eq!(u.combo("LIGHTS_POINT"), Some(1));
+        assert_eq!(u.combo("LIGHTS_SPOT"), Some(0));
+        assert_eq!(u.uniform("g_LightSkylightColor").unwrap(), [0.4, 0.5, 0.6]);
+    }
+
+    #[test]
+    fn camera_object_overrides_saved_viewport() {
+        let built = build(
+            r#"{
+            "general": {"fov": 50, "perspectiveoverridefov": 40},
+            "camera": {"eye": "0 0 10", "center": "0 0 0", "up": "0 1 0"},
+            "objects": [{"id": 1, "camera": "default", "origin": "1 2 3",
+                         "angles": "0 1.5707964 0", "fov": 70}]
+        }"#,
+        );
+        let cam = built.perspective;
+        assert_eq!((cam.eye, cam.fov), (Vec3::new(1.0, 2.0, 3.0), 70.0));
+        // Yawed a quarter turn: -Z turns to -X.
+        assert!((cam.center - Vec3::new(0.0, 2.0, 3.0)).length() < 1e-5);
+        assert!((cam.up - Vec3::Y).length() < 1e-5);
+
+        let built = build(r#"{"general": {"fov": 50, "perspectiveoverridefov": 40}}"#);
+        assert_eq!(built.perspective.fov, 40.0);
     }
 }

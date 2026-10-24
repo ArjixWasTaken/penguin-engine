@@ -28,20 +28,27 @@ dialect to SPIR-V and run through wgpu:
 - user properties, keyframe animations, camera parallax and shake
 - sound layers and audio-reactive spectrum (`--audio`)
 - particles (sprite, trail, rope) without geometry shaders
-- puppet warp (`.mdl` skinned meshes and bone animations)
+- puppet warp (`.mdl` skinned meshes, bone animations, blend shapes)
+- 3D: model objects (`.mdl` meshes with depth testing and culling), perspective scenes and
+  perspective layers, point/spot/tube/directional lights
 - SceneScript (QuickJS) on any scene value, with the engine services scripts use:
   - layers: transforms, colour, visibility (groups included), text and layout properties,
     `createLayer` / `destroyLayer` / `sortLayer` / `setParent` (the frame is rebuilt)
-  - animations: keyframe, sprite-sheet and puppet animation-layer playback control
-  - puppet bones (pose queries, `setBoneTransform`, springy physics impulses)
-  - particles (`instance` overrides, `emitParticles`), material and effect constants,
-    effect visibility, scene settings (`thisScene.bloom`, `camerashake`, ...)
+  - animations: keyframe, sprite-sheet and puppet animation-layer playback control,
+    `createAnimationLayer` / `playSingleAnimation`, animation events
+  - puppet bones (by name or index, pose queries, `setBoneTransform`, local angles,
+    springy physics impulses), attachments (`setParent(layer, attachment)`), blend shapes
+  - custom geometry (`createModelData`, `applyData` / `replaceData`, `createLayer({model})`)
+  - particles (`instance` overrides, `emitParticles`, play/pause/stop), material and
+    effect constants, effect functions, effect visibility, scene settings
+    (`thisScene.bloom`, `camerashake`, ...), camera transforms
   - video (`getVideoTexture()`), sound layers (play/pause/stop/volume), media players
     over MPRIS (media events and the `$mediaThumbnail` album-art texture)
-  - cursor events, `localStorage` (persisted per wallpaper), user property changes
-    (`Wallpaper::set_user_property`, `scene-viewer --property name=value`)
+  - cursor events and hit boxes, `localStorage` (persisted per wallpaper), user property
+    changes (`Wallpaper::set_user_property`, `scene-viewer --property name=value`),
+    `openUserShortcut` (only shortcuts the user bound), `applyGeneralSettings`
 
-Not yet: 3D models, HDR scenes, desktop background (wallpaper) mode and the wallpaper
+Not yet: camera paths and shadows in 3D scenes, HDR scenes, desktop background (wallpaper) mode and the wallpaper
 picker UI.
 
 Debugging aids: `WPE_SCRIPT_AUDIT=<file>` records script requests the runtime doesn't
@@ -59,7 +66,7 @@ frames (with clicks) before a `--screenshot`.
 | `crates/wpe-render` | wgpu renderer: render targets, material draws, effect chains |
 | `crates/wpe-text` | Text layer layout and rasterisation |
 | `crates/wpe-particles` | Particle simulation and CPU vertex generation |
-| `crates/wpe-mdl` | `.mdl` puppet/model parsing and bone animation |
+| `crates/wpe-mdl` | `.mdl` puppet/model parsing, bone animation and blend shapes |
 | `crates/wpe-script` | SceneScript runtime (QuickJS) |
 | `crates/wpe-audio` | Sound playback and audio spectrum |
 | `crates/wpe-runtime` | Embeddable API tying loading, animation and rendering together |

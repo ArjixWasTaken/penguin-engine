@@ -395,6 +395,7 @@
 		createLayer(config) {
 			let desc;
 			if (typeof config === 'string') desc = config;
+			else if (config instanceof ModelData) desc = { model: config.toConfigString() };
 			else if (config && config.__asset !== undefined) desc = config.__asset;
 			else desc = JSON.parse(stringify(config || {}));
 			// Workshop assets name their files relative to their own folder.
@@ -424,8 +425,11 @@
 		setCameraTransforms(t) { N.sceneSet('cameratransforms', JSON.parse(stringify(t))); },
 		// An animation of any layer, by name.
 		getAnimation(name) { return makeAnimation(SCENE_ANIMATIONS, 'animation:' + (name || ''), name || ''); },
-		createModelData() { return { applyData() {}, replaceData() {}, toConfigString() { return ''; } }; },
-		destroyModelData() {},
+		createModelData(config) {
+			const id = N.modelData('create', -1, stringify(modelShapes(config)));
+			return typeof id === 'number' && id >= 0 ? new ModelData(id) : null;
+		},
+		destroyModelData(data) { if (data instanceof ModelData) N.modelData('destroy', data.__modelData, 'null'); },
 	};
 	for (const prop of SCENE_PROPS) {
 		Object.defineProperty(thisScene, prop, {
@@ -438,6 +442,51 @@
 		});
 	}
 	global.thisScene = thisScene;
+
+	// ---------------------------------------------------------------- model data
+	// Custom geometry for model layers (`thisScene.createModelData`). Typed
+	// arrays cross to the host as plain arrays; material handles as paths.
+	const MODEL_FORMATS = ['position', 'normal', 'tangentSigned', 'uv', 'color'];
+	function modelShape(shape) {
+		if (shape === null || shape === undefined) return null;
+		const out = {};
+		for (const k of Object.keys(shape)) {
+			const v = shape[k];
+			if (ArrayBuffer.isView(v)) out[k] = Array.from(v);
+			else if (v && typeof v.toConfigString === 'function') out[k] = v.toConfigString();
+			else out[k] = v;
+		}
+		if (Array.isArray(out.vertexFormat)) out.vertexFormat = out.vertexFormat.map(String);
+		return out;
+	}
+	function modelShapes(config) {
+		if (config === null || config === undefined) return { shapes: [] };
+		if (Array.isArray(config)) return { shapes: config.map(modelShape) };
+		if (!Array.isArray(config.shapes)) return { shapes: [modelShape(config)] };
+		const out = { shapes: config.shapes.map(modelShape) };
+		for (const k of ['boundingBoxMins', 'boundingBoxMaxs']) {
+			if (config[k] !== undefined) out[k] = [+config[k].x || 0, +config[k].y || 0, +config[k].z || 0];
+		}
+		return out;
+	}
+	class ModelData {
+		constructor(id) { this.__modelData = id; }
+		get POSITION() { return 'position'; }
+		get NORMAL() { return 'normal'; }
+		get TANGENT_SIGNED() { return 'tangentSigned'; }
+		get UV() { return 'uv'; }
+		get COLOR() { return 'color'; }
+		applyData(shapes) { N.modelData('apply', this.__modelData, stringify(modelShapes(shapes))); }
+		replaceData(shapes) {
+			if (W.inUpdate) throw new Error('replaceData must not be called from update()');
+			N.modelData('replace', this.__modelData, stringify(modelShapes(shapes)));
+		}
+		toConfigString() { return 'modeldata:' + this.__modelData; }
+	}
+	for (const [k, v] of [['POSITION', 0], ['NORMAL', 1], ['TANGENT_SIGNED', 2], ['UV', 3], ['COLOR', 4]]) {
+		ModelData[k] = MODEL_FORMATS[v];
+	}
+	global.IModelData = ModelData;
 
 	// ---------------------------------------------------------------- engine
 	const engine = {
@@ -617,7 +666,9 @@
 	};
 	W.callValue = function (sid, name, value) {
 		const e = W.scripts.get(sid);
-		const r = within(sid, () => e.ns[name](value));
+		W.inUpdate = name === 'update';
+		let r;
+		try { r = within(sid, () => e.ns[name](value)); } finally { W.inUpdate = false; }
 		if (r === undefined || r === null) return undefined;
 		if (e.kind === 's') {
 			if (typeof r === 'number' && !Number.isFinite(r)) return undefined;

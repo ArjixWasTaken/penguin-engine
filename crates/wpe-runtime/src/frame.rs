@@ -10,16 +10,19 @@ use wpe_assets::effect::{CommandKind, EffectPass};
 use wpe_assets::material::{Blending, Material, MaterialPass, PassOverride};
 use wpe_assets::tex::Texture;
 use wpe_render::{
-    BlendMode, Camera, CardMesh, DEFAULT_FORMAT, Draw, Gpu, GpuTexture, ImageDraw, MaterialDraw,
-    Mesh, MeshData, ShaderProgram, SpriteAnimation, SpriteFrame, Step, TargetDesc, TargetId,
-    TargetSize, TexRef, upload_texture, wgpu,
+    BlendMode, Camera, CardMesh, CullMode, DEFAULT_FORMAT, Draw, Gpu, GpuTexture, ImageDraw,
+    MaterialDraw, Mesh, MeshData, RasterState, ShaderProgram, SpriteAnimation, SpriteFrame, Step,
+    TargetDesc, TargetId, TargetSize, TexRef, upload_texture, wgpu,
 };
-use wpe_scene::{Animation, Bloom, ImageLayer, Motion, Parallax, apply_override};
+use wpe_scene::{
+    Animation, Bloom, DrawItem, ImageLayer, ModelLayer, Motion, Parallax, apply_override,
+};
 use wpe_vfs::Vfs;
 
 use crate::bones::{Bones, PuppetBones};
 use crate::clock::{self, Clock, Clocks};
 use crate::material::{self, SlotTexture, TextureStore};
+use crate::model_data::SharedModelDatas;
 use crate::video::VideoStream;
 
 /// A built frame: render targets, steps and what animates them.
@@ -214,12 +217,18 @@ impl LayerPuppet {
 
     /// The puppet mesh in layer-local pixels; UVs scaled onto a padded texture.
     fn mesh(&self, uv_scale: Vec2) -> Mesh {
-        self.morphed_mesh(uv_scale, &[])
+        self.morphed_mesh(0, uv_scale, &[])
     }
 
-    /// The mesh with blend shapes applied at `weights`.
-    fn morphed_mesh(&self, uv_scale: Vec2, weights: &[f32]) -> Mesh {
-        let m = &self.mdl.meshes[0];
+    /// Mesh `index` with blend shapes applied at `weights`.
+    fn morphed_mesh(&self, index: usize, uv_scale: Vec2, weights: &[f32]) -> Mesh {
+        mdl_mesh(&self.mdl.meshes[index], uv_scale, weights)
+    }
+}
+
+/// An MDL mesh for the renderer, blend shapes applied at `weights`.
+fn mdl_mesh(m: &wpe_mdl::MdlMesh, uv_scale: Vec2, weights: &[f32]) -> Mesh {
+    {
         let n = m.positions.len();
         let positions = if weights.iter().any(|&w| w != 0.0) {
             m.morphed_positions(weights)
@@ -261,11 +270,41 @@ impl LayerPuppet {
                 m.blend_weights.iter().flatten().copied().collect(),
             ),
         ];
+        let mut streams = streams;
+        if m.tangents.len() == n {
+            streams.push((
+                "a_Tangent4".to_owned(),
+                4,
+                m.tangents.iter().flatten().copied().collect(),
+            ));
+        }
         Mesh::Triangles(MeshData {
             vertex_count: n as u32,
             attributes: streams,
             indices: Some(m.indices.clone()),
         })
+    }
+}
+
+/// The camera a layer composites with: the perspective one when it asks.
+fn layer_camera(layer: &ImageLayer) -> Camera {
+    if layer.perspective {
+        Camera::Perspective
+    } else {
+        Camera::Scene
+    }
+}
+
+/// Material for script geometry that names none.
+fn default_model_pass() -> MaterialPass {
+    MaterialPass {
+        shader: "generic".to_owned(),
+        blending: Blending::Normal,
+        cullmode: wpe_assets::material::CullMode::Normal,
+        depthtest: wpe_assets::material::Toggle::Enabled,
+        depthwrite: wpe_assets::material::Toggle::Enabled,
+        textures: vec![Some("util/white".to_owned())],
+        ..Default::default()
     }
 }
 
@@ -295,10 +334,22 @@ pub enum Binding {
         layer: i32,
         step: usize,
         puppet: Arc<LayerPuppet>,
-        /// The mesh's UV scale, for re-uploading it morphed.
+        /// Which of the model's meshes the draw is, and its UV scale, for
+        /// re-uploading it morphed.
+        mesh: usize,
         uv_scale: Vec2,
         /// Blend shape weights the draw's mesh has (empty: none applied).
         morphed: std::cell::RefCell<Vec<f32>>,
+    },
+    /// Script geometry (`createModelData`) re-uploaded when `applyData`
+    /// changes it.
+    ModelData {
+        step: usize,
+        data: SharedModelDatas,
+        id: i32,
+        shape: usize,
+        /// The data's generation the draw has.
+        generation: std::cell::Cell<u64>,
     },
     /// An animated material constant.
     Constant {
@@ -358,6 +409,7 @@ impl Binding {
             Self::Constant {
                 layer, animation, ..
             } => add(*layer, animation),
+            Self::ModelData { .. } => {}
             Self::Bones { layer, puppet, .. } => {
                 for (i, params) in puppet.puppet.layers().enumerate() {
                     // Seconds, rate applied (`fps` 1).
@@ -473,6 +525,24 @@ impl Binding {
                 renderer.set_uniform(*step, "g_UserAlpha", vec![a]);
                 renderer.set_uniform(*step, "g_Alpha", vec![a]);
             }
+            Self::ModelData {
+                step,
+                data,
+                id,
+                shape,
+                generation,
+            } => {
+                let data = data.borrow();
+                let Some(model) = data.data.get(id) else {
+                    return;
+                };
+                if model.generation != generation.get() {
+                    generation.set(model.generation);
+                    if let Some(shape) = model.shapes.get(*shape) {
+                        renderer.set_mesh(*step, Mesh::Triangles(shape.mesh()));
+                    }
+                }
+            }
             Self::Constant {
                 layer,
                 step,
@@ -487,6 +557,7 @@ impl Binding {
                 layer,
                 step,
                 puppet,
+                mesh,
                 uv_scale,
                 morphed,
             } => {
@@ -507,7 +578,7 @@ impl Binding {
                         visible: params.visible,
                     },
                 };
-                if puppet.puppet.blend_shape_count() > 0 {
+                if *mesh == 0 && puppet.puppet.blend_shape_count() > 0 {
                     let base: Vec<f32> = state
                         .as_ref()
                         .map(|s| s.blend_weights.clone())
@@ -523,7 +594,7 @@ impl Binding {
                         *morphed == weights
                     };
                     if !unchanged {
-                        renderer.set_mesh(*step, puppet.morphed_mesh(*uv_scale, &weights));
+                        renderer.set_mesh(*step, puppet.morphed_mesh(*mesh, *uv_scale, &weights));
                         morphed.clone_from(&weights);
                     }
                     if let Some(s) = state.as_deref_mut() {
@@ -603,6 +674,11 @@ pub struct FrameBuilder<'a> {
     sprite_steps: Vec<(i32, usize)>,
     bindings: Vec<Binding>,
     parallax: Option<(Parallax, Vec2)>,
+    /// Model materials' light combos (`LIGHTS_*`), script geometry, and
+    /// whether every model draws in perspective (3D scenes).
+    light_combos: BTreeMap<String, String>,
+    model_data: SharedModelDatas,
+    is_3d: bool,
     /// Draws using their compiled material, and all draws.
     pub stats: (usize, usize),
 }
@@ -660,6 +736,9 @@ impl<'a> FrameBuilder<'a> {
             sprite_steps: Vec::new(),
             bindings: Vec::new(),
             parallax: None,
+            light_combos: BTreeMap::new(),
+            model_data: Default::default(),
+            is_3d: false,
             particles: Vec::new(),
             current_layer: None,
             layer_steps: HashMap::new(),
@@ -907,6 +986,29 @@ impl<'a> FrameBuilder<'a> {
         blend: BlendMode,
         camera: Camera,
     ) {
+        self.push_draw_with(
+            target,
+            resolved,
+            model,
+            mesh,
+            blend,
+            camera,
+            RasterState::default(),
+        );
+    }
+
+    /// [`Self::push_draw`] with depth testing and culling (3D models).
+    #[allow(clippy::too_many_arguments)]
+    fn push_draw_with(
+        &mut self,
+        target: TargetId,
+        resolved: Resolved,
+        model: Mat4,
+        mesh: impl Into<Mesh>,
+        blend: BlendMode,
+        camera: Camera,
+        raster: RasterState,
+    ) {
         if resolved.reads_frame {
             let copy = self.frame_copy();
             self.push_copy(TargetId::DEFAULT, copy);
@@ -957,6 +1059,7 @@ impl<'a> FrameBuilder<'a> {
                 blend,
                 camera,
                 sprites: resolved.sprites,
+                raster,
             }),
         });
     }
@@ -965,6 +1068,41 @@ impl<'a> FrameBuilder<'a> {
     /// sample, rendered offscreen, then the rest onto the screen. Hidden
     /// layers are drawn too, switched off, so scripts can show them; hidden
     /// particle systems are left out to spare their simulation.
+    /// What model layers need: the scene's light combos, script geometry
+    /// and whether the scene is 3D.
+    pub fn set_models(
+        &mut self,
+        light_combos: BTreeMap<String, String>,
+        model_data: SharedModelDatas,
+        is_3d: bool,
+    ) {
+        self.light_combos = light_combos;
+        self.model_data = model_data;
+        self.is_3d = is_3d;
+    }
+
+    /// Add every layer and model in draw order (see [`Self::layers`]).
+    pub fn objects(&mut self, layers: &[ImageLayer], models: &[ModelLayer], order: &[DrawItem]) {
+        if models.is_empty() {
+            return self.layers(layers);
+        }
+        let mut pending: Vec<ImageLayer> = Vec::new();
+        for item in order {
+            match *item {
+                DrawItem::Layer(i) => pending.push(layers[i].clone()),
+                DrawItem::Model(i) => {
+                    if !pending.is_empty() {
+                        self.layers(&std::mem::take(&mut pending));
+                    }
+                    self.model_layer(&models[i]);
+                }
+            }
+        }
+        if !pending.is_empty() {
+            self.layers(&pending);
+        }
+    }
+
     pub fn layers(&mut self, layers: &[ImageLayer]) {
         let mut referenced: Vec<i32> = layers.iter().flat_map(linked_ids).collect();
         referenced.sort_unstable();
@@ -1113,6 +1251,170 @@ impl<'a> FrameBuilder<'a> {
     }
 
     /// Draw `layer` onto the screen, or into `offscreen` filling it.
+    /// A model's draws: its MDL meshes or script shapes, opaque ones first.
+    fn model_layer(&mut self, m: &ModelLayer) {
+        self.current_layer = Some(m.id);
+        self.building = Some(m.id);
+        let camera = if self.is_3d || m.perspective {
+            Camera::Perspective
+        } else {
+            Camera::Scene
+        };
+        // (pass, mesh, mesh index, puppet)
+        type Part = (MaterialPass, Mesh, usize, Option<Arc<LayerPuppet>>);
+        let mut parts: Vec<Part> = Vec::new();
+        let mut combos = self.light_combos.clone();
+        if let Some(id) = crate::model_data::id_of(&m.model) {
+            let shapes = self
+                .model_data
+                .borrow()
+                .data
+                .get(&id)
+                .map(|d| d.shapes.clone())
+                .unwrap_or_default();
+            for (i, shape) in shapes.iter().enumerate() {
+                let pass = match &shape.material {
+                    Some(path) => self.model_pass(path),
+                    None => Some(default_model_pass()),
+                };
+                if let Some(pass) = pass {
+                    parts.push((pass, Mesh::Triangles(shape.mesh()), i, None));
+                }
+            }
+        } else if let Some(path) = &m.mdl {
+            let Some(mdl) = self.load_mdl(path) else {
+                return;
+            };
+            let puppet = Arc::new(LayerPuppet {
+                puppet: wpe_mdl::Puppet::new(&mdl, &m.animation_layers),
+                mdl: mdl.clone(),
+            });
+            combos.extend(puppet.combos());
+            for (i, mesh) in mdl.meshes.iter().enumerate() {
+                let Some(pass) = mesh.material.as_deref().and_then(|p| self.model_pass(p)) else {
+                    continue;
+                };
+                parts.push((
+                    pass,
+                    mdl_mesh(mesh, Vec2::ONE, &[]),
+                    i,
+                    Some(puppet.clone()),
+                ));
+            }
+        }
+        // Translucent parts after opaque ones, each group in file order.
+        parts.sort_by_key(|(pass, ..)| pass.blending == Blending::Translucent);
+        let first = self.steps.len();
+        for (pass, mesh, index, puppet) in parts {
+            let label = format!("model {:?} part {index}", m.name);
+            let Some(mut r) = self.resolve_with(&label, &pass, &HashMap::new(), &combos) else {
+                continue;
+            };
+            for (name, value) in [
+                ("g_Color4", vec![1.0; 4]),
+                ("g_Color", vec![1.0; 3]),
+                ("g_Alpha", vec![1.0]),
+                ("g_UserAlpha", vec![1.0]),
+                ("g_Brightness", vec![1.0]),
+            ] {
+                r.constants.entry(name.to_owned()).or_insert(value);
+            }
+            let blend = blend_mode(&pass.blending);
+            let raster = RasterState {
+                depth_test: pass.depthtest.is_enabled(),
+                // Blended parts don't hide what's behind them.
+                depth_write: pass.depthwrite.is_enabled()
+                    && !matches!(blend, BlendMode::Translucent | BlendMode::Additive),
+                cull: match pass.cullmode {
+                    wpe_assets::material::CullMode::Normal => CullMode::Back,
+                    _ => CullMode::None,
+                },
+            };
+            let uv_scale = r.uv_scale;
+            let mesh = match &puppet {
+                Some(p) => p.morphed_mesh(index, uv_scale, &[]),
+                None => mesh,
+            };
+            self.current_pass = Some((None, 0));
+            self.push_draw_with(
+                TargetId::DEFAULT,
+                r,
+                m.transform,
+                mesh,
+                blend,
+                camera,
+                raster,
+            );
+            let step = self.steps.len() - 1;
+            if let Some(id) = crate::model_data::id_of(&m.model) {
+                let generation = self
+                    .model_data
+                    .borrow()
+                    .data
+                    .get(&id)
+                    .map_or(0, |d| d.generation);
+                self.bindings.push(Binding::ModelData {
+                    step,
+                    data: self.model_data.clone(),
+                    id,
+                    shape: index,
+                    generation: generation.into(),
+                });
+            }
+            self.bind_puppet_mesh(puppet, index, uv_scale);
+            if let Some(steps) = self.current_steps() {
+                steps.model.push(step);
+            }
+            let attach = m.attachment.clone().zip(m.parent).map(|(a, p)| (p, a));
+            if m.motion.is_transform_animated() || attach.is_some() {
+                self.bindings.push(Binding::Model {
+                    layer: m.id,
+                    step,
+                    motion: m.motion.clone(),
+                    parallax: None,
+                    attach,
+                });
+            }
+        }
+        if !m.visible && self.steps.len() > first {
+            self.hidden.push(m.id);
+        }
+        self.current_layer = None;
+        self.building = None;
+    }
+
+    /// A model part's material pass, with the defaults 3D models get.
+    fn model_pass(&mut self, path: &str) -> Option<MaterialPass> {
+        let text = self
+            .vfs
+            .read_to_string(path)
+            .inspect_err(|e| tracing::warn!("model material {path}: {e}"))
+            .ok()?;
+        wpe_assets::material::parse_model_material(&text)
+            .inspect_err(|e| tracing::warn!("model material {path}: {e}"))
+            .ok()?
+            .passes
+            .into_iter()
+            .next()
+    }
+
+    /// A parsed `.mdl`, cached by path.
+    fn load_mdl(&mut self, path: &str) -> Option<Arc<wpe_mdl::Mdl>> {
+        self.cache
+            .mdls
+            .entry(path.to_owned())
+            .or_insert_with(|| {
+                self.vfs
+                    .read(path)
+                    .map_err(|e| e.to_string())
+                    .and_then(|b| wpe_mdl::Mdl::parse(&b).map_err(|e| e.to_string()))
+                    .inspect_err(|e| tracing::warn!("model {path}: {e}"))
+                    .ok()
+                    .map(Arc::new)
+            })
+            .clone()
+    }
+
     fn layer(&mut self, layer: &ImageLayer, offscreen: Option<TargetId>) {
         self.current_layer = offscreen.is_none().then_some(layer.id);
         self.building = Some(layer.id);
@@ -1217,11 +1519,17 @@ impl<'a> FrameBuilder<'a> {
 
     /// Upload the puppet's bones into the draw just pushed, every frame.
     fn bind_puppet(&mut self, puppet: Option<Arc<LayerPuppet>>, uv_scale: Vec2) {
+        self.bind_puppet_mesh(puppet, 0, uv_scale);
+    }
+
+    /// Upload the model's bones into the draw of its mesh `mesh` just pushed.
+    fn bind_puppet_mesh(&mut self, puppet: Option<Arc<LayerPuppet>>, mesh: usize, uv_scale: Vec2) {
         if let Some(puppet) = puppet.filter(|p| p.puppet.bone_count() > 0) {
             self.bindings.push(Binding::Bones {
                 layer: self.building.unwrap_or(-1),
                 step: self.steps.len() - 1,
                 puppet,
+                mesh,
                 uv_scale,
                 morphed: Default::default(),
             });
@@ -1331,7 +1639,7 @@ impl<'a> FrameBuilder<'a> {
                         layer.transform,
                         mesh,
                         Self::final_blend(layer),
-                        Camera::Scene,
+                        layer_camera(layer),
                     ),
                 }
                 self.bind_layer(layer, offscreen.is_none(), false);
@@ -1406,7 +1714,7 @@ impl<'a> FrameBuilder<'a> {
                 size: layer.size,
                 uv_scale: Vec2::ONE,
             };
-            (Camera::Scene, layer.transform, mesh.into())
+            (layer_camera(layer), layer.transform, mesh.into())
         } else {
             let ortho = local_camera(layer.size);
             let mesh = match &puppet {
@@ -1579,7 +1887,7 @@ impl<'a> FrameBuilder<'a> {
         *target = TargetId::DEFAULT;
         draw.blend = Self::final_blend(layer);
         if !layer.fullscreen {
-            draw.camera = Camera::Scene;
+            draw.camera = layer_camera(layer);
             draw.model = layer.transform;
             draw.mesh = CardMesh {
                 size: layer.size,

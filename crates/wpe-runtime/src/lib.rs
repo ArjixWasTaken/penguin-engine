@@ -6,6 +6,7 @@ mod files;
 mod frame;
 pub mod material;
 mod media;
+mod model_data;
 mod script;
 mod sound;
 mod storage;
@@ -16,7 +17,7 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use chrono::Timelike;
-use glam::Vec2;
+use glam::{Vec2, Vec3};
 use wpe_assets::tex::{Mip, TexFormat, TexImage, Texture};
 use wpe_render::{FrameGlobals, Gpu, GpuTexture, SceneRenderer, wgpu};
 use wpe_scene::{OrthoCamera, Scene};
@@ -166,6 +167,15 @@ pub struct Wallpaper {
     pub title: String,
     pub fill: FillMode,
     camera: OrthoCamera,
+    /// The scene's perspective camera (models, perspective layers) and
+    /// whether the scene is 3D.
+    perspective: Option<wpe_scene::PerspectiveCamera>,
+    is_3d: bool,
+    /// The scene's lights with their ambient and skylight colours, when
+    /// any light moves (their uniforms are then refreshed every frame).
+    moving_lights: Option<(Vec<wpe_scene::SceneLight>, Vec3, Vec3)>,
+    /// Script geometry, shared with the scripts.
+    model_data: model_data::SharedModelDatas,
     renderer: SceneRenderer,
     /// The scene document, as scripts have edited it.
     scene_json: serde_json::Value,
@@ -231,6 +241,10 @@ impl Wallpaper {
                 scene_size: Vec2::ONE,
                 zoom: 1.0,
             },
+            perspective: None,
+            is_3d: false,
+            moving_lights: None,
+            model_data: Default::default(),
             renderer: SceneRenderer::new(gpu, output_format),
             scene_json: files.scene_json.clone(),
             cache: Some(FrameCache::new(
@@ -287,6 +301,7 @@ impl Wallpaper {
             wallpaper.camera.scene_size,
             wallpaper.clocks.clone(),
             wallpaper.bones.clone(),
+            wallpaper.model_data.clone(),
             wallpaper.storage.load(),
         );
         if wallpaper.scripts.is_some() || !wallpaper.system_slots.is_empty() {
@@ -314,7 +329,17 @@ impl Wallpaper {
 
         let mut builder = FrameBuilder::new(gpu, vfs, cache);
         builder.set_parallax(scene.parallax, scene.camera.scene_size);
-        builder.layers(&scene.layers);
+        let lights = scene.light_uniforms();
+        builder.set_models(
+            lights
+                .combos
+                .iter()
+                .map(|(k, v)| (k.clone(), v.to_string()))
+                .collect(),
+            self.model_data.clone(),
+            scene.is_3d,
+        );
+        builder.objects(&scene.layers, &scene.models, &scene.draw_order);
         if let Some(bloom) = scene.bloom {
             builder.bloom(bloom);
         }
@@ -331,6 +356,9 @@ impl Wallpaper {
             a: 1.0,
         };
         self.renderer.set_frame(gpu, frame.targets, frame.steps);
+        for (name, values) in &lights.uniforms {
+            self.renderer.set_global_uniform(name, values);
+        }
         for id in &frame.hidden {
             for &step in frame.layer_steps.get(id).map_or(&[][..], |s| &s.all) {
                 self.renderer.set_visible(step, false);
@@ -365,6 +393,19 @@ impl Wallpaper {
         }
         self.sprite_steps = frame.sprite_steps;
         self.camera = scene.camera;
+        self.perspective = Some(scene.perspective);
+        self.moving_lights = scene
+            .lights
+            .iter()
+            .any(|l| l.motion.is_transform_animated())
+            .then(|| {
+                (
+                    scene.lights.clone(),
+                    scene.ambient_color,
+                    scene.skylight_color,
+                )
+            });
+        self.is_3d = scene.is_3d;
         self.bindings = frame.bindings;
         self.particles = frame.particles;
         self.parallax_delay = scene.parallax.map_or(0.0, |p| p.delay);
@@ -539,6 +580,14 @@ impl Wallpaper {
         let mut bones = self.bones.borrow_mut();
         let dt = clocks.advance(time);
         bones.step(dt);
+        if let Some((lights, ambient, skylight)) = &mut self.moving_lights {
+            for light in lights.iter_mut() {
+                light.set_transform(light.motion.transform_at(time));
+            }
+            for (name, values) in wpe_scene::light_uniforms(lights, *ambient, *skylight).uniforms {
+                self.renderer.set_global_uniform(&name, &values);
+            }
+        }
         for binding in &self.bindings {
             binding.apply(&mut self.renderer, frame, &clocks, &mut bones);
         }
@@ -602,6 +651,16 @@ impl Wallpaper {
             let offset = shake.offset(time) * self.camera.scene_size * 0.01;
             view_proj *= glam::Mat4::from_translation(offset.extend(0.0));
         }
+        let perspective = match &self.perspective {
+            Some(p) => FrameGlobals {
+                perspective: p.view_proj(size, self.fill),
+                perspective_view: p.view(size, self.fill),
+                perspective_proj: p.proj(size, self.fill),
+                perspective_eye: p.eye(),
+                ..Default::default()
+            },
+            None => FrameGlobals::default(),
+        };
         FrameGlobals {
             time,
             daytime: now.num_seconds_from_midnight() as f32 / 86_400.0,
@@ -610,6 +669,7 @@ impl Wallpaper {
             view_proj,
             screen: Vec2::new(size.0 as f32, size.1 as f32),
             eye: (self.camera.scene_size / 2.0).extend(1000.0),
+            ..perspective
         }
     }
 

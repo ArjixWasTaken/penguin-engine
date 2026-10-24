@@ -1089,6 +1089,19 @@ fn install_natives<'js>(ctx: &Ctx<'js>, host: Rc<HostSlot>) -> rquickjs::Result<
     )?;
     let h = host.clone();
     n.set(
+        "modelData",
+        Function::new(
+            ctx.clone(),
+            move |op: String, id: f64, json: String| -> Option<f64> {
+                let data = serde_json::from_str(&json).unwrap_or_default();
+                h.with(|h| h.model_data(&op, id as i32, &data))
+                    .flatten()
+                    .map(f64::from)
+            },
+        )?,
+    )?;
+    let h = host.clone();
+    n.set(
         "shortcut",
         Function::new(ctx.clone(), move |name: String| -> bool {
             h.with(|h| h.open_user_shortcut(&name)).unwrap_or(false)

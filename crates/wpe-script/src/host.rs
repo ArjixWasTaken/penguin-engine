@@ -133,6 +133,16 @@ pub trait SceneHost {
     ) {
         let _ = (layer, parent, attachment, adjust);
     }
+    /// Custom model geometry (`thisScene.createModelData` and `IModelData`):
+    /// `op` is `"create"` (returns the new id), `"apply"` (new buffer
+    /// contents, same layout), `"replace"` (anything may change) or
+    /// `"destroy"`. `data` is `{shapes: [{vertexFormat, vertexBuffer,
+    /// indexBuffer, material, ...}], boundingBoxMins?, boundingBoxMaxs?}`
+    /// with typed arrays as plain arrays.
+    fn model_data(&mut self, op: &str, id: i32, data: &serde_json::Value) -> Option<i32> {
+        let _ = (op, id, data);
+        None
+    }
     /// `engine.openUserShortcut(name)`: open what the user bound to the
     /// `usershortcut` property `name`. Returns whether something opened.
     fn open_user_shortcut(&mut self, name: &str) -> bool {
