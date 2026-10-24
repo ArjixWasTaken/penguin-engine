@@ -16,8 +16,8 @@ use crate::render::{self, RenderSetup};
 use crate::rng::Rng;
 use crate::{ParticleError, ParticleMesh, UpdateContext};
 
-/// Longest simulation step; longer updates are split.
-pub const MAX_STEP: f32 = 0.032;
+/// Longest simulation step; longer updates are split into equal steps.
+pub const MAX_STEP: f32 = 1.0 / 30.0;
 /// Step used while pre-simulating `starttime`.
 pub const PREWARM_STEP: f32 = 1.0 / 15.0;
 /// Upper bound on `starttime` pre-simulation, in seconds.

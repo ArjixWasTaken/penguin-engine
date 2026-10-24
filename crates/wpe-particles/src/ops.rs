@@ -635,10 +635,13 @@ pub(crate) fn operate(op: &Operator, particles: &mut [Particle], ctx: &OpCtx) {
             let phase = phase_min + (phase_max - phase_min) * ctx.random[0];
             let speed = speed_min + (speed_max - speed_min) * ctx.random[1];
             let shift = phase as f64 + *timescale as f64 * ctx.time;
+            let s2 = (*scale * 2.0) as f64;
             for p in live {
-                let mut q = p.position;
-                q.x = (q.x as f64 + shift) as f32;
-                let dir = noise::curl(q * scale * 2.0).normalize_or_zero() * *mask;
+                let q = p.position;
+                let dir =
+                    noise::curl_at((q.x as f64 + shift) * s2, q.y as f64 * s2, q.z as f64 * s2)
+                        .normalize_or_zero()
+                        * *mask;
                 p.velocity += dir * speed * blend.factor(p.age01()) * dt;
             }
         }

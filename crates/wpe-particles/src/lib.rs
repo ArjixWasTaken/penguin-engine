@@ -201,7 +201,7 @@ impl ParticleSystem {
         self.subs.iter().map(Subsystem::particle_count).sum()
     }
 
-    /// Advance by `dt` seconds (split into steps of at most [`MAX_STEP`]).
+    /// Advance by `dt` seconds, split into equal steps of at most [`MAX_STEP`].
     /// The first call also pre-simulates the definitions' `starttime`.
     pub fn update(&mut self, dt: f32, ctx: &UpdateContext) {
         self.view = ctx.view;
@@ -221,11 +221,14 @@ impl ParticleSystem {
         }
     }
 
-    fn advance(&mut self, mut dt: f32, max_step: f32, ctx: &UpdateContext) {
-        while dt > 1e-6 {
-            let step = dt.min(max_step);
+    fn advance(&mut self, dt: f32, max_step: f32, ctx: &UpdateContext) {
+        if dt <= 1e-6 {
+            return;
+        }
+        let steps = ((dt / max_step) - 1e-3).ceil().max(1.0) as u32;
+        let step = dt / steps as f32;
+        for _ in 0..steps {
             system::step(&mut self.subs, step, ctx, &mut self.rng);
-            dt -= step;
         }
     }
 

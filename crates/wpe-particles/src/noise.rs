@@ -102,29 +102,96 @@ pub fn fbm01(x: f64, octaves: u32) -> f64 {
     ((sum / max + 1.0) * 0.5).clamp(0.0, 1.0)
 }
 
-fn perlin3(p: [f64; 3]) -> [f64; 3] {
-    [
-        perlin(p[0], p[1], p[2]),
-        perlin(p[0] + 89.2, p[1] + 33.1, p[2] + 57.3),
-        perlin(p[0] + 100.3, p[1] + 120.1, p[2] + 142.2),
-    ]
+/// Gradient vector `grad` dots with for each hash value.
+const GRADIENTS: [[f64; 3]; 16] = [
+    [1.0, 1.0, 0.0],
+    [-1.0, 1.0, 0.0],
+    [1.0, -1.0, 0.0],
+    [-1.0, -1.0, 0.0],
+    [1.0, 0.0, 1.0],
+    [-1.0, 0.0, 1.0],
+    [1.0, 0.0, -1.0],
+    [-1.0, 0.0, -1.0],
+    [0.0, 1.0, 1.0],
+    [0.0, -1.0, 1.0],
+    [0.0, 1.0, -1.0],
+    [0.0, -1.0, -1.0],
+    [1.0, 1.0, 0.0],
+    [0.0, -1.0, 1.0],
+    [-1.0, 1.0, 0.0],
+    [0.0, -1.0, -1.0],
+];
+
+fn fade_derivative(t: f64) -> f64 {
+    30.0 * t * t * (t - 1.0) * (t - 1.0)
 }
 
-/// Curl of a Perlin vector field: divergence-free swirling directions.
-pub fn curl(p: Vec3) -> Vec3 {
-    const E: f64 = 1e-3;
-    let p = [p.x as f64, p.y as f64, p.z as f64];
-    let at = |axis: usize| {
-        let mut q = p;
-        q[axis] += E;
-        perlin3(q)
+/// [`perlin`] and its analytic gradient `[d/dx, d/dy, d/dz]`.
+pub fn perlin_gradient(x: f64, y: f64, z: f64) -> (f64, [f64; 3]) {
+    let (fx, fy, fz) = (x.floor(), y.floor(), z.floor());
+    let (xi, yi, zi) = (fx as i32 & 255, fy as i32 & 255, fz as i32 & 255);
+    let (x, y, z) = (x - fx, y - fy, z - fz);
+    let a = perm(xi) + yi;
+    let aa = perm(a) + zi;
+    let ab = perm(a + 1) + zi;
+    let b = perm(xi + 1) + yi;
+    let ba = perm(b) + zi;
+    let bb = perm(b + 1) + zi;
+    let corner = |hash: i32, dx: f64, dy: f64, dz: f64| {
+        let g = GRADIENTS[(hash & 0xF) as usize];
+        (g[0] * (x - dx) + g[1] * (y - dy) + g[2] * (z - dz), g)
     };
-    let c = perlin3(p);
-    let (x1, y1, z1) = (at(0), at(1), at(2));
-    let x = (y1[2] - c[2]) - (z1[1] - c[1]);
-    let y = (z1[0] - c[0]) - (x1[2] - c[2]);
-    let z = (x1[1] - c[1]) - (y1[0] - c[0]);
-    Vec3::new(x as f32, y as f32, z as f32) / E as f32
+    let (va, ga) = corner(perm(aa), 0.0, 0.0, 0.0);
+    let (vb, gb) = corner(perm(ba), 1.0, 0.0, 0.0);
+    let (vc, gc) = corner(perm(ab), 0.0, 1.0, 0.0);
+    let (vd, gd) = corner(perm(bb), 1.0, 1.0, 0.0);
+    let (ve, ge) = corner(perm(aa + 1), 0.0, 0.0, 1.0);
+    let (vf, gf) = corner(perm(ba + 1), 1.0, 0.0, 1.0);
+    let (vg, gg) = corner(perm(ab + 1), 0.0, 1.0, 1.0);
+    let (vh, gh) = corner(perm(bb + 1), 1.0, 1.0, 1.0);
+    let (u, v, w) = (fade(x), fade(y), fade(z));
+    let (du, dv, dw) = (fade_derivative(x), fade_derivative(y), fade_derivative(z));
+    let k1 = vb - va;
+    let k2 = vc - va;
+    let k3 = ve - va;
+    let k4 = va - vb - vc + vd;
+    let k5 = va - vc - ve + vg;
+    let k6 = va - vb - ve + vf;
+    let k7 = -va + vb + vc - vd + ve - vf - vg + vh;
+    let value =
+        va + u * k1 + v * k2 + w * k3 + u * v * k4 + v * w * k5 + w * u * k6 + u * v * w * k7;
+    let mut grad = [0.0; 3];
+    for i in 0..3 {
+        grad[i] = ga[i]
+            + u * (gb[i] - ga[i])
+            + v * (gc[i] - ga[i])
+            + w * (ge[i] - ga[i])
+            + u * v * (ga[i] - gb[i] - gc[i] + gd[i])
+            + v * w * (ga[i] - gc[i] - ge[i] + gg[i])
+            + w * u * (ga[i] - gb[i] - ge[i] + gf[i])
+            + u * v * w * (-ga[i] + gb[i] + gc[i] - gd[i] + ge[i] - gf[i] - gg[i] + gh[i]);
+    }
+    grad[0] += du * (k1 + k4 * v + k6 * w + k7 * v * w);
+    grad[1] += dv * (k2 + k5 * w + k4 * u + k7 * w * u);
+    grad[2] += dw * (k3 + k6 * u + k5 * v + k7 * u * v);
+    (value, grad)
+}
+
+/// Curl of a Perlin vector field at `(x, y, z)`: divergence-free swirling directions.
+pub fn curl_at(x: f64, y: f64, z: f64) -> Vec3 {
+    let (_, fx) = perlin_gradient(x, y, z);
+    let (_, fy) = perlin_gradient(x + 89.2, y + 33.1, z + 57.3);
+    let (_, fz) = perlin_gradient(x + 100.3, y + 120.1, z + 142.2);
+    Vec3::new(
+        (fz[1] - fy[2]) as f32,
+        (fx[2] - fz[0]) as f32,
+        (fy[0] - fx[1]) as f32,
+    )
+}
+
+/// [`curl_at`] for a single-precision point.
+pub fn curl(p: Vec3) -> Vec3 {
+    curl_at(p.x as f64, p.y as f64, p.z as f64)
 }
 
 #[cfg(test)]
@@ -140,6 +207,32 @@ mod tests {
             assert!((-1.5..=1.5).contains(&n));
         }
         assert!((0.0..=1.0).contains(&fbm01(3.7, 4)));
+    }
+
+    #[test]
+    fn analytic_gradient_matches_finite_differences() {
+        const E: f64 = 1e-6;
+        for i in 0..200 {
+            let p = [
+                i as f64 * 0.731 - 40.0,
+                i as f64 * 0.377 + 3.1,
+                i as f64 * -0.19 + 7.7,
+            ];
+            let (v, g) = perlin_gradient(p[0], p[1], p[2]);
+            assert!((v - perlin(p[0], p[1], p[2])).abs() < 1e-12);
+            for axis in 0..3 {
+                let mut q = p;
+                q[axis] += E;
+                let mut r = p;
+                r[axis] -= E;
+                let fd = (perlin(q[0], q[1], q[2]) - perlin(r[0], r[1], r[2])) / (2.0 * E);
+                assert!(
+                    (fd - g[axis]).abs() < 1e-5,
+                    "axis {axis}: {fd} vs {}",
+                    g[axis]
+                );
+            }
+        }
     }
 
     #[test]
