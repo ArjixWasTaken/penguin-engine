@@ -1591,7 +1591,12 @@ impl<'a> FrameBuilder<'a> {
                 sub.model_matrix(),
                 Mesh::Triangles(MeshData::default()),
                 blend_mode(&pass.blending),
-                Camera::Scene,
+                // Flag 4: drawn through the scene's perspective camera.
+                if sub.perspective() {
+                    Camera::Perspective
+                } else {
+                    Camera::Scene
+                },
             );
             draws.push((index, self.steps.len() - 1));
         }
