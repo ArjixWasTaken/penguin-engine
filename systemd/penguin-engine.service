@@ -11,9 +11,9 @@ After=penguin-engine.socket
 Type=notify
 NotifyAccess=main
 # Without a wallpaper argument the daemon restores the saved wallpapers; it
-# reads ~/.config/penguin-engine/config.toml. Adjust the path to where
-# the binary is installed (cargo install --path apps/penguind puts it in
-# ~/.cargo/bin).
+# reads ~/.config/penguin-engine/config.toml. The path is where
+# `cargo install --path apps/penguind` puts the binary; packages use
+# /usr/bin/penguind.
 ExecStart=%h/.cargo/bin/penguind
 ExecReload=kill -HUP $MAINPID
 Restart=on-failure

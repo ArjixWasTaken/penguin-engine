@@ -1,0 +1,11 @@
+[Desktop Entry]
+Type=Application
+Name=Penguin Engine
+GenericName=Wallpaper Manager
+Comment=Browse, apply and customize animated wallpapers
+Exec=penguin-engine
+Icon=dev.arjix.penguin-engine
+Terminal=false
+Categories=Settings;DesktopSettings;
+Keywords=wallpaper;background;desktop;animated;live;Wallpaper Engine;
+StartupWMClass=penguin-engine
