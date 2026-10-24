@@ -414,6 +414,10 @@ pub struct ScriptHost {
     pub single_layers: Vec<(i32, usize)>,
     /// Camera centre and zoom scripts set (`setCameraTransforms`).
     pub camera: Option<(Vec2, f32)>,
+    /// In 3D scenes, the perspective camera's eye, centre and up as last
+    /// drawn, and the ones scripts set instead.
+    pub view3d: Option<[Vec3; 3]>,
+    pub camera3d: Option<[Vec3; 3]>,
     /// Render targets scripts asked to clear (effect functions).
     pub clears: Vec<wpe_render::TargetId>,
     /// Id for the next created layer.
@@ -453,6 +457,8 @@ impl ScriptHost {
             particles_paused: Default::default(),
             single_layers: Vec::new(),
             camera: None,
+            view3d: None,
+            camera3d: None,
             clears: Vec::new(),
             next_id: 1,
             sounds: HashMap::new(),
@@ -1540,6 +1546,17 @@ impl SceneHost for ScriptHost {
     }
 
     fn scene_get(&self, property: &str) -> Option<ScriptValue> {
+        if property == "cameratransforms"
+            && let Some(view) = self.view3d
+        {
+            let [eye, center, up] = self.camera3d.unwrap_or(view);
+            return Some(ScriptValue::Json(serde_json::json!({
+                "eye": eye.to_array(),
+                "center": center.to_array(),
+                "up": up.to_array(),
+                "zoom": 1.0,
+            })));
+        }
         if property == "cameratransforms" {
             let half = Vec2::from_array(self.canvas) / 2.0;
             let (center, zoom) = self.camera.unwrap_or((half, 1.0));
@@ -1559,6 +1576,28 @@ impl SceneHost for ScriptHost {
     }
 
     fn scene_set(&mut self, property: &str, value: ScriptValue) {
+        if property == "cameratransforms"
+            && let (Some(view), ScriptValue::Json(t)) = (self.view3d, &value)
+        {
+            // A 3D scene's camera: where it is, looks at and which way is up.
+            let vector = |key: &str, default: Vec3| -> Vec3 {
+                let Some(v) = t.get(key) else { return default };
+                let n = |k: &str| v.get(k).and_then(Value::as_f64);
+                match (n("x"), n("y"), n("z")) {
+                    (Some(x), Some(y), Some(z)) => Vec3::new(x as f32, y as f32, z as f32),
+                    _ => match config_numbers(v)[..] {
+                        [x, y, z, ..] => Vec3::new(x as f32, y as f32, z as f32),
+                        _ => default,
+                    },
+                }
+            };
+            self.camera3d = Some([
+                vector("eye", view[0]),
+                vector("center", view[1]),
+                vector("up", view[2]),
+            ]);
+            return;
+        }
         if property == "cameratransforms" {
             // A flat scene's camera: where it looks and how far it zooms in.
             let ScriptValue::Json(t) = &value else { return };

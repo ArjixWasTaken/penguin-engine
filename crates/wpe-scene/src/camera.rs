@@ -124,6 +124,29 @@ impl PerspectiveCamera {
     pub fn view_proj(&self, output: (u32, u32), fill: FillMode) -> Mat4 {
         self.proj(output, fill) * self.view(output, fill)
     }
+
+    /// The `"reflected_perspective"` camera's view: this one mirrored about
+    /// the y = 0 floor (the view's y column negated), so points on the floor
+    /// stay where this camera sees them.
+    pub fn reflected_view(&self, output: (u32, u32), fill: FillMode) -> Mat4 {
+        self.view(output, fill) * Mat4::from_scale(Vec3::new(1.0, -1.0, 1.0))
+    }
+
+    /// Its projection, flipped vertically: the reflection target stores the
+    /// mirror image upside down, so floors sampling it at their own screen
+    /// position (with GL's y-up screen UVs) read the mirrored point.
+    pub fn reflected_proj(&self, output: (u32, u32), fill: FillMode) -> Mat4 {
+        Mat4::from_scale(Vec3::new(1.0, -1.0, 1.0)) * self.proj(output, fill)
+    }
+
+    pub fn reflected_view_proj(&self, output: (u32, u32), fill: FillMode) -> Mat4 {
+        self.reflected_proj(output, fill) * self.reflected_view(output, fill)
+    }
+
+    /// The eye mirrored below the floor.
+    pub fn reflected_eye(&self) -> Vec3 {
+        self.eye * Vec3::new(1.0, -1.0, 1.0)
+    }
 }
 
 /// 3D scenes' `"global_ortho"` overlay camera as the reference renderer
@@ -199,6 +222,31 @@ mod tests {
         // At distance 10 with a 90° vertical fov the view is 20 tall, 40 wide.
         assert!((project(vp, Vec3::new(20.0, 10.0, 0.0)) - Vec2::ONE).length() < 1e-5);
         assert_eq!(cam.eye(), Vec3::new(0.0, 0.0, 10.0));
+    }
+
+    #[test]
+    fn reflected_camera_keeps_the_floor_and_mirrors_the_rest() {
+        let cam = PerspectiveCamera {
+            eye: Vec3::new(1.7, 1.0, 2.9),
+            center: Vec3::ZERO,
+            up: Vec3::Y,
+            fov: 50.0,
+            near: 0.1,
+            far: 100.0,
+            fit: None,
+        };
+        let out = (640, 360);
+        let main = cam.view_proj(out, FillMode::Crop);
+        let refl = cam.reflected_view_proj(out, FillMode::Crop);
+        let flip = Vec2::new(1.0, -1.0);
+        // A floor point lands on the same pixel, stored upside down.
+        let floor = Vec3::new(0.3, 0.0, -0.4);
+        assert!((project(refl, floor) - project(main, floor) * flip).length() < 1e-5);
+        // A point above the floor shows where its mirror image below would.
+        let above = Vec3::new(0.3, 0.5, -0.4);
+        let below = above * Vec3::new(1.0, -1.0, 1.0);
+        assert!((project(refl, above) - project(main, below) * flip).length() < 1e-5);
+        assert_eq!(cam.reflected_eye(), Vec3::new(1.7, -1.0, 2.9));
     }
 
     #[test]

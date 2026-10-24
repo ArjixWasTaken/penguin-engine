@@ -25,12 +25,15 @@ dialect to SPIR-V and run through wgpu:
 - image layers with materials, blend modes, `colorBlendMode`, compose/fullscreen layers
 - image effect chains (ping-pong buffers, FBOs, copy commands, layer dependencies)
 - sprite sheets, video textures (libmpv), text layers, scene bloom
+- HDR scenes: 16-bit float colour buffers clamped on output, `bloomhdr*` settings and the
+  HDR mip-chain bloom (`postprocessing` `ultra`/`displayhdr`)
 - user properties, keyframe animations, camera parallax and shake
 - sound layers and audio-reactive spectrum (`--audio`)
 - particles (sprite, trail, rope) without geometry shaders
 - puppet warp (`.mdl` skinned meshes, bone animations, blend shapes)
 - 3D: model objects (`.mdl` meshes with depth testing and culling), perspective scenes and
-  perspective layers, point/spot/tube/directional lights
+  perspective layers, camera paths, reflections, point/spot/tube/directional lights with
+  shadow maps and volumetrics
 - SceneScript (QuickJS) on any scene value, with the engine services scripts use:
   - layers: transforms, colour, visibility (groups included), text and layout properties,
     `createLayer` / `destroyLayer` / `sortLayer` / `setParent` (the frame is rebuilt)
@@ -41,14 +44,14 @@ dialect to SPIR-V and run through wgpu:
   - custom geometry (`createModelData`, `applyData` / `replaceData`, `createLayer({model})`)
   - particles (`instance` overrides, `emitParticles`, play/pause/stop), material and
     effect constants, effect functions, effect visibility, scene settings
-    (`thisScene.bloom`, `camerashake`, ...), camera transforms
+    (`thisScene.bloom`, `camerashake`, ...), camera transforms (2D and 3D)
   - video (`getVideoTexture()`), sound layers (play/pause/stop/volume), media players
     over MPRIS (media events and the `$mediaThumbnail` album-art texture)
   - cursor events and hit boxes, `localStorage` (persisted per wallpaper), user property
     changes (`Wallpaper::set_user_property`, `scene-viewer --property name=value`),
     `openUserShortcut` (only shortcuts the user bound), `applyGeneralSettings`
 
-Not yet: camera paths and shadows in 3D scenes, HDR scenes, desktop background (wallpaper) mode and the wallpaper
+Not yet: light cookies, desktop background (wallpaper) mode and the wallpaper
 picker UI.
 
 Debugging aids: `WPE_SCRIPT_AUDIT=<file>` records script requests the runtime doesn't

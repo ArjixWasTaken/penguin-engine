@@ -103,21 +103,26 @@ pub fn translate_clip(src: &str) -> String {
 
 static COMBINED_SAMPLER: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(
-        r"(?m)^\s*uniform\s+(?:(?:highp|mediump|lowp)\s+)?sampler(2D|3D|Cube|2DArray)\s+(\w+)\s*;",
+        r"(?m)^\s*uniform\s+(?:(?:highp|mediump|lowp)\s+)?sampler(2D|3D|Cube|2DArray|2DShadow)\s+(\w+)\s*;",
     )
     .expect("valid regex")
 });
 
 /// Split each `uniform samplerXD name;` into a texture and a sampler (naga's
 /// SPIR-V frontend has no combined image-samplers), with a macro rebuilding
-/// the combined sampler at each use.
+/// the combined sampler at each use. Shadow samplers (WE's
+/// `sampler2DComparison`) get a comparison sampler.
 pub fn split_samplers(src: &str) -> String {
     COMBINED_SAMPLER
         .replace_all(src, |c: &regex::Captures| {
             let (dim, name) = (&c[1], &c[2]);
+            let (texture, sampler) = match dim {
+                "2DShadow" => ("2D", "samplerShadow"),
+                _ => (dim, "sampler"),
+            };
             format!(
-                "uniform texture{dim} {name}{TEXTURE_SUFFIX};\n\
-                 uniform sampler {name}{SAMPLER_SUFFIX};\n\
+                "uniform texture{texture} {name}{TEXTURE_SUFFIX};\n\
+                 uniform {sampler} {name}{SAMPLER_SUFFIX};\n\
                  #define {name} sampler{dim}({name}{TEXTURE_SUFFIX}, {name}{SAMPLER_SUFFIX})"
             )
         })
@@ -308,6 +313,10 @@ mod tests {
         let s = split_samplers("uniform sampler2D g_Texture0;\nuniform float x;\n");
         assert!(s.contains("uniform texture2D g_Texture0_wet;"));
         assert!(s.contains("#define g_Texture0 sampler2D(g_Texture0_wet, g_Texture0_wes)"));
+        let s = split_samplers("uniform sampler2DShadow g_Texture6;\n");
+        assert!(s.contains("uniform texture2D g_Texture6_wet;"));
+        assert!(s.contains("uniform samplerShadow g_Texture6_wes;"));
+        assert!(s.contains("sampler2DShadow(g_Texture6_wet, g_Texture6_wes)"));
     }
 
     #[test]

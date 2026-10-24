@@ -86,10 +86,10 @@ vec4  _westep(vec4  e, float x) { return step(e, vec4(x)); }
 #define step _westep
 
 #define sampler2DBackBuffer sampler2D
-#define sampler2DComparison sampler2D
-#define texSample2DBackBuffer(s, uv, res) texture((s), (uv))
+#define sampler2DComparison sampler2DShadow
+#define texSample2DBackBuffer(s, uv, res) texelFetch((s), clamp(ivec2((uv) * (res).xy), ivec2(0), ivec2((res).xy) - 1), 0)
 #define texLoad2D(t, uv, res) texelFetch((t), ivec2((uv) * (res).xy), 0)
-#define texSample2DCompare(s, uv, ref) vec4(1.0)
+#define texSample2DCompare(s, uv, ref) vec4(texture((s), vec3((uv), (ref))))
 
 #define float1 float
 #define float2 vec2
@@ -118,13 +118,144 @@ pub const GEOMETRY: &str = "\n";
 
 /// Injected for `#require LightingV1`; the definition of
 /// `ComputePBRLightShadow` comes from `common_pbr_2.h`.
+///
+/// Without shadows it lights with the legacy `g_Lights*` arrays. With
+/// `LIGHTS_SHADOW_MAPPING` it is Wallpaper Engine's generated version: the
+/// per-kind `g_L<Kind>_*` arrays sized by the `LIGHTS_<KIND>` combos, the
+/// first `LIGHTS_<KIND>_SHADOW` lights of a kind sampling the shadow atlas
+/// through the `g_LFeature_*` arrays. Spot lights and directional cascades
+/// share `g_LFeature_ShadowProjection*`: spots first, then three cascades
+/// per directional light.
 pub const LIGHTING_V1: &str = "
-uniform vec4 g_LightsPosition[4];
-uniform vec4 g_LightsColorRadius[4];
-
 vec3 ComputePBRLightShadow(vec3 N, vec3 L, vec3 V, vec3 albedo, vec3 lightColor,
     float radius, float exponent, vec3 specularTint, vec3 baseReflectance,
     float roughness, float metallic, float shadowFactor);
+
+#if LIGHTS_SHADOW_MAPPING
+#ifndef LIGHTS_POINT
+#define LIGHTS_POINT 0
+#endif
+#ifndef LIGHTS_SPOT
+#define LIGHTS_SPOT 0
+#endif
+#ifndef LIGHTS_TUBE
+#define LIGHTS_TUBE 0
+#endif
+#ifndef LIGHTS_DIRECTIONAL
+#define LIGHTS_DIRECTIONAL 0
+#endif
+#ifndef LIGHTS_POINT_SHADOW
+#define LIGHTS_POINT_SHADOW 0
+#endif
+#ifndef LIGHTS_SPOT_SHADOW
+#define LIGHTS_SPOT_SHADOW 0
+#endif
+#ifndef LIGHTS_DIRECTIONAL_SHADOW
+#define LIGHTS_DIRECTIONAL_SHADOW 0
+#endif
+
+vec3 ComputePBRLightShadowInfinite(vec3 N, vec3 L, vec3 V, vec3 albedo, vec3 lightColor,
+    vec3 specularTint, vec3 baseReflectance, float roughness, float metallic, float shadowFactor);
+
+#if LIGHTS_POINT
+uniform vec4 g_LPoint_Color[LIGHTS_POINT];
+uniform vec4 g_LPoint_Origin[LIGHTS_POINT];
+#endif
+#if LIGHTS_SPOT
+uniform vec4 g_LSpot_Color[LIGHTS_SPOT];
+uniform vec4 g_LSpot_Origin[LIGHTS_SPOT];
+uniform vec4 g_LSpot_Direction[LIGHTS_SPOT];
+uniform vec4 g_LSpot_Exponent[LIGHTS_SPOT];
+#endif
+#if LIGHTS_TUBE
+uniform vec4 g_LTube_Color[LIGHTS_TUBE];
+uniform vec4 g_LTube_OriginA[LIGHTS_TUBE];
+uniform vec4 g_LTube_OriginB[LIGHTS_TUBE];
+#endif
+#if LIGHTS_DIRECTIONAL
+uniform vec4 g_LDirectional_Color[LIGHTS_DIRECTIONAL];
+uniform vec4 g_LDirectional_Direction[LIGHTS_DIRECTIONAL];
+#endif
+#if LIGHTS_POINT_SHADOW
+uniform vec4 g_LFeature_ShadowPointProjection[LIGHTS_POINT_SHADOW];
+uniform vec4 g_LFeature_ShadowPointProjectionTransform[LIGHTS_POINT_SHADOW];
+#endif
+#if LIGHTS_SPOT_SHADOW || LIGHTS_DIRECTIONAL_SHADOW
+uniform mat4 g_LFeature_ShadowProjection[LIGHTS_SPOT_SHADOW + 3 * LIGHTS_DIRECTIONAL_SHADOW];
+uniform vec4 g_LFeature_ShadowProjectionTransform[LIGHTS_SPOT_SHADOW + 3 * LIGHTS_DIRECTIONAL_SHADOW];
+#endif
+
+vec3 PerformLighting_V1(vec3 worldPos, vec3 color, vec3 normal, vec3 viewVector,
+    vec3 specularTint, vec3 ambient, float roughness, float metallic)
+{
+    vec3 light = CAST3(0.0);
+#if LIGHTS_POINT
+    for (int i = 0; i < LIGHTS_POINT; ++i) {
+        vec3 lightDelta = g_LPoint_Origin[i].xyz - worldPos;
+        float shadowFactor = 1.0;
+#if LIGHTS_POINT_SHADOW
+        if (i < LIGHTS_POINT_SHADOW) {
+            vec4 projectedCoords = CalculateProjectedCoordsPoint(worldPos, g_LPoint_Origin[i].xyz,
+                g_LFeature_ShadowPointProjection[i], g_LFeature_ShadowPointProjectionTransform[i]);
+            shadowFactor = PerformPointShadowMapping(projectedCoords);
+        }
+#endif
+        light += ComputePBRLightShadow(normal, lightDelta, viewVector, color, g_LPoint_Color[i].rgb,
+            g_LPoint_Color[i].w, g_LPoint_Origin[i].w, specularTint, ambient, roughness, metallic,
+            shadowFactor);
+    }
+#endif
+#if LIGHTS_SPOT
+    for (int i = 0; i < LIGHTS_SPOT; ++i) {
+        vec3 lightDelta = g_LSpot_Origin[i].xyz - worldPos;
+        float spotCookie = -dot(normalize(lightDelta), g_LSpot_Direction[i].xyz);
+        spotCookie = smoothstep(g_LSpot_Direction[i].w, g_LSpot_Origin[i].w, spotCookie);
+        float shadowFactor = 1.0;
+#if LIGHTS_SPOT_SHADOW
+        if (i < LIGHTS_SPOT_SHADOW) {
+            vec3 projectedCoords = CalculateProjectedCoords(worldPos, g_LFeature_ShadowProjection[i]);
+            shadowFactor = PerformShadowMapping(projectedCoords, g_LFeature_ShadowProjectionTransform[i]);
+        }
+#endif
+        light += ComputePBRLightShadow(normal, lightDelta, viewVector, color,
+            g_LSpot_Color[i].rgb * spotCookie, g_LSpot_Color[i].w, g_LSpot_Exponent[i].x,
+            specularTint, ambient, roughness, metallic, shadowFactor);
+    }
+#endif
+#if LIGHTS_TUBE
+    for (int i = 0; i < LIGHTS_TUBE; ++i) {
+        vec3 lightDelta = PointSegmentDelta(worldPos, g_LTube_OriginA[i].xyz, g_LTube_OriginB[i].xyz);
+        light += ComputePBRLightShadow(normal, lightDelta, viewVector, color, g_LTube_Color[i].rgb,
+            g_LTube_Color[i].w, g_LTube_OriginA[i].w, specularTint, ambient, roughness, metallic, 1.0);
+    }
+#endif
+#if LIGHTS_DIRECTIONAL
+    for (int i = 0; i < LIGHTS_DIRECTIONAL; ++i) {
+        float shadowFactor = 1.0;
+#if LIGHTS_DIRECTIONAL_SHADOW
+        if (i < LIGHTS_DIRECTIONAL_SHADOW) {
+            int p1 = LIGHTS_SPOT_SHADOW + 3 * i;
+            int p2 = p1 + 1;
+            int p3 = p1 + 2;
+            vec4 projectedCoords1 = CalculateProjectedCoordsCascades(worldPos, g_LFeature_ShadowProjection[p1]);
+            vec4 projectedCoords2 = CalculateProjectedCoordsCascades(worldPos, g_LFeature_ShadowProjection[p2]);
+            vec4 projectedCoords3 = CalculateProjectedCoordsCascades(worldPos, g_LFeature_ShadowProjection[p3]);
+            vec4 uvTransforms = mix(g_LFeature_ShadowProjectionTransform[p1], g_LFeature_ShadowProjectionTransform[p2], projectedCoords1.w);
+            uvTransforms = mix(uvTransforms, g_LFeature_ShadowProjectionTransform[p3], projectedCoords2.w);
+            projectedCoords1.xyz = mix(projectedCoords1.xyz, projectedCoords2.xyz, projectedCoords1.w);
+            projectedCoords1.xyz = mix(projectedCoords1.xyz, projectedCoords3.xyz, projectedCoords2.w);
+            shadowFactor = max(projectedCoords3.w, PerformShadowMapping(projectedCoords1.xyz, uvTransforms));
+        }
+#endif
+        light += ComputePBRLightShadowInfinite(normal, g_LDirectional_Direction[i].xyz, viewVector,
+            color, g_LDirectional_Color[i].rgb, specularTint, ambient, roughness, metallic, shadowFactor);
+    }
+#endif
+    return light;
+}
+#else
+uniform vec4 g_LightsPosition[4];
+uniform vec4 g_LightsColorRadius[4];
 
 vec3 PerformLighting_V1(vec3 worldPos, vec3 albedo, vec3 normal,
     vec3 viewVector, vec3 specularTint, vec3 f0, float roughness, float metallic)
@@ -141,4 +272,5 @@ vec3 PerformLighting_V1(vec3 worldPos, vec3 albedo, vec3 normal,
     }
     return light;
 }
+#endif
 ";

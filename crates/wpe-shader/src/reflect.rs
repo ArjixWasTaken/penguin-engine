@@ -2,7 +2,9 @@
 
 use std::collections::BTreeMap;
 
-use naga::{AddressSpace, Binding, ImageDimension, ScalarKind, TypeInner};
+use std::collections::BTreeSet;
+
+use naga::{AddressSpace, Binding, Expression, ImageClass, ImageDimension, ScalarKind, TypeInner};
 
 use crate::glslang::{GLOBALS_BLOCK, Stage};
 use crate::rewrite::{SAMPLER_SUFFIX, TEXTURE_SUFFIX};
@@ -56,12 +58,27 @@ pub enum TextureDim {
     D2Array,
 }
 
+/// How a texture is read, which decides the bindings it accepts.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum TextureKind {
+    /// Sampled with filtering (most textures).
+    #[default]
+    Filterable,
+    /// Only read with `texelFetch` (`texLoad2D`, back buffers): any float
+    /// texture fits, depth buffers and 32-bit float targets included.
+    Unfilterable,
+    /// A depth texture read with depth comparison (`sampler2DComparison`,
+    /// the shadow atlas).
+    Comparison,
+}
+
 /// A combined sampler from the source, split into two bindings.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct TextureBinding {
     pub texture: u32,
     pub sampler: u32,
     pub dim: TextureDim,
+    pub kind: TextureKind,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -108,6 +125,34 @@ pub fn validate(module: &naga::Module) -> Result<naga::valid::ModuleInfo, Reflec
     naga::valid::Validator::new(Default::default(), naga::valid::Capabilities::all())
         .validate(module)
         .map_err(|e| ReflectError::Validate(e.emit_to_string("")))
+}
+
+/// Images the module samples (rather than only loads from). `None` when
+/// some sampled image is not a global (a function argument), so which are
+/// sampled is unknown.
+fn sampled_images(module: &naga::Module) -> Option<BTreeSet<naga::Handle<naga::GlobalVariable>>> {
+    let mut sampled = BTreeSet::new();
+    let functions = module
+        .functions
+        .iter()
+        .map(|(_, f)| f)
+        .chain(module.entry_points.iter().map(|ep| &ep.function));
+    for function in functions {
+        for (_, expr) in function.expressions.iter() {
+            let image = match expr {
+                Expression::ImageSample { image, .. } => *image,
+                Expression::ImageQuery { image, .. } => *image,
+                _ => continue,
+            };
+            match function.expressions[image] {
+                Expression::GlobalVariable(handle) => {
+                    sampled.insert(handle);
+                }
+                _ => return None,
+            }
+        }
+    }
+    Some(sampled)
 }
 
 fn scalar(kind: ScalarKind) -> Scalar {
@@ -165,6 +210,7 @@ impl Reflection {
             (0..module.entry_points.len()).any(|i| !info.get_entry_point(i)[handle].is_empty())
         };
 
+        let sampled = sampled_images(module);
         let mut textures = BTreeMap::new();
         let mut samplers = BTreeMap::new();
         for (handle, var) in module.global_variables.iter() {
@@ -207,18 +253,32 @@ impl Reflection {
                         }
                     }
                 }
-                (TypeInner::Image { dim, arrayed, .. }, _) => {
+                (
+                    TypeInner::Image {
+                        dim,
+                        arrayed,
+                        class,
+                    },
+                    _,
+                ) => {
                     let dim = match (dim, arrayed) {
                         (ImageDimension::D3, _) => TextureDim::D3,
                         (ImageDimension::Cube, _) => TextureDim::Cube,
                         (_, true) => TextureDim::D2Array,
                         _ => TextureDim::D2,
                     };
+                    let kind = match class {
+                        ImageClass::Depth { .. } => TextureKind::Comparison,
+                        _ if sampled.as_ref().is_some_and(|s| !s.contains(&handle)) => {
+                            TextureKind::Unfilterable
+                        }
+                        _ => TextureKind::Filterable,
+                    };
                     let base = name
                         .strip_suffix(TEXTURE_SUFFIX)
                         .unwrap_or(&name)
                         .to_owned();
-                    textures.insert(base, (binding.binding, dim));
+                    textures.insert(base, (binding.binding, dim, kind));
                 }
                 (TypeInner::Sampler { .. }, _) => {
                     let base = name
@@ -230,14 +290,22 @@ impl Reflection {
                 _ => {}
             }
         }
-        for (name, (texture, dim)) in textures {
+        for (name, (texture, dim, kind)) in textures {
             let sampler = samplers.get(&name).copied().unwrap_or(texture + 1);
+            // A texture sampled in one stage and loaded in another is sampled.
+            let kind = match self.textures.get(&name).map(|t| t.kind) {
+                Some(TextureKind::Filterable) if kind == TextureKind::Unfilterable => {
+                    TextureKind::Filterable
+                }
+                _ => kind,
+            };
             self.textures.insert(
                 name,
                 TextureBinding {
                     texture,
                     sampler,
                     dim,
+                    kind,
                 },
             );
         }

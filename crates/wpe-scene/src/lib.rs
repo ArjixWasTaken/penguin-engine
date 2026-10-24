@@ -2,6 +2,7 @@
 
 mod animation;
 mod camera;
+mod camera_path;
 mod light;
 mod props;
 mod scene;
@@ -11,12 +12,14 @@ pub use animation::{Animation, AnimationMode, AnimationTime};
 pub use camera::{
     FillMode, OrthoCamera, PERSPECTIVE_DISTANCE, PerspectiveCamera, overlay_view_proj,
 };
+pub use camera_path::{CAMERA_FADE_SECONDS, CameraKeyframe, CameraPath, CameraPathPlayer};
 pub use light::{
-    LightKind, LightUniforms, MAX_LIGHTS, MAX_LIGHTS_PER_KIND, SceneLight, light_uniforms,
+    DEFAULT_CASCADES, LightKind, LightUniforms, LightsByKind, MAX_LIGHTS, MAX_LIGHTS_PER_KIND,
+    SHADOW_QUALITY, SceneLight, apply_light_extras, light_uniforms,
 };
 pub use props::UserProperties;
 pub use scene::{
-    Bloom, DrawItem, ImageLayer, ModelLayer, Motion, Parallax, ParticleSource, Scene, Shake,
-    apply_override, text_texture_name,
+    Bloom, DrawItem, HdrBloom, ImageLayer, ModelLayer, Motion, Parallax, ParticleSource, Scene,
+    Shake, apply_override, hdr_intent, text_texture_name,
 };
 pub use transform::{alignment_offset, local_transform};

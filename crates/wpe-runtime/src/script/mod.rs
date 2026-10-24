@@ -291,6 +291,13 @@ impl Scripts {
         self.host.camera
     }
 
+    /// In a 3D scene, tell scripts where the camera is (eye, centre, up);
+    /// returns the camera scripts set instead, if any.
+    pub fn view_camera(&mut self, view: [glam::Vec3; 3]) -> Option<[glam::Vec3; 3]> {
+        self.host.view3d = Some(view);
+        self.host.camera3d
+    }
+
     /// Call `handler(arg)` on every script exporting it (media events, ...).
     pub fn emit(&mut self, handler: &'static str, arg: &Value) {
         self.runtime.emit(&mut self.host, handler, arg);

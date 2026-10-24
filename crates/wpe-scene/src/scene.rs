@@ -31,6 +31,9 @@ pub struct Scene {
     /// `perspective` layers (lined up with `camera` on the z = 0 plane).
     pub perspective: PerspectiveCamera,
     pub clear_color: Vec3,
+    /// The scene renders in HDR: colour buffers hold unclamped floats and
+    /// the output clamps them (see [`hdr_intent`]).
+    pub hdr: bool,
     /// Scene-wide bloom post-processing, when enabled.
     pub bloom: Option<Bloom>,
     /// Mouse/position parallax, when enabled.
@@ -96,12 +99,78 @@ pub struct ModelLayer {
     pub object_index: usize,
 }
 
-/// Wallpaper Engine's legacy (LDR) bloom settings.
+/// Scene bloom settings. HDR scenes use the `bloomhdr*` strength and
+/// threshold, others `bloomstrength` / `bloomthreshold`.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct Bloom {
     pub strength: f32,
     pub threshold: f32,
     pub tint: Vec3,
+    /// The HDR mip-chain bloom, used instead of the legacy LDR passes.
+    pub mip_chain: Option<HdrBloom>,
+}
+
+/// Parameters of the HDR mip-chain bloom: HDR scenes whose
+/// `orthogonalprojection.postprocessing` is `ultra` or `displayhdr`.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct HdrBloom {
+    /// `bloomhdrfeather`: soft-knee width as a fraction of the threshold.
+    pub feather: f32,
+    /// `bloomhdriterations` and `bloomhdrscatter`, as authored. Wallpaper
+    /// Engine's use of them isn't known: like the reference renderer the
+    /// chain has four levels and upsamples with a neutral scatter (feeding
+    /// scatter into every level compounds and blows the bloom out).
+    pub iterations: u32,
+    pub scatter: f32,
+}
+
+impl Bloom {
+    fn from_general(
+        general: &wpe_assets::scene::SceneGeneral,
+        props: &UserProperties,
+        hdr: bool,
+    ) -> Self {
+        let (strength, threshold) = if hdr {
+            (&general.bloomhdrstrength, &general.bloomhdrthreshold)
+        } else {
+            (&general.bloomstrength, &general.bloomthreshold)
+        };
+        let preset = general
+            .orthogonalprojection
+            .as_ref()
+            .and_then(|p| p.postprocessing.as_deref());
+        // The mip chain needs the scene's own `hdr`, not the overbright
+        // auto-enable of [`hdr_intent`].
+        let mip_chain = (props.flag(&general.hdr)
+            && matches!(preset, Some("ultra" | "displayhdr")))
+        .then(|| HdrBloom {
+            feather: props.value(&general.bloomhdrfeather),
+            iterations: props.value(&general.bloomhdriterations).max(0.0) as u32,
+            scatter: props.value(&general.bloomhdrscatter),
+        });
+        Self {
+            strength: props.value(strength),
+            threshold: props.value(threshold),
+            tint: vec3(*props.value(&general.bloomtint)),
+            mip_chain,
+        }
+    }
+}
+
+/// Whether `scene` renders in HDR: `general.hdr`, or a particle instance
+/// override with `brightness` above 1, whose overbright colours would
+/// otherwise clamp per channel and add up to white.
+pub fn hdr_intent(scene: &wpe_assets::Scene, props: &UserProperties) -> bool {
+    props.flag(&scene.general.hdr)
+        || scene.objects.iter().any(|obj| match obj {
+            SceneObject::Particle(p) => p
+                .instanceoverride
+                .as_ref()
+                .and_then(|o| o.get("brightness"))
+                .and_then(|b| b.as_f64())
+                .is_some_and(|b| b > 1.0),
+            _ => false,
+        })
 }
 
 /// `general.camerashake*` settings.
@@ -492,11 +561,13 @@ impl Scene {
             PerspectiveCamera::global_perspective(camera, near, far)
         };
 
+        let hdr = hdr_intent(scene, props);
         Self {
             camera,
             is_3d,
             perspective,
             clear_color: vec3(*props.value(&general.clearcolor)),
+            hdr,
             parallax: props.flag(&general.cameraparallax).then(|| Parallax {
                 amount: props.value(&general.cameraparallaxamount),
                 delay: props.value(&general.cameraparallaxdelay),
@@ -507,11 +578,9 @@ impl Scene {
                 speed: props.value(&general.camerashakespeed),
                 roughness: props.value(&general.camerashakeroughness),
             }),
-            bloom: props.flag(&general.bloom).then(|| Bloom {
-                strength: props.value(&general.bloomstrength),
-                threshold: props.value(&general.bloomthreshold),
-                tint: vec3(*props.value(&general.bloomtint)),
-            }),
+            bloom: props
+                .flag(&general.bloom)
+                .then(|| Bloom::from_general(general, props, hdr)),
             groups: nodes
                 .iter()
                 .filter(|(_, n)| n.group)
@@ -679,7 +748,13 @@ fn scene_light(nodes: &HashMap<i32, Node>, props: &UserProperties, l: &LightObje
         outer_cone: cone(&l.outercone, 45.0),
         parent: common.parent,
         motion,
+        cast_shadow: false,
+        cast_volumetrics: false,
+        density: 1.0,
+        volumetrics_exponent: 1.0,
+        cascades: crate::light::DEFAULT_CASCADES,
     };
+    crate::light::apply_light_extras(&mut light, &l.extra, props);
     light.set_transform(light.motion.transform_at(0.0));
     light
 }
@@ -1070,5 +1145,65 @@ mod tests {
 
         let built = build(r#"{"general": {"fov": 50, "perspectiveoverridefov": 40}}"#);
         assert_eq!(built.perspective.fov, 40.0);
+    }
+
+    #[test]
+    fn hdr_intent_picks_bloom_parameters_and_path() {
+        let general = |extra: &str| {
+            format!(
+                r#"{{"general": {{"bloom": true, "bloomstrength": 0.5, "bloomthreshold": 0.6,
+                    "bloomhdrstrength": 3, "bloomhdrthreshold": 1.5, "bloomhdrfeather": 0.2,
+                    "bloomhdriterations": 6, "bloomhdrscatter": 0.7, {extra}}}}}"#
+            )
+        };
+        let ortho = r#""orthogonalprojection": {"width": 100, "height": 100"#;
+
+        let ldr = build(&general(&format!(
+            r#"{ortho}, "postprocessing": "ultra"}}"#
+        )));
+        assert!(!ldr.hdr);
+        let bloom = ldr.bloom.unwrap();
+        assert_eq!((bloom.strength, bloom.threshold), (0.5, 0.6));
+        assert_eq!(bloom.mip_chain, None);
+
+        let hdr = build(&general(&format!(r#""hdr": true, {ortho}}}"#)));
+        assert!(hdr.hdr);
+        let bloom = hdr.bloom.unwrap();
+        assert_eq!((bloom.strength, bloom.threshold), (3.0, 1.5));
+        assert_eq!(bloom.mip_chain, None);
+
+        for preset in ["ultra", "displayhdr"] {
+            let chain = build(&general(&format!(
+                r#""hdr": true, {ortho}, "postprocessing": "{preset}"}}"#
+            )));
+            let expected = HdrBloom {
+                feather: 0.2,
+                iterations: 6,
+                scatter: 0.7,
+            };
+            assert_eq!(chain.bloom.unwrap().mip_chain, Some(expected));
+        }
+
+        // Bound to a user property.
+        let scene: wpe_assets::Scene = wpe_assets::parse_json(&general(
+            r#""hdr": {"user": "gg", "value": true}, "orthogonalprojection": null"#,
+        ))
+        .unwrap();
+        let mut props = UserProperties::default();
+        assert!(hdr_intent(&scene, &props));
+        props.set("gg", serde_json::json!(false));
+        assert!(!hdr_intent(&scene, &props));
+
+        // Overbright particle overrides switch HDR on.
+        let overbright = |b: &str| {
+            let scene: wpe_assets::Scene = wpe_assets::parse_json(&format!(
+                r#"{{"objects": [{{"id": 1, "particle": "p.json",
+                    "instanceoverride": {{"brightness": {b}}}}}]}}"#
+            ))
+            .unwrap();
+            hdr_intent(&scene, &UserProperties::default())
+        };
+        assert!(overbright("5.0"));
+        assert!(!overbright("1.0"));
     }
 }

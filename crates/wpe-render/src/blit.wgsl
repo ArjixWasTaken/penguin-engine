@@ -17,5 +17,7 @@ fn vs_main(@builtin(vertex_index) vi: u32) -> VsOut {
 
 @fragment
 fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
-    return vec4<f32>(textureSample(tex, samp, in.uv).rgb, 1.0);
+    // HDR scenes hold unclamped values; like Wallpaper Engine's combine
+    // into an SDR backbuffer, the output is clipped to [0, 1].
+    return vec4<f32>(clamp(textureSample(tex, samp, in.uv).rgb, vec3<f32>(0.0), vec3<f32>(1.0)), 1.0);
 }

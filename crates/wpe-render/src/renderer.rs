@@ -4,8 +4,10 @@ use glam::{Mat4, Vec2, Vec4};
 
 use crate::image_pipeline::{ImagePipelines, ImageUniforms};
 use crate::material::{
-    FrameGlobals, MaterialDraw, PassDepth, Placeholders, PreparedMaterialDraw, RasterState,
+    Bindables, FrameGlobals, MaterialDraw, PassDepth, Placeholders, PreparedMaterialDraw,
+    RasterState, TexRef,
 };
+use crate::shadow::{ShadowLights, ShadowMaps};
 use crate::targets::{DEFAULT_FORMAT, DepthBuffers, TargetDesc, TargetId, Targets, depth_view};
 use crate::{BlendMode, Gpu, GpuTexture};
 
@@ -42,6 +44,16 @@ pub enum Step {
         from: TargetId,
         to: TargetId,
     },
+    /// Draw the material draw at step `source` again into `target`, seen by
+    /// the reflected camera ([`FrameGlobals::reflected`]) and lit by mirrored
+    /// lights: a planar reflection. It shows and hides with its source.
+    ///
+    /// The first mirror step and every step after it run before the
+    /// frame's other steps, so the reflection is ready when they sample it.
+    Mirror {
+        target: TargetId,
+        source: usize,
+    },
 }
 
 struct PreparedImageDraw {
@@ -54,13 +66,23 @@ struct PreparedImageDraw {
 enum PreparedStep {
     Image(TargetId, PreparedImageDraw),
     Material(TargetId, PreparedMaterialDraw),
-    Copy { from: TargetId, to: TargetId },
+    Copy {
+        from: TargetId,
+        to: TargetId,
+    },
+    /// [`Step::Mirror`], with its source's depth and culling.
+    Mirror {
+        target: TargetId,
+        source: usize,
+        raster: RasterState,
+    },
 }
 
 impl PreparedStep {
     fn draw_target(&self) -> Option<TargetId> {
         match self {
             Self::Image(t, _) | Self::Material(t, _) => Some(*t),
+            Self::Mirror { target, .. } => Some(*target),
             Self::Copy { .. } => None,
         }
     }
@@ -69,6 +91,7 @@ impl PreparedStep {
     fn raster(&self) -> RasterState {
         match self {
             Self::Material(_, d) => d.draw.raster,
+            Self::Mirror { raster, .. } => *raster,
             _ => RasterState::default(),
         }
     }
@@ -87,7 +110,11 @@ fn needs_depth(steps: &[PreparedStep], hidden: &[bool]) -> bool {
 /// `_rt_default` to an output view.
 pub struct SceneRenderer {
     images: ImagePipelines,
-    blit_pipeline: wgpu::RenderPipeline,
+    blit_module: wgpu::ShaderModule,
+    blit_pipeline_layout: wgpu::PipelineLayout,
+    /// Present pipelines by output format.
+    blit_pipelines: std::collections::HashMap<wgpu::TextureFormat, wgpu::RenderPipeline>,
+    output_format: wgpu::TextureFormat,
     blit_layout: wgpu::BindGroupLayout,
     blit_bind_group: Option<(u64, wgpu::BindGroup)>,
     targets: Targets,
@@ -96,11 +123,17 @@ pub struct SceneRenderer {
     steps: Vec<PreparedStep>,
     /// Steps skipped this frame.
     hidden: Vec<bool>,
+    /// Steps from here on run first ([`Step::Mirror`]).
+    prelude: usize,
     placeholders: Placeholders,
     /// Uniforms written into every material draw that declares them.
     globals: std::collections::HashMap<String, Vec<f32>>,
     /// Targets to zero before the next frame's passes ([`Self::clear_target`]).
     pending_clears: Vec<TargetId>,
+    /// Uniforms in output texels ([`Self::set_texel_uniform`]).
+    texel_uniforms: Vec<(usize, String, [f32; 4])>,
+    /// Shadow-casting lights, their casters and the shadow atlas.
+    shadows: ShadowMaps,
     pub clear_color: wgpu::Color,
 }
 
@@ -129,46 +162,79 @@ impl SceneRenderer {
                 },
             ],
         });
-        let layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+        let blit_pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
             label: Some("blit"),
             bind_group_layouts: &[Some(&blit_layout)],
             immediate_size: 0,
         });
-        let blit_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
-            label: Some("blit"),
-            layout: Some(&layout),
-            vertex: wgpu::VertexState {
-                module: &module,
-                entry_point: Some("vs_main"),
-                compilation_options: Default::default(),
-                buffers: &[],
-            },
-            primitive: Default::default(),
-            depth_stencil: None,
-            multisample: Default::default(),
-            fragment: Some(wgpu::FragmentState {
-                module: &module,
-                entry_point: Some("fs_main"),
-                compilation_options: Default::default(),
-                targets: &[Some(output_format.into())],
-            }),
-            multiview_mask: None,
-            cache: None,
-        });
-        Self {
-            images: ImagePipelines::new(device, DEFAULT_FORMAT),
-            blit_pipeline,
+        let mut renderer = Self {
+            images: ImagePipelines::new(device),
+            blit_module: module,
+            blit_pipeline_layout,
+            blit_pipelines: Default::default(),
+            output_format,
             blit_layout,
             blit_bind_group: None,
             targets: Targets::new(gpu),
             depth: DepthBuffers::default(),
             steps: Vec::new(),
             hidden: Vec::new(),
+            prelude: 0,
             placeholders: Placeholders::new(gpu),
             globals: Default::default(),
             pending_clears: Vec::new(),
+            texel_uniforms: Vec::new(),
+            shadows: ShadowMaps::default(),
             clear_color: wgpu::Color::BLACK,
-        }
+        };
+        renderer.blit_pipeline(device, output_format);
+        renderer
+    }
+
+    /// The present pipeline writing into `format`.
+    fn blit_pipeline(
+        &mut self,
+        device: &wgpu::Device,
+        format: wgpu::TextureFormat,
+    ) -> wgpu::RenderPipeline {
+        let (module, layout) = (&self.blit_module, &self.blit_pipeline_layout);
+        self.blit_pipelines
+            .entry(format)
+            .or_insert_with(|| {
+                device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+                    label: Some("blit"),
+                    layout: Some(layout),
+                    vertex: wgpu::VertexState {
+                        module,
+                        entry_point: Some("vs_main"),
+                        compilation_options: Default::default(),
+                        buffers: &[],
+                    },
+                    primitive: Default::default(),
+                    depth_stencil: None,
+                    multisample: Default::default(),
+                    fragment: Some(wgpu::FragmentState {
+                        module,
+                        entry_point: Some("fs_main"),
+                        compilation_options: Default::default(),
+                        targets: &[Some(format.into())],
+                    }),
+                    multiview_mask: None,
+                    cache: None,
+                })
+            })
+            .clone()
+    }
+
+    /// Format of `_rt_default`: [`DEFAULT_FORMAT`], or
+    /// [`crate::HDR_FORMAT`] for HDR scenes. Every other target holding scene
+    /// colour must match it, since copies need identical formats.
+    pub fn set_scene_format(&mut self, format: wgpu::TextureFormat) {
+        self.targets.set_default_format(format);
+    }
+
+    pub fn scene_format(&self) -> wgpu::TextureFormat {
+        self.targets.format(TargetId::DEFAULT)
     }
 
     /// Replace the frame: extra render targets (ids from 1, in order; 0 is
@@ -187,9 +253,54 @@ impl SceneRenderer {
                     draw: Draw::Material(draw),
                 } => PreparedStep::Material(target, PreparedMaterialDraw::new(gpu, draw)),
                 Step::Copy { from, to } => PreparedStep::Copy { from, to },
+                Step::Mirror { target, source } => PreparedStep::Mirror {
+                    target,
+                    source,
+                    raster: RasterState::default(),
+                },
             })
             .collect();
+        for i in 0..self.steps.len() {
+            let PreparedStep::Mirror { source, .. } = self.steps[i] else {
+                continue;
+            };
+            let raster = match self.steps.get_mut(source) {
+                Some(PreparedStep::Material(_, d)) => {
+                    d.enable_mirror(gpu);
+                    d.draw.raster
+                }
+                _ => continue,
+            };
+            if let PreparedStep::Mirror { raster: r, .. } = &mut self.steps[i] {
+                *r = raster;
+            }
+        }
+        self.prelude = self
+            .steps
+            .iter()
+            .position(|s| matches!(s, PreparedStep::Mirror { .. }))
+            .unwrap_or(self.steps.len());
         self.hidden = vec![false; self.steps.len()];
+        self.texel_uniforms.clear();
+        self.shadows.set_casters(Vec::new());
+    }
+
+    /// The scene's shadow-casting lights (none: no shadow atlas). Set again
+    /// whenever they move.
+    pub fn set_shadow_lights(&mut self, lights: ShadowLights) {
+        self.shadows.set_lights(lights);
+    }
+
+    /// The material draws (step indices) whose geometry casts shadows.
+    pub fn set_shadow_casters(&mut self, steps: Vec<usize>) {
+        self.shadows.set_casters(steps);
+    }
+
+    /// Set uniform `name` of the material draw at `step` every frame to
+    /// `scale` times the output's texel size (1/width, 1/height, 1/width,
+    /// 1/height), for sample offsets that follow the output resolution.
+    pub fn set_texel_uniform(&mut self, step: usize, name: &str, scale: [f32; 4]) {
+        self.texel_uniforms.push((step, name.to_owned(), scale));
     }
 
     /// Show or hide the draw at `step`.
@@ -311,6 +422,20 @@ impl SceneRenderer {
         size: (u32, u32),
     ) {
         self.draw_scene(gpu, encoder, globals, size);
+        let format = self.output_format;
+        self.present(gpu, encoder, output, format);
+    }
+
+    /// Draw `_rt_default` onto `output`, clamped to the displayable range
+    /// (HDR scenes hold values above 1).
+    fn present(
+        &mut self,
+        gpu: &Gpu,
+        encoder: &mut wgpu::CommandEncoder,
+        output: &wgpu::TextureView,
+        format: wgpu::TextureFormat,
+    ) {
+        let pipeline = self.blit_pipeline(&gpu.device, format);
         let generation = self.targets.generation;
         if self
             .blit_bind_group
@@ -348,7 +473,7 @@ impl SceneRenderer {
             })],
             ..Default::default()
         });
-        pass.set_pipeline(&self.blit_pipeline);
+        pass.set_pipeline(&pipeline);
         if let Some((_, group)) = &self.blit_bind_group {
             pass.set_bind_group(0, group, &[]);
         }
@@ -359,7 +484,30 @@ impl SceneRenderer {
     pub fn capture(&mut self, gpu: &Gpu, globals: FrameGlobals, size: (u32, u32)) -> Vec<u8> {
         let mut encoder = gpu.device.create_command_encoder(&Default::default());
         self.draw_scene(gpu, &mut encoder, globals, size);
-        let rt = self.targets.get(TargetId::DEFAULT);
+        // An HDR `_rt_default` is read through the present pass, as shown.
+        let presented = (self.scene_format() != DEFAULT_FORMAT).then(|| {
+            let texture = gpu.device.create_texture(&wgpu::TextureDescriptor {
+                label: Some("capture"),
+                size: wgpu::Extent3d {
+                    width: size.0,
+                    height: size.1,
+                    depth_or_array_layers: 1,
+                },
+                mip_level_count: 1,
+                sample_count: 1,
+                dimension: wgpu::TextureDimension::D2,
+                format: DEFAULT_FORMAT,
+                usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC,
+                view_formats: &[],
+            });
+            let view = texture.create_view(&Default::default());
+            self.present(gpu, &mut encoder, &view, DEFAULT_FORMAT);
+            texture
+        });
+        let source = match &presented {
+            Some(texture) => texture,
+            None => &self.targets.get(TargetId::DEFAULT).texture,
+        };
 
         let row = size.0 * 4;
         let padded_row = row.next_multiple_of(wgpu::COPY_BYTES_PER_ROW_ALIGNMENT);
@@ -370,7 +518,7 @@ impl SceneRenderer {
             mapped_at_creation: false,
         });
         encoder.copy_texture_to_buffer(
-            rt.texture.as_image_copy(),
+            source.as_image_copy(),
             wgpu::TexelCopyBufferInfo {
                 buffer: &buffer,
                 layout: wgpu::TexelCopyBufferLayout {
@@ -403,6 +551,49 @@ impl SceneRenderer {
         out
     }
 
+    /// Clear the depth buffers the shown draws in `start..end` (drawing into
+    /// `target`) sample, if nothing drew depth into them yet this frame.
+    fn clear_sampled_depth(
+        &mut self,
+        gpu: &Gpu,
+        encoder: &mut wgpu::CommandEncoder,
+        start: usize,
+        end: usize,
+        target: TargetId,
+    ) {
+        for j in start..end {
+            let (Some(PreparedStep::Material(_, d)), Some(false)) =
+                (self.steps.get(j), self.hidden.get(j))
+            else {
+                continue;
+            };
+            for tex in d.draw.textures.iter().flatten() {
+                let TexRef::Depth(t) = *tex else {
+                    continue;
+                };
+                if t.0 >= self.targets.len() || t == target {
+                    continue;
+                }
+                let size = self.targets.get(t).size;
+                let (view, first) = self.depth.get(t, size, |size| depth_view(gpu, size));
+                if first {
+                    encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                        label: Some("clear sampled depth"),
+                        depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
+                            view,
+                            depth_ops: Some(wgpu::Operations {
+                                load: wgpu::LoadOp::Clear(1.0),
+                                store: wgpu::StoreOp::Store,
+                            }),
+                            stencil_ops: None,
+                        }),
+                        ..Default::default()
+                    });
+                }
+            }
+        }
+    }
+
     fn draw_scene(
         &mut self,
         gpu: &Gpu,
@@ -413,7 +604,42 @@ impl SceneRenderer {
         let size = (size.0.max(1), size.1.max(1));
         globals.screen = Vec2::new(size.0 as f32, size.1 as f32);
         self.targets.prepare(gpu, size);
+        for (step, name, scale) in &self.texel_uniforms {
+            if let Some(PreparedStep::Material(_, d)) = self.steps.get_mut(*step) {
+                let texel = [globals.screen.x, globals.screen.y].map(|v| 1.0 / v);
+                let values = (0..4).map(|i| scale[i] * texel[i % 2]).collect();
+                d.overrides.insert(name.clone(), values);
+            }
+        }
 
+        for (name, values) in self.shadows.prepare(gpu, &globals) {
+            self.globals.insert(name, values);
+        }
+        // Depth buffers that draws sample exist before they are bound.
+        for step in &self.steps {
+            let PreparedStep::Material(_, d) = step else {
+                continue;
+            };
+            for tex in d.draw.textures.iter().flatten() {
+                if let TexRef::Depth(t) = *tex
+                    && t.0 < self.targets.len()
+                {
+                    let size = self.targets.get(t).size;
+                    self.depth.ensure(t, size, |size| depth_view(gpu, size));
+                }
+            }
+        }
+        let bindables = Bindables {
+            placeholders: &self.placeholders,
+            targets: &self.targets,
+            depth: &self.depth,
+            shadow_atlas: self.shadows.atlas(),
+            generation: self
+                .targets
+                .generation
+                .wrapping_add(self.depth.generation)
+                .wrapping_add(self.shadows.generation),
+        };
         for step in &mut self.steps {
             match step {
                 PreparedStep::Image(_, d) => {
@@ -426,14 +652,8 @@ impl SceneRenderer {
                     gpu.queue
                         .write_buffer(&d.uniforms, 0, bytemuck::bytes_of(&uniforms));
                 }
-                PreparedStep::Material(_, d) => d.update(
-                    gpu,
-                    &globals,
-                    &self.globals,
-                    &self.placeholders,
-                    &self.targets,
-                ),
-                PreparedStep::Copy { .. } => {}
+                PreparedStep::Material(_, d) => d.update(gpu, &globals, &self.globals, &bindables),
+                PreparedStep::Copy { .. } | PreparedStep::Mirror { .. } => {}
             }
         }
 
@@ -455,101 +675,131 @@ impl SceneRenderer {
                 ..Default::default()
             });
         }
+        if self.shadows.atlas().is_some() {
+            let casters: Vec<(usize, &PreparedMaterialDraw)> = self
+                .shadows
+                .casters
+                .iter()
+                .filter_map(|&i| match (self.steps.get(i), self.hidden.get(i)) {
+                    (Some(PreparedStep::Material(_, d)), Some(false)) => Some((i, d)),
+                    _ => None,
+                })
+                .collect();
+            self.shadows.render(gpu, encoder, &casters);
+        }
+        let scene_format = self.scene_format();
         let mut written = vec![false; self.targets.len()];
         self.depth.begin_frame(self.targets.len());
-        let mut i = 0;
-        while i < self.steps.len() {
-            if self.hidden[i] && matches!(self.steps[i], PreparedStep::Copy { .. }) {
-                i += 1;
-                continue;
+        let (prelude, len) = (self.prelude.min(self.steps.len()), self.steps.len());
+        for i in prelude..len {
+            if let PreparedStep::Mirror { source, .. } = self.steps[i] {
+                self.hidden[i] = self.hidden.get(source).copied().unwrap_or(true);
             }
-            if let PreparedStep::Copy { from, to } = self.steps[i] {
-                let (src, dst) = (self.targets.get(from), self.targets.get(to));
-                encoder.copy_texture_to_texture(
-                    src.texture.as_image_copy(),
-                    dst.texture.as_image_copy(),
-                    wgpu::Extent3d {
-                        width: src.size.0.min(dst.size.0),
-                        height: src.size.1.min(dst.size.1),
-                        depth_or_array_layers: 1,
-                    },
-                );
-                written[to.0] = true;
-                i += 1;
-                continue;
-            }
-            let target = self.steps[i].draw_target().expect("not a copy");
-            let end = (i..self.steps.len())
-                .find(|&j| self.steps[j].draw_target() != Some(target))
-                .unwrap_or(self.steps.len());
-            // Hidden draws must not clear their target either.
-            if self.hidden[i..end].iter().all(|&h| h) {
-                i = end;
-                continue;
-            }
-            let load = if written[target.0] {
-                wgpu::LoadOp::Load
-            } else if target == TargetId::DEFAULT {
-                wgpu::LoadOp::Clear(self.clear_color)
-            } else {
-                wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT)
-            };
-            written[target.0] = true;
-            let format = self.targets.format(target);
-            let color = self.targets.get(target);
-            let depth = if needs_depth(&self.steps[i..end], &self.hidden[i..end]) {
-                let (view, first) = self
-                    .depth
-                    .get(target, color.size, |size| depth_view(gpu, size));
-                let load = if first {
-                    wgpu::LoadOp::Clear(1.0)
-                } else {
-                    wgpu::LoadOp::Load
-                };
-                Some(wgpu::RenderPassDepthStencilAttachment {
-                    view,
-                    depth_ops: Some(wgpu::Operations {
-                        load,
-                        store: wgpu::StoreOp::Store,
-                    }),
-                    stencil_ops: None,
-                })
-            } else {
-                None
-            };
-            let depth_attached = depth.is_some();
-            let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-                label: Some("scene"),
-                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                    view: &color.view,
-                    depth_slice: None,
-                    resolve_target: None,
-                    ops: wgpu::Operations {
-                        load,
-                        store: wgpu::StoreOp::Store,
-                    },
-                })],
-                depth_stencil_attachment: depth,
-                ..Default::default()
-            });
-            for (step, hidden) in self.steps[i..end].iter().zip(&self.hidden[i..end]) {
-                if *hidden {
+        }
+        // Mirror passes and the steps after them first, then the rest.
+        for (start, stop) in [(prelude, len), (0, prelude)] {
+            let mut i = start;
+            while i < stop {
+                if self.hidden[i] && matches!(self.steps[i], PreparedStep::Copy { .. }) {
+                    i += 1;
                     continue;
                 }
-                match step {
-                    PreparedStep::Image(_, d) if format == DEFAULT_FORMAT => {
-                        let depth = PassDepth::new(RasterState::default(), depth_attached);
-                        pass.set_pipeline(&self.images.get(&gpu.device, d.draw.blend, depth));
-                        pass.set_bind_group(0, &d.bind_group, &[]);
-                        pass.draw(0..4, 0..1);
-                    }
-                    PreparedStep::Material(_, d) => {
-                        d.record(&gpu.device, &mut pass, format, depth_attached)
-                    }
-                    _ => {}
+                if let PreparedStep::Copy { from, to } = self.steps[i] {
+                    let (src, dst) = (self.targets.get(from), self.targets.get(to));
+                    encoder.copy_texture_to_texture(
+                        src.texture.as_image_copy(),
+                        dst.texture.as_image_copy(),
+                        wgpu::Extent3d {
+                            width: src.size.0.min(dst.size.0),
+                            height: src.size.1.min(dst.size.1),
+                            depth_or_array_layers: 1,
+                        },
+                    );
+                    written[to.0] = true;
+                    i += 1;
+                    continue;
                 }
+                let target = self.steps[i].draw_target().expect("not a copy");
+                let end = (i..stop)
+                    .find(|&j| self.steps[j].draw_target() != Some(target))
+                    .unwrap_or(stop);
+                // Hidden draws must not clear their target either.
+                if self.hidden[i..end].iter().all(|&h| h) {
+                    i = end;
+                    continue;
+                }
+                self.clear_sampled_depth(gpu, encoder, i, end, target);
+                let load = if written[target.0] {
+                    wgpu::LoadOp::Load
+                } else if target == TargetId::DEFAULT {
+                    wgpu::LoadOp::Clear(self.clear_color)
+                } else {
+                    wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT)
+                };
+                written[target.0] = true;
+                let format = self.targets.format(target);
+                let color = self.targets.get(target);
+                let depth = if needs_depth(&self.steps[i..end], &self.hidden[i..end]) {
+                    let (view, first) = self
+                        .depth
+                        .get(target, color.size, |size| depth_view(gpu, size));
+                    let load = if first {
+                        wgpu::LoadOp::Clear(1.0)
+                    } else {
+                        wgpu::LoadOp::Load
+                    };
+                    Some(wgpu::RenderPassDepthStencilAttachment {
+                        view,
+                        depth_ops: Some(wgpu::Operations {
+                            load,
+                            store: wgpu::StoreOp::Store,
+                        }),
+                        stencil_ops: None,
+                    })
+                } else {
+                    None
+                };
+                let depth_attached = depth.is_some();
+                let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                    label: Some("scene"),
+                    color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                        view: &color.view,
+                        depth_slice: None,
+                        resolve_target: None,
+                        ops: wgpu::Operations {
+                            load,
+                            store: wgpu::StoreOp::Store,
+                        },
+                    })],
+                    depth_stencil_attachment: depth,
+                    ..Default::default()
+                });
+                for (step, hidden) in self.steps[i..end].iter().zip(&self.hidden[i..end]) {
+                    if *hidden {
+                        continue;
+                    }
+                    match step {
+                        PreparedStep::Image(_, d) if format == scene_format => {
+                            let depth = PassDepth::new(RasterState::default(), depth_attached);
+                            let pipeline =
+                                self.images.get(&gpu.device, d.draw.blend, depth, format);
+                            pass.set_pipeline(&pipeline);
+                            pass.set_bind_group(0, &d.bind_group, &[]);
+                            pass.draw(0..4, 0..1);
+                        }
+                        PreparedStep::Material(_, d) => {
+                            d.record(&gpu.device, &mut pass, format, depth_attached)
+                        }
+                        PreparedStep::Mirror { source, .. } => {
+                            if let Some(PreparedStep::Material(_, d)) = self.steps.get(*source) {
+                                d.record_mirror(&gpu.device, &mut pass, format, depth_attached)
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+                i = end;
             }
-            i = end;
         }
         if !written[TargetId::DEFAULT.0] {
             encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
@@ -708,5 +958,119 @@ mod tests {
             assert_eq!(at(3, 0), [0, 255, 0]);
             assert_eq!(at(3, 3), [0, 0, 255]);
         }
+    }
+
+    #[test]
+    fn hdr_scenes_keep_overbright_values_until_presented() {
+        let instance =
+            wgpu::Instance::new(wgpu::InstanceDescriptor::new_without_display_handle_from_env());
+        let Ok(gpu) = pollster::block_on(Gpu::new(instance, None)) else {
+            eprintln!("no GPU; skipped");
+            return;
+        };
+        let program = flat_program(&gpu);
+        let full = || quad(-1.0, 1.0, -1.0, 1.0, 0.5);
+        let steps = || {
+            let mut subtract = draw(
+                &program,
+                full(),
+                [-1.0, -1.0, 0.0, 1.0],
+                RasterState::default(),
+            );
+            if let Step::Draw {
+                draw: Draw::Material(d),
+                ..
+            } = &mut subtract
+            {
+                d.blend = BlendMode::Additive;
+            }
+            vec![
+                draw(
+                    &program,
+                    full(),
+                    [1.5, 2.5, 0.25, 1.0],
+                    RasterState::default(),
+                ),
+                subtract,
+            ]
+        };
+        let mut renderer = SceneRenderer::new(&gpu, DEFAULT_FORMAT);
+        renderer.set_frame(&gpu, Vec::new(), steps());
+        // 8-bit targets clamp each draw's output.
+        let pixels = renderer.capture(&gpu, FrameGlobals::default(), (2, 2));
+        assert_eq!(&pixels[..3], [255, 255, 64]);
+
+        renderer.set_scene_format(crate::HDR_FORMAT);
+        renderer.set_frame(&gpu, Vec::new(), steps());
+        let pixels = renderer.capture(&gpu, FrameGlobals::default(), (2, 2));
+        // 1.5 - 1 and 2.5 - 1 (clamped when presented).
+        assert_eq!(&pixels[..3], [128, 255, 64]);
+    }
+
+    #[test]
+    fn mirror_draws_run_first_with_the_reflected_camera() {
+        let instance =
+            wgpu::Instance::new(wgpu::InstanceDescriptor::new_without_display_handle_from_env());
+        let Ok(gpu) = pollster::block_on(Gpu::new(instance, None)) else {
+            eprintln!("no GPU; skipped");
+            return;
+        };
+        let program = flat_program(&gpu);
+        let reflection = TargetId(1);
+        let steps = || {
+            // Red over the top half, seen by the perspective camera.
+            let mut top = draw(
+                &program,
+                quad(-1.0, 1.0, 0.0, 1.0, 0.5),
+                [1., 0., 0., 1.],
+                RasterState::default(),
+            );
+            if let Step::Draw {
+                draw: Draw::Material(d),
+                ..
+            } = &mut top
+            {
+                d.camera = Camera::Perspective;
+            }
+            vec![
+                // Reads the reflection before the mirror step's index: only
+                // works because mirror steps run first.
+                Step::Copy {
+                    from: reflection,
+                    to: TargetId::DEFAULT,
+                },
+                top,
+                Step::Mirror {
+                    target: reflection,
+                    source: 1,
+                },
+            ]
+        };
+        let targets = || {
+            vec![TargetDesc {
+                name: "_rt_Reflection".to_owned(),
+                size: crate::TargetSize::Screen { divisor: 1.0 },
+                format: DEFAULT_FORMAT,
+            }]
+        };
+        let globals = FrameGlobals {
+            perspective: Mat4::IDENTITY,
+            reflected: Mat4::from_scale(glam::Vec3::new(1.0, -1.0, 1.0)),
+            ..Default::default()
+        };
+        let mut renderer = SceneRenderer::new(&gpu, DEFAULT_FORMAT);
+        renderer.set_frame(&gpu, targets(), steps());
+        let pixels = renderer.capture(&gpu, globals, (4, 4));
+        let at = |pixels: &[u8], y: usize| pixels[y * 16..][..3].to_vec();
+        // The mirror image fills the bottom half.
+        assert_eq!(at(&pixels, 0), [255, 0, 0]);
+        assert_eq!(at(&pixels, 3), [255, 0, 0]);
+
+        // A hidden source hides its mirror too.
+        let mut renderer = SceneRenderer::new(&gpu, DEFAULT_FORMAT);
+        renderer.set_frame(&gpu, targets(), steps());
+        renderer.set_visible(1, false);
+        let pixels = renderer.capture(&gpu, globals, (4, 4));
+        assert_eq!(at(&pixels, 3), [0, 0, 0]);
     }
 }

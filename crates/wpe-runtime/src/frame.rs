@@ -15,7 +15,7 @@ use wpe_render::{
     TargetDesc, TargetId, TargetSize, TexRef, upload_texture, wgpu,
 };
 use wpe_scene::{
-    Animation, Bloom, DrawItem, ImageLayer, ModelLayer, Motion, Parallax, apply_override,
+    Animation, Bloom, DrawItem, HdrBloom, ImageLayer, ModelLayer, Motion, Parallax, apply_override,
 };
 use wpe_vfs::Vfs;
 
@@ -24,6 +24,10 @@ use crate::clock::{self, Clock, Clocks};
 use crate::material::{self, SlotTexture, TextureStore};
 use crate::model_data::SharedModelDatas;
 use crate::video::VideoStream;
+
+#[path = "volumetric.rs"]
+mod volumetric;
+pub use volumetric::Volumetrics;
 
 /// A built frame: render targets, steps and what animates them.
 pub struct Frame {
@@ -41,6 +45,9 @@ pub struct Frame {
     pub particles: Vec<ParticleInstance>,
     /// Draws of each on-screen layer, by layer id.
     pub layer_steps: HashMap<i32, LayerSteps>,
+    /// Uniforms set in output texels (see
+    /// [`wpe_render::SceneRenderer::set_texel_uniform`]): step, uniform, scale.
+    pub texel_uniforms: Vec<(usize, String, [f32; 4])>,
 }
 
 /// A material slot showing an engine texture (`$mediaThumbnail`).
@@ -85,6 +92,9 @@ pub struct LayerSteps {
 const PREVIOUS: &str = "_rt_previous";
 const FULL_FRAME: &str = "_rt_FullFrameBuffer";
 const MIPMAPPED_FRAME: &str = "_rt_MipMappedFrameBuffer";
+/// What the reflected camera sees, for floors that sample it.
+const REFLECTION: &str = "_rt_Reflection";
+const REFLECTION_BLUR: &str = "_rt_Reflection_blur";
 
 pub fn blend_mode(b: &Blending) -> BlendMode {
     match b {
@@ -95,14 +105,15 @@ pub fn blend_mode(b: &Blending) -> BlendMode {
     }
 }
 
-fn target_format(format: Option<&str>) -> wgpu::TextureFormat {
+/// An effect FBO's format; colour FBOs take the scene's colour format.
+fn target_format(format: Option<&str>, scene: wgpu::TextureFormat) -> wgpu::TextureFormat {
     match format.map(str::to_ascii_lowercase).as_deref() {
         Some("r8") => wgpu::TextureFormat::R8Unorm,
         Some("rg88") => wgpu::TextureFormat::Rg8Unorm,
         Some("rgba16161616f" | "rgba16f") => wgpu::TextureFormat::Rgba16Float,
         Some("r16f") => wgpu::TextureFormat::R16Float,
         Some("rg1616f" | "rg16f") => wgpu::TextureFormat::Rg16Float,
-        _ => DEFAULT_FORMAT,
+        _ => scene,
     }
 }
 
@@ -679,8 +690,15 @@ pub struct FrameBuilder<'a> {
     light_combos: BTreeMap<String, String>,
     model_data: SharedModelDatas,
     is_3d: bool,
+    /// `_rt_Reflection` and its blur buffer, when the scene renders planar
+    /// reflections ([`Self::enable_reflection`]).
+    reflection: Option<(TargetId, TargetId)>,
     /// Draws using their compiled material, and all draws.
     pub stats: (usize, usize),
+    /// Format of `_rt_default` and every target holding scene colour.
+    scene_format: wgpu::TextureFormat,
+    /// Uniforms in output texels: step, uniform, scale.
+    texel_uniforms: Vec<(usize, String, [f32; 4])>,
 }
 
 /// What outlives one build of a wallpaper's frame: loaded textures, GPU
@@ -739,10 +757,13 @@ impl<'a> FrameBuilder<'a> {
             light_combos: BTreeMap::new(),
             model_data: Default::default(),
             is_3d: false,
+            reflection: None,
             particles: Vec::new(),
             current_layer: None,
             layer_steps: HashMap::new(),
             stats: (0, 0),
+            scene_format: DEFAULT_FORMAT,
+            texel_uniforms: Vec::new(),
         }
     }
 
@@ -757,8 +778,18 @@ impl<'a> FrameBuilder<'a> {
             bindings: self.bindings,
             particles: self.particles,
             layer_steps: self.layer_steps,
+            texel_uniforms: self.texel_uniforms,
         };
         (frame, self.cache)
+    }
+
+    /// Render HDR scenes into [`wpe_render::HDR_FORMAT`] targets.
+    pub fn set_hdr(&mut self, hdr: bool) {
+        self.scene_format = if hdr {
+            wpe_render::HDR_FORMAT
+        } else {
+            DEFAULT_FORMAT
+        };
     }
 
     fn target(&mut self, name: String, size: TargetSize, format: wgpu::TextureFormat) -> TargetId {
@@ -773,7 +804,7 @@ impl<'a> FrameBuilder<'a> {
         let id = self.target(
             FULL_FRAME.to_owned(),
             TargetSize::Screen { divisor: 1.0 },
-            DEFAULT_FORMAT,
+            self.scene_format,
         );
         self.frame_copy = Some(id);
         id
@@ -857,6 +888,20 @@ impl<'a> FrameBuilder<'a> {
         targets: &HashMap<String, TargetId>,
         combos: &BTreeMap<String, String>,
     ) -> Option<Resolved> {
+        // With shadow mapping on, every lit material samples the shadow
+        // atlas, image layers included: they all get the light combos.
+        let shadowed;
+        let combos = if self.shadow_mapping() {
+            shadowed = self
+                .light_combos
+                .clone()
+                .into_iter()
+                .chain(combos.clone())
+                .collect();
+            &shadowed
+        } else {
+            combos
+        };
         let prepared = material::prepare(self.vfs, &mut self.cache.store, pass, combos)
             .inspect_err(|e| tracing::warn!("{label} ({}): {e}", pass.shader))
             .ok()?;
@@ -901,6 +946,12 @@ impl<'a> FrameBuilder<'a> {
                     } else if name == FULL_FRAME || name == MIPMAPPED_FRAME {
                         reads_frame = true;
                         Some(TexRef::Target(self.frame_copy()))
+                    } else if name == volumetric::SHADOW_ATLAS {
+                        Some(TexRef::ShadowAtlas)
+                    } else if let (REFLECTION, Some((reflection, _))) =
+                        (name.as_str(), self.reflection)
+                    {
+                        Some(TexRef::Target(reflection))
                     } else {
                         tracing::debug!("{label}: render target {name} not supported yet");
                         None
@@ -1116,7 +1167,7 @@ impl<'a> FrameBuilder<'a> {
             let link = self.target(
                 format!("_rt_link_{id}"),
                 TargetSize::Fixed(w, h),
-                DEFAULT_FORMAT,
+                self.scene_format,
             );
             self.layer(layer, Some(link));
             self.links.insert(id, link);
@@ -1134,13 +1185,18 @@ impl<'a> FrameBuilder<'a> {
     }
 
     /// Scene bloom: bright-pass and blur a copy of the frame at quarter and
-    /// eighth size, then add it back over `_rt_default`.
+    /// eighth size, then add it back over `_rt_default`; or the HDR mip
+    /// chain ([`Self::hdr_bloom`]).
     pub fn bloom(&mut self, bloom: Bloom) {
+        if let Some(chain) = bloom.mip_chain {
+            return self.hdr_bloom(bloom, chain);
+        }
         let screen = |divisor| TargetSize::Screen { divisor };
-        let scene = self.target("_rt_Bloom_Scene".to_owned(), screen(1.0), DEFAULT_FORMAT);
-        let quarter = self.target("_rt_Bloom_Quarter".to_owned(), screen(4.0), DEFAULT_FORMAT);
-        let eighth = self.target("_rt_Bloom_Eighth".to_owned(), screen(8.0), DEFAULT_FORMAT);
-        let result = self.target("_rt_Bloom_Result".to_owned(), screen(8.0), DEFAULT_FORMAT);
+        let format = self.scene_format;
+        let scene = self.target("_rt_Bloom_Scene".to_owned(), screen(1.0), format);
+        let quarter = self.target("_rt_Bloom_Quarter".to_owned(), screen(4.0), format);
+        let eighth = self.target("_rt_Bloom_Eighth".to_owned(), screen(8.0), format);
+        let result = self.target("_rt_Bloom_Result".to_owned(), screen(8.0), format);
         let names: HashMap<String, TargetId> = [
             ("_rt_Bloom_Scene", scene),
             ("_rt_Bloom_Quarter", quarter),
@@ -1184,6 +1240,197 @@ impl<'a> FrameBuilder<'a> {
             }
             let Some(r) = self.resolve(&format!("bloom {shader}"), &pass, &names) else {
                 tracing::warn!("bloom disabled: {shader} failed");
+                return;
+            };
+            self.push_draw(
+                target,
+                r,
+                Mat4::IDENTITY,
+                CardMesh::FULLSCREEN,
+                BlendMode::Normal,
+                Camera::Fixed(Mat4::IDENTITY),
+            );
+        }
+    }
+
+    /// HDR scenes' mip-chain bloom (`postprocessing` `ultra`/`displayhdr`):
+    /// a soft-knee bright pass of the frame into a half-size mip, 4-tap
+    /// downsamples to 1/16 size, additive 4-tap upsamples back to the half
+    /// size mip, and `combine_hdr` adding that over the frame, clamped.
+    fn hdr_bloom(&mut self, bloom: Bloom, chain: HdrBloom) {
+        const MIPS: usize = 4;
+        let format = self.scene_format;
+        let screen = |divisor| TargetSize::Screen { divisor };
+        let scene = self.target("_rt_Bloom_Scene".to_owned(), screen(1.0), format);
+        let mut names = HashMap::from([("_rt_Bloom_Scene".to_owned(), scene)]);
+        // Mip n is at 1/2^n size; mip 0 is the frame copy.
+        let mut mips = vec![scene];
+        for n in 1..=MIPS {
+            let name = format!("_rt_Bloom_Mip{n}");
+            let id = self.target(name.clone(), screen((1 << n) as f32), format);
+            names.insert(name, id);
+            mips.push(id);
+        }
+        self.steps.push(Step::Copy {
+            from: TargetId::DEFAULT,
+            to: scene,
+        });
+
+        // Soft knee from threshold - knee to threshold + knee, the knee a
+        // fraction of the threshold (floored: the shader divides by it).
+        let threshold = bloom.threshold;
+        let knee = (threshold * chain.feather.clamp(0.0, 1.0)).max(1e-4);
+        let mut passes = Vec::new();
+        for n in 0..MIPS {
+            // Bright pass from the frame, then plain downsamples.
+            let combo = (n == 0).then_some("BLOOM");
+            passes.push((n, n + 1, combo));
+        }
+        for n in (1..MIPS).rev() {
+            passes.push((n + 1, n, Some("UPSAMPLE")));
+        }
+        for (from, to, combo) in passes {
+            let pass = MaterialPass {
+                shader: "hdr_downsample".to_owned(),
+                blending: Blending::Normal,
+                textures: vec![Some(format!("_rt_Bloom_{}", mip_name(from)))],
+                ..Default::default()
+            };
+            let combos = combo
+                .map(|c| BTreeMap::from([(c.to_owned(), "1".to_owned())]))
+                .unwrap_or_default();
+            let label = format!("bloom hdr_downsample {from}->{to}");
+            let Some(mut r) = self.resolve_with(&label, &pass, &names, &combos) else {
+                tracing::warn!("bloom disabled: {label} failed");
+                return;
+            };
+            match combo {
+                Some("BLOOM") => {
+                    let c = &mut r.constants;
+                    let params = vec![threshold, threshold - knee, 2.0 * knee, 0.25 / knee];
+                    c.insert("g_BloomBlendParams".to_owned(), params);
+                    c.insert("g_BloomTint".to_owned(), bloom.tint.to_array().to_vec());
+                    c.insert("g_BloomStrength".to_owned(), vec![bloom.strength]);
+                }
+                Some(_) => {
+                    // Neutral: `bloomhdrscatter` compounds over the levels.
+                    r.constants.insert("g_BloomScatter".to_owned(), vec![1.0]);
+                }
+                None => {}
+            }
+            // Corner offsets of half a source texel.
+            let d = 0.5 * (1 << from) as f32;
+            let step = self.steps.len();
+            self.texel_uniforms
+                .push((step, "g_RenderVar0".to_owned(), [-d, -d, d, d]));
+            let blend = if from > to {
+                BlendMode::Additive
+            } else {
+                BlendMode::Normal
+            };
+            self.push_draw(
+                mips[to],
+                r,
+                Mat4::IDENTITY,
+                CardMesh::FULLSCREEN,
+                blend,
+                Camera::Fixed(Mat4::IDENTITY),
+            );
+        }
+
+        // `combine_hdr` with LINEAR: the frame plus the bloom, clamped.
+        // (Its non-linear branch decodes sRGB for a linear backbuffer;
+        // scene colour here stays in display space throughout.)
+        let pass = MaterialPass {
+            shader: "combine_hdr".to_owned(),
+            blending: Blending::Normal,
+            textures: vec![
+                Some("_rt_Bloom_Scene".to_owned()),
+                Some("_rt_Bloom_Mip1".to_owned()),
+            ],
+            ..Default::default()
+        };
+        let combos = BTreeMap::from([("LINEAR".to_owned(), "1".to_owned())]);
+        let Some(mut r) = self.resolve_with("bloom combine_hdr", &pass, &names, &combos) else {
+            tracing::warn!("bloom disabled: combine_hdr failed");
+            return;
+        };
+        r.constants
+            .insert("g_RenderVar0".to_owned(), vec![1.0, 0.0, 0.0, 0.0]);
+        self.push_draw(
+            TargetId::DEFAULT,
+            r,
+            Mat4::IDENTITY,
+            CardMesh::FULLSCREEN,
+            BlendMode::Normal,
+            Camera::Fixed(Mat4::IDENTITY),
+        );
+    }
+
+    /// Render planar reflections: create `_rt_Reflection` (which materials
+    /// may then sample) before adding objects, then add the passes filling
+    /// it with [`Self::reflection_passes`]. Wallpaper Engine does this in 3D
+    /// scenes with camera paths (its `"reflected_perspective"` camera).
+    pub fn enable_reflection(&mut self) {
+        if self.reflection.is_some() {
+            return;
+        }
+        let screen = TargetSize::Screen { divisor: 1.0 };
+        let format = self.scene_format;
+        let reflection = self.target(REFLECTION.to_owned(), screen, format);
+        let blur = self.target(REFLECTION_BLUR.to_owned(), screen, format);
+        self.reflection = Some((reflection, blur));
+    }
+
+    /// Mirror every perspective draw onto the screen, except those reading
+    /// the reflection, into `_rt_Reflection` with the reflected camera, then
+    /// soften it with a separable `blur_k3`. The renderer runs these before
+    /// the rest of the frame.
+    pub fn reflection_passes(&mut self) {
+        let Some((reflection, blur)) = self.reflection else {
+            return;
+        };
+        let sources: Vec<usize> =
+            self.steps
+                .iter()
+                .enumerate()
+                .filter_map(|(i, step)| match step {
+                    Step::Draw {
+                        target: TargetId::DEFAULT,
+                        draw: Draw::Material(d),
+                    } if matches!(d.camera, Camera::Perspective)
+                        && !d.textures.iter().any(
+                            |t| matches!(t, Some(TexRef::Target(id)) if *id == reflection),
+                        ) =>
+                    {
+                        Some(i)
+                    }
+                    _ => None,
+                })
+                .collect();
+        tracing::debug!("{} draws mirrored into {REFLECTION}", sources.len());
+        for source in sources {
+            self.steps.push(Step::Mirror {
+                target: reflection,
+                source,
+            });
+        }
+        let names = HashMap::from([
+            (REFLECTION.to_owned(), reflection),
+            (REFLECTION_BLUR.to_owned(), blur),
+        ]);
+        for (input, vertical, target) in
+            [(REFLECTION, "0", blur), (REFLECTION_BLUR, "1", reflection)]
+        {
+            let pass = MaterialPass {
+                shader: "blur_k3".to_owned(),
+                blending: Blending::Normal,
+                textures: vec![Some(input.to_owned())],
+                ..Default::default()
+            };
+            let combos = BTreeMap::from([("VERTICAL".to_owned(), vertical.to_owned())]);
+            let Some(r) = self.resolve_with("reflection blur", &pass, &names, &combos) else {
+                tracing::warn!("reflection blur: blur_k3 failed");
                 return;
             };
             self.push_draw(
@@ -1687,8 +1934,9 @@ impl<'a> FrameBuilder<'a> {
         } else {
             TargetSize::Fixed(w, h)
         };
-        let mut prev = self.target(format!("_rt_pingpong_a_{id}"), base_size, DEFAULT_FORMAT);
-        let mut out = self.target(format!("_rt_pingpong_b_{id}"), base_size, DEFAULT_FORMAT);
+        let format = self.scene_format;
+        let mut prev = self.target(format!("_rt_pingpong_a_{id}"), base_size, format);
+        let mut out = self.target(format!("_rt_pingpong_b_{id}"), base_size, format);
 
         // The layer's own image, untransformed, filling the first buffer.
         let label = format!("layer {:?}", layer.name);
@@ -1752,7 +2000,7 @@ impl<'a> FrameBuilder<'a> {
                 let t = self.target(
                     format!("_rt_{}_{id}", fbo.name),
                     size,
-                    target_format(fbo.format.as_deref()),
+                    target_format(fbo.format.as_deref(), self.scene_format),
                 );
                 names.insert(format!("_rt_{}", fbo.name), t);
             }
@@ -1908,6 +2156,15 @@ fn local_camera(size: Vec2) -> Mat4 {
 const COMPOSITE_PREFIX: &str = "_rt_imageLayerComposite_";
 
 /// Layer id of `_rt_imageLayerComposite_<id>[_a|_b]`.
+/// `Scene` for mip 0 (the frame copy), else `Mip<n>`.
+fn mip_name(n: usize) -> String {
+    if n == 0 {
+        "Scene".to_owned()
+    } else {
+        format!("Mip{n}")
+    }
+}
+
 fn link_id(name: &str) -> Option<i32> {
     let rest = name.strip_prefix(COMPOSITE_PREFIX)?;
     let digits = rest.split('_').next()?;

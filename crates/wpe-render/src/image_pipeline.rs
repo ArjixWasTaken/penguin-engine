@@ -49,18 +49,17 @@ pub(crate) struct ImageUniforms {
     pub size_uv: [f32; 4],
 }
 
-/// Pipelines for the built-in image shader, one per blend mode and pass
-/// depth state.
+/// Pipelines for the built-in image shader, one per blend mode, pass depth
+/// state and target format.
 pub(crate) struct ImagePipelines {
     pub layout: wgpu::BindGroupLayout,
     module: wgpu::ShaderModule,
     pipeline_layout: wgpu::PipelineLayout,
-    target_format: wgpu::TextureFormat,
-    pipelines: HashMap<(BlendMode, PassDepth), wgpu::RenderPipeline>,
+    pipelines: HashMap<(BlendMode, PassDepth, wgpu::TextureFormat), wgpu::RenderPipeline>,
 }
 
 impl ImagePipelines {
-    pub fn new(device: &wgpu::Device, target_format: wgpu::TextureFormat) -> Self {
+    pub fn new(device: &wgpu::Device) -> Self {
         let module = device.create_shader_module(wgpu::include_wgsl!("image.wgsl"));
         let layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
             label: Some("image"),
@@ -102,20 +101,21 @@ impl ImagePipelines {
             layout,
             module,
             pipeline_layout,
-            target_format,
             pipelines: HashMap::new(),
         }
     }
 
     /// The pipeline for `blend` in a pass with `depth` (images never test
-    /// or write depth, but must match the pass's attachment).
+    /// or write depth, but must match the pass's attachment) into `format`.
     pub fn get(
         &mut self,
         device: &wgpu::Device,
         blend: BlendMode,
         depth: PassDepth,
+        format: wgpu::TextureFormat,
     ) -> wgpu::RenderPipeline {
-        let pipeline = self.pipelines.entry((blend, depth)).or_insert_with(|| {
+        let key = (blend, depth, format);
+        let pipeline = self.pipelines.entry(key).or_insert_with(|| {
             device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
                 label: Some("image"),
                 layout: Some(&self.pipeline_layout),
@@ -136,7 +136,7 @@ impl ImagePipelines {
                     entry_point: Some("fs_main"),
                     compilation_options: Default::default(),
                     targets: &[Some(wgpu::ColorTargetState {
-                        format: self.target_format,
+                        format,
                         blend: blend.state(),
                         write_mask: wgpu::ColorWrites::ALL,
                     })],

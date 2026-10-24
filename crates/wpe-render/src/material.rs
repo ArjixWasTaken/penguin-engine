@@ -5,10 +5,10 @@ use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
 use glam::{Mat3, Mat4, Vec2, Vec3};
-use wpe_shader::reflect::{Scalar, TextureDim, UniformMember};
+use wpe_shader::reflect::{Scalar, TextureDim, TextureKind, UniformMember};
 use wpe_shader::{CompiledShader, Reflection};
 
-use crate::targets::{TargetId, Targets};
+use crate::targets::{DepthBuffers, TargetId, Targets};
 use crate::{BlendMode, Gpu, GpuTexture};
 
 #[derive(Debug, thiserror::Error)]
@@ -86,11 +86,25 @@ impl ShaderProgram {
                 TextureDim::Cube => wgpu::TextureViewDimension::Cube,
                 TextureDim::D2Array => wgpu::TextureViewDimension::D2Array,
             };
+            let (sample_type, sampler) = match t.kind {
+                TextureKind::Filterable => (
+                    wgpu::TextureSampleType::Float { filterable: true },
+                    wgpu::SamplerBindingType::Filtering,
+                ),
+                TextureKind::Unfilterable => (
+                    wgpu::TextureSampleType::Float { filterable: false },
+                    wgpu::SamplerBindingType::NonFiltering,
+                ),
+                TextureKind::Comparison => (
+                    wgpu::TextureSampleType::Depth,
+                    wgpu::SamplerBindingType::Comparison,
+                ),
+            };
             entries.push(wgpu::BindGroupLayoutEntry {
                 binding: t.texture,
                 visibility: wgpu::ShaderStages::VERTEX_FRAGMENT,
                 ty: wgpu::BindingType::Texture {
-                    sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                    sample_type,
                     view_dimension,
                     multisampled: false,
                 },
@@ -99,7 +113,7 @@ impl ShaderProgram {
             entries.push(wgpu::BindGroupLayoutEntry {
                 binding: t.sampler,
                 visibility: wgpu::ShaderStages::VERTEX_FRAGMENT,
-                ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
+                ty: wgpu::BindingType::Sampler(sampler),
                 count: None,
             });
         }
@@ -338,7 +352,7 @@ impl Mesh {
         }
     }
 
-    fn data(&self) -> std::borrow::Cow<'_, MeshData> {
+    pub(crate) fn data(&self) -> std::borrow::Cow<'_, MeshData> {
         match self {
             Self::Card(card) => {
                 let corners = card.corners();
@@ -470,6 +484,13 @@ pub struct FrameGlobals {
     pub perspective_proj: Mat4,
     /// Its position in world space (`g_EyePosition`).
     pub perspective_eye: Vec3,
+    /// The `"reflected_perspective"` camera that mirror draws (planar
+    /// reflections into `_rt_Reflection`) use: view, projection, their
+    /// product and eye.
+    pub reflected_view: Mat4,
+    pub reflected_proj: Mat4,
+    pub reflected: Mat4,
+    pub reflected_eye: Vec3,
 }
 
 /// Where a texture slot's image comes from.
@@ -477,6 +498,13 @@ pub struct FrameGlobals {
 pub enum TexRef {
     Asset(Arc<GpuTexture>),
     Target(TargetId),
+    /// The depth buffer of a target, as drawn so far this frame (cleared to
+    /// the far plane when nothing drew depth there yet). Only programs that
+    /// read it with `texelFetch` or depth comparison can bind it.
+    Depth(TargetId),
+    /// `_rt_shadowAtlas`, the shadow maps of the scene's shadow-casting
+    /// lights ([`crate::SceneRenderer::set_shadow_lights`]).
+    ShadowAtlas,
 }
 
 /// One frame of a sprite-sheet animation.
@@ -560,6 +588,16 @@ impl Camera {
             },
         }
     }
+
+    /// The camera mirror draws use.
+    fn reflected(globals: &FrameGlobals) -> View {
+        View {
+            view: globals.reflected_view,
+            proj: globals.reflected_proj,
+            view_proj: globals.reflected,
+            eye: globals.reflected_eye,
+        }
+    }
 }
 
 /// Inverse transpose of `model`'s linear part, scaled back to unit
@@ -572,6 +610,73 @@ fn normal_matrix(model: Mat4) -> Mat3 {
         return linear;
     }
     linear.inverse().transpose() * det.abs().cbrt()
+}
+
+/// Write the uniforms that depend on the camera.
+fn write_camera(
+    block: &mut UniformBlock,
+    r: &Reflection,
+    model: Mat4,
+    perspective: bool,
+    camera: &View,
+) {
+    let view_proj = camera.view_proj;
+    let mvp = view_proj * model;
+    let mat4 = |m: Mat4| m.to_cols_array().to_vec();
+    let values: [(&str, Vec<f32>); 16] = [
+        ("g_ModelViewProjectionMatrix", mat4(mvp)),
+        ("g_ModelViewProjectionMatrixInverse", mat4(mvp.inverse())),
+        ("g_ModelMatrix", mat4(model)),
+        ("g_ModelMatrixInverse", mat4(model.inverse())),
+        ("g_AltModelMatrix", mat4(model)),
+        ("g_ViewProjectionMatrix", mat4(view_proj)),
+        ("g_ViewProjectionMatrixInverse", mat4(view_proj.inverse())),
+        ("g_AltViewProjectionMatrix", mat4(view_proj)),
+        ("g_ViewMatrix", mat4(camera.view)),
+        ("g_ViewMatrixInverse", mat4(camera.view.inverse())),
+        ("g_ProjectionMatrix", mat4(camera.proj)),
+        ("g_ProjectionMatrixInverse", mat4(camera.proj.inverse())),
+        ("g_ModelViewMatrix", mat4(camera.view * model)),
+        (
+            "g_ModelViewMatrixInverse",
+            mat4((camera.view * model).inverse()),
+        ),
+        ("g_EyePosition", camera.eye.to_array().to_vec()),
+        // Volumetric light passes unproject screen positions and depths
+        // back into the world with it.
+        ("g_EffectModelMatrix", mat4(view_proj.inverse())),
+    ];
+    for (name, v) in values {
+        if let Some(member) = r.uniforms.get(name) {
+            block.write(member, &v);
+        }
+    }
+    // The camera's axes in world space (billboards, rim lighting). Other
+    // cameras leave them to the draw's constants (particles set them).
+    if perspective {
+        let rows = camera.view.transpose();
+        for (name, axis) in [
+            ("g_ViewRight", rows.x_axis),
+            ("g_ViewUp", rows.y_axis),
+            ("g_ViewForward", -rows.z_axis),
+        ] {
+            if let Some(member) = r.uniforms.get(name) {
+                block.write(member, &axis.truncate().normalize_or_zero().to_array());
+            }
+        }
+    }
+}
+
+/// `g_LightsPosition` (a `vec4` per light) with every light mirrored below
+/// the y = 0 floor, for the reflected camera.
+fn mirror_lights(positions: &[f32]) -> Vec<f32> {
+    let mut mirrored = positions.to_vec();
+    for light in mirrored.chunks_mut(4) {
+        if let Some(y) = light.get_mut(1) {
+            *y = -*y;
+        }
+    }
+    mirrored
 }
 
 /// One draw with a compiled program.
@@ -601,7 +706,19 @@ pub(crate) struct PreparedMaterialDraw {
     geometry: Option<Geometry>,
     /// The mesh changed and must be re-uploaded.
     mesh_dirty: bool,
+    /// Bumped whenever the mesh is replaced (shadow casters re-upload it).
+    pub(crate) mesh_version: u64,
     /// Rebuilt when render targets are reallocated.
+    bind_group: Option<(u64, wgpu::BindGroup)>,
+    /// The same draw seen by the reflected camera, when mirrored.
+    mirror: Option<Mirror>,
+}
+
+/// A material draw's uniforms and bindings for its mirror draw: the same
+/// geometry and textures with the reflected camera and mirrored lights.
+struct Mirror {
+    block: UniformBlock,
+    uniforms: wgpu::Buffer,
     bind_group: Option<(u64, wgpu::BindGroup)>,
 }
 
@@ -609,6 +726,22 @@ pub(crate) struct PreparedMaterialDraw {
 pub(crate) struct Placeholders {
     d2: GpuTexture,
     d3: GpuTexture,
+    /// A 1×1 depth texture at the far plane, for missing depth buffers.
+    depth: wgpu::TextureView,
+    /// For textures read without filtering.
+    nearest: wgpu::Sampler,
+    /// Depth comparison passing when the reference is nearer or equal.
+    pub(crate) comparison: wgpu::Sampler,
+}
+
+/// What material bindings are resolved against.
+pub(crate) struct Bindables<'a> {
+    pub placeholders: &'a Placeholders,
+    pub targets: &'a Targets,
+    pub depth: &'a DepthBuffers,
+    pub shadow_atlas: Option<&'a wgpu::TextureView>,
+    /// Changes whenever any texture above is (re)allocated.
+    pub generation: u64,
 }
 
 impl Placeholders {
@@ -652,9 +785,53 @@ impl Placeholders {
                 map_height: 1,
             }
         };
+        let depth = gpu
+            .device
+            .create_texture(&wgpu::TextureDescriptor {
+                label: Some("placeholder depth"),
+                size: wgpu::Extent3d {
+                    width: 1,
+                    height: 1,
+                    depth_or_array_layers: 1,
+                },
+                mip_level_count: 1,
+                sample_count: 1,
+                dimension: wgpu::TextureDimension::D2,
+                format: DEPTH_FORMAT,
+                usage: wgpu::TextureUsages::TEXTURE_BINDING
+                    | wgpu::TextureUsages::RENDER_ATTACHMENT,
+                view_formats: &[],
+            })
+            .create_view(&Default::default());
+        let mut encoder = gpu.device.create_command_encoder(&Default::default());
+        encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+            label: Some("placeholder depth"),
+            depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
+                view: &depth,
+                depth_ops: Some(wgpu::Operations {
+                    load: wgpu::LoadOp::Clear(1.0),
+                    store: wgpu::StoreOp::Store,
+                }),
+                stencil_ops: None,
+            }),
+            ..Default::default()
+        });
+        gpu.queue.submit([encoder.finish()]);
         Self {
             d2: make(wgpu::TextureDimension::D2),
             d3: make(wgpu::TextureDimension::D3),
+            depth,
+            nearest: gpu.device.create_sampler(&wgpu::SamplerDescriptor {
+                label: Some("nearest"),
+                ..Default::default()
+            }),
+            comparison: gpu.device.create_sampler(&wgpu::SamplerDescriptor {
+                label: Some("comparison"),
+                mag_filter: wgpu::FilterMode::Linear,
+                min_filter: wgpu::FilterMode::Linear,
+                compare: Some(wgpu::CompareFunction::LessEqual),
+                ..Default::default()
+            }),
         }
     }
 }
@@ -715,21 +892,62 @@ impl PreparedMaterialDraw {
             uniforms,
             geometry,
             mesh_dirty: false,
+            mesh_version: 0,
             bind_group: None,
+            mirror: None,
         }
     }
 
-    fn bind(&mut self, gpu: &Gpu, placeholders: &Placeholders, targets: &Targets) {
-        if self
-            .bind_group
-            .as_ref()
-            .is_some_and(|(generation, _)| *generation == targets.generation)
-        {
+    /// Also keep uniforms for a mirror draw ([`Self::record_mirror`]).
+    pub fn enable_mirror(&mut self, gpu: &Gpu) {
+        if self.mirror.is_some() || self.uniforms.is_none() {
             return;
         }
+        let size = self.block.data.len();
+        self.mirror = Some(Mirror {
+            block: UniformBlock {
+                data: vec![0; size],
+            },
+            uniforms: gpu.device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("mirror uniforms"),
+                size: size as u64,
+                usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+                mapped_at_creation: false,
+            }),
+            bind_group: None,
+        });
+    }
+
+    fn bind(&mut self, gpu: &Gpu, res: &Bindables) {
+        let current = |group: &Option<(u64, wgpu::BindGroup)>| {
+            group
+                .as_ref()
+                .is_some_and(|(generation, _)| *generation == res.generation)
+        };
+        if !current(&self.bind_group) {
+            let group = self.bind_group_with(gpu, self.uniforms.as_ref(), res);
+            self.bind_group = Some((res.generation, group));
+        }
+        if let Some(mirror) = &self.mirror
+            && !current(&mirror.bind_group)
+        {
+            let group = self.bind_group_with(gpu, Some(&mirror.uniforms), res);
+            if let Some(mirror) = &mut self.mirror {
+                mirror.bind_group = Some((res.generation, group));
+            }
+        }
+    }
+
+    fn bind_group_with(
+        &self,
+        gpu: &Gpu,
+        uniforms: Option<&wgpu::Buffer>,
+        res: &Bindables,
+    ) -> wgpu::BindGroup {
+        let (placeholders, targets) = (res.placeholders, res.targets);
         let r = &self.draw.program.reflection;
         let mut entries = Vec::new();
-        if let Some(buf) = &self.uniforms {
+        if let Some(buf) = uniforms {
             entries.push(wgpu::BindGroupEntry {
                 binding: 0,
                 resource: buf.as_entire_binding(),
@@ -740,13 +958,32 @@ impl PreparedMaterialDraw {
             let bound = slot_index(name)
                 .and_then(|i| self.draw.textures.get(i))
                 .and_then(Option::as_ref);
-            let (view, sampler) = match bound {
-                Some(TexRef::Asset(t))
+            let depth_of = |bound: Option<&TexRef>| match bound {
+                Some(TexRef::Depth(id)) => res.depth.view(*id),
+                Some(TexRef::ShadowAtlas) => res.shadow_atlas,
+                _ => None,
+            };
+            let (view, sampler) = match (binding.kind, bound) {
+                (TextureKind::Comparison, _) => (
+                    depth_of(bound).unwrap_or(&placeholders.depth),
+                    &placeholders.comparison,
+                ),
+                (_, Some(TexRef::Asset(t)))
                     if (t.texture.dimension() == wgpu::TextureDimension::D3) == wants_3d =>
                 {
                     (&t.view, &t.sampler)
                 }
-                Some(TexRef::Target(id)) if !wants_3d => (&targets.get(*id).view, &targets.sampler),
+                (_, Some(TexRef::Target(id))) if !wants_3d => {
+                    (&targets.get(*id).view, &targets.sampler)
+                }
+                (TextureKind::Unfilterable, Some(TexRef::Depth(_) | TexRef::ShadowAtlas))
+                    if !wants_3d =>
+                {
+                    (
+                        depth_of(bound).unwrap_or(&placeholders.depth),
+                        &placeholders.nearest,
+                    )
+                }
                 _ => {
                     let p = if wants_3d {
                         &placeholders.d3
@@ -755,6 +992,10 @@ impl PreparedMaterialDraw {
                     };
                     (&p.view, &p.sampler)
                 }
+            };
+            let sampler = match binding.kind {
+                TextureKind::Unfilterable => &placeholders.nearest,
+                _ => sampler,
             };
             entries.push(wgpu::BindGroupEntry {
                 binding: binding.texture,
@@ -765,12 +1006,11 @@ impl PreparedMaterialDraw {
                 resource: wgpu::BindingResource::Sampler(sampler),
             });
         }
-        let group = gpu.device.create_bind_group(&wgpu::BindGroupDescriptor {
+        gpu.device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("material"),
             layout: &self.draw.program.layout,
             entries: &entries,
-        });
-        self.bind_group = Some((targets.generation, group));
+        })
     }
 
     /// Refresh per-frame uniforms, upload the block and (re)bind textures.
@@ -779,9 +1019,9 @@ impl PreparedMaterialDraw {
         gpu: &Gpu,
         globals: &FrameGlobals,
         shared: &HashMap<String, Vec<f32>>,
-        placeholders: &Placeholders,
-        targets: &Targets,
+        res: &Bindables,
     ) {
+        let targets = res.targets;
         for anim in &self.draw.sprites {
             let Some(frame) = anim.frame_at(self.sprite_time.unwrap_or(globals.time)) else {
                 continue;
@@ -818,14 +1058,18 @@ impl PreparedMaterialDraw {
             let previous = self.geometry.take();
             self.geometry = Geometry::upload(gpu, &self.draw.program, &self.draw.mesh, previous);
         }
-        self.bind(gpu, placeholders, targets);
+        self.bind(gpu, res);
         let Some(buffer) = &self.uniforms else { return };
         let r = &self.draw.program.reflection;
         let model = self.draw.model;
-        let camera = self.draw.camera.resolve(globals);
-        let view_proj = camera.view_proj;
-        let mvp = view_proj * model;
         let perspective = matches!(self.draw.camera, Camera::Perspective);
+        write_camera(
+            &mut self.block,
+            r,
+            model,
+            perspective,
+            &self.draw.camera.resolve(globals),
+        );
         // 2D layers keep the plain inverse transpose they always had.
         let normal = if perspective {
             normal_matrix(model)
@@ -833,26 +1077,8 @@ impl PreparedMaterialDraw {
             Mat3::from_mat4(model.inverse().transpose())
         };
         let mat4 = |m: Mat4| m.to_cols_array().to_vec();
-        let mat3 = |m: Mat3| m.to_cols_array().to_vec();
-        let values: [(&str, Vec<f32>); 23] = [
-            ("g_ModelViewProjectionMatrix", mat4(mvp)),
-            ("g_ModelViewProjectionMatrixInverse", mat4(mvp.inverse())),
-            ("g_ModelMatrix", mat4(model)),
-            ("g_ModelMatrixInverse", mat4(model.inverse())),
-            ("g_AltModelMatrix", mat4(model)),
-            ("g_ViewProjectionMatrix", mat4(view_proj)),
-            ("g_ViewProjectionMatrixInverse", mat4(view_proj.inverse())),
-            ("g_AltViewProjectionMatrix", mat4(view_proj)),
-            ("g_ViewMatrix", mat4(camera.view)),
-            ("g_ViewMatrixInverse", mat4(camera.view.inverse())),
-            ("g_ProjectionMatrix", mat4(camera.proj)),
-            ("g_ProjectionMatrixInverse", mat4(camera.proj.inverse())),
-            ("g_ModelViewMatrix", mat4(camera.view * model)),
-            (
-                "g_ModelViewMatrixInverse",
-                mat4((camera.view * model).inverse()),
-            ),
-            ("g_NormalModelMatrix", mat3(normal)),
+        let values: [(&str, Vec<f32>); 8] = [
+            ("g_NormalModelMatrix", normal.to_cols_array().to_vec()),
             ("g_Time", vec![globals.time]),
             ("g_DayTime", vec![globals.daytime]),
             ("g_PointerPosition", globals.pointer.to_array().to_vec()),
@@ -873,26 +1099,10 @@ impl PreparedMaterialDraw {
                     globals.screen.x / globals.screen.y,
                 ],
             ),
-            ("g_EyePosition", camera.eye.to_array().to_vec()),
         ];
         for (name, v) in values {
             if let Some(member) = r.uniforms.get(name) {
                 self.block.write(member, &v);
-            }
-        }
-        // The camera's axes in world space (billboards, rim lighting). Other
-        // cameras leave them to the draw's constants (particles set them).
-        if perspective {
-            let rows = camera.view.transpose();
-            for (name, axis) in [
-                ("g_ViewRight", rows.x_axis),
-                ("g_ViewUp", rows.y_axis),
-                ("g_ViewForward", -rows.z_axis),
-            ] {
-                if let Some(member) = r.uniforms.get(name) {
-                    self.block
-                        .write(member, &axis.truncate().normalize_or_zero().to_array());
-                }
             }
         }
         for name in [
@@ -911,7 +1121,7 @@ impl PreparedMaterialDraw {
             }
         }
         for (slot, tex) in self.draw.textures.iter().enumerate() {
-            if let Some(TexRef::Target(id)) = tex
+            if let Some(TexRef::Target(id) | TexRef::Depth(id)) = tex
                 && let Some(member) = r.uniforms.get(&format!("g_Texture{slot}Resolution"))
             {
                 let (w, h) = targets.get(*id).size;
@@ -920,6 +1130,26 @@ impl PreparedMaterialDraw {
             }
         }
         gpu.queue.write_buffer(buffer, 0, &self.block.data);
+        if let Some(mirror) = &mut self.mirror {
+            // The same values seen from below the floor, lit by the lights'
+            // mirror images.
+            mirror.block.data.copy_from_slice(&self.block.data);
+            write_camera(
+                &mut mirror.block,
+                r,
+                model,
+                true,
+                &Camera::reflected(globals),
+            );
+            if let (Some(member), Some(lights)) = (
+                r.uniforms.get("g_LightsPosition"),
+                shared.get("g_LightsPosition"),
+            ) {
+                mirror.block.write(member, &mirror_lights(lights));
+            }
+            gpu.queue
+                .write_buffer(&mirror.uniforms, 0, &mirror.block.data);
+        }
     }
 
     /// Draw into `pass`, whose colour attachment is `format`;
@@ -931,7 +1161,38 @@ impl PreparedMaterialDraw {
         format: wgpu::TextureFormat,
         depth_attached: bool,
     ) {
-        let Some((_, group)) = &self.bind_group else {
+        self.record_with(
+            device,
+            pass,
+            format,
+            depth_attached,
+            self.bind_group.as_ref(),
+        );
+    }
+
+    /// [`Self::record`] with the reflected camera ([`Self::enable_mirror`]).
+    /// Both the view's and the projection's y flips reverse the winding, so
+    /// culling stays as it is.
+    pub fn record_mirror(
+        &self,
+        device: &wgpu::Device,
+        pass: &mut wgpu::RenderPass,
+        format: wgpu::TextureFormat,
+        depth_attached: bool,
+    ) {
+        let group = self.mirror.as_ref().and_then(|m| m.bind_group.as_ref());
+        self.record_with(device, pass, format, depth_attached, group);
+    }
+
+    fn record_with(
+        &self,
+        device: &wgpu::Device,
+        pass: &mut wgpu::RenderPass,
+        format: wgpu::TextureFormat,
+        depth_attached: bool,
+        group: Option<&(u64, wgpu::BindGroup)>,
+    ) {
+        let Some((_, group)) = group else {
             return;
         };
         let Some(geometry) = &self.geometry else {
@@ -968,6 +1229,7 @@ impl PreparedMaterialDraw {
     pub fn set_mesh(&mut self, mesh: Mesh) {
         self.draw.mesh = mesh;
         self.mesh_dirty = true;
+        self.mesh_version += 1;
     }
 }
 
@@ -1203,6 +1465,14 @@ mod tests {
         let v = Camera::Scene.resolve(&globals);
         assert_eq!((v.view, v.proj), (Mat4::IDENTITY, globals.view_proj));
         assert_eq!(v.eye, globals.eye);
+    }
+
+    #[test]
+    fn mirrored_lights_flip_height_only() {
+        assert_eq!(
+            mirror_lights(&[1.0, 2.0, 3.0, 0.5, -4.0, -5.0, 6.0, 1.0]),
+            [1.0, -2.0, 3.0, 0.5, -4.0, 5.0, 6.0, 1.0]
+        );
     }
 
     #[test]

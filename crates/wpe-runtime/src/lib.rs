@@ -8,6 +8,7 @@ pub mod material;
 mod media;
 mod model_data;
 mod script;
+mod shadow;
 mod sound;
 mod storage;
 mod video;
@@ -171,9 +172,17 @@ pub struct Wallpaper {
     /// whether the scene is 3D.
     perspective: Option<wpe_scene::PerspectiveCamera>,
     is_3d: bool,
+    /// 3D scenes' camera paths, moving `perspective`, and the scene time
+    /// they were last advanced to.
+    camera_paths: Option<wpe_scene::CameraPathPlayer>,
+    camera_path_time: Option<f32>,
     /// The scene's lights with their ambient and skylight colours, when
     /// any light moves (their uniforms are then refreshed every frame).
+    /// The 3D camera scripts set (eye, centre, up), this frame.
+    script_view: Option<[Vec3; 3]>,
     moving_lights: Option<(Vec<wpe_scene::SceneLight>, Vec3, Vec3)>,
+    /// Shadow maps and volumetric passes of the lights.
+    light_fx: shadow::LightEffects,
     /// Script geometry, shared with the scripts.
     model_data: model_data::SharedModelDatas,
     renderer: SceneRenderer,
@@ -243,7 +252,11 @@ impl Wallpaper {
             },
             perspective: None,
             is_3d: false,
+            camera_paths: None,
+            camera_path_time: None,
             moving_lights: None,
+            light_fx: Default::default(),
+            script_view: None,
             model_data: Default::default(),
             renderer: SceneRenderer::new(gpu, output_format),
             scene_json: files.scene_json.clone(),
@@ -328,6 +341,7 @@ impl Wallpaper {
         );
 
         let mut builder = FrameBuilder::new(gpu, vfs, cache);
+        builder.set_hdr(scene.hdr);
         builder.set_parallax(scene.parallax, scene.camera.scene_size);
         let lights = scene.light_uniforms();
         builder.set_models(
@@ -339,10 +353,27 @@ impl Wallpaper {
             self.model_data.clone(),
             scene.is_3d,
         );
+        if scene.is_3d && self.camera_paths.is_none() {
+            let fade = self.props.flag(&doc.general.camerafade);
+            let paths = wpe_scene::CameraPath::load_scene(vfs, &doc);
+            self.camera_paths = wpe_scene::CameraPathPlayer::new(paths, fade);
+        }
+        // Like Wallpaper Engine, only 3D scenes with camera paths render
+        // planar reflections.
+        if scene.is_3d && self.camera_paths.is_some() {
+            builder.enable_reflection();
+        }
         builder.objects(&scene.layers, &scene.models, &scene.draw_order);
+        let postprocessing = doc
+            .general
+            .orthogonalprojection
+            .as_ref()
+            .and_then(|p| p.postprocessing.as_deref());
+        let volumetrics = builder.volumetrics(&scene.lights, postprocessing);
         if let Some(bloom) = scene.bloom {
             builder.bloom(bloom);
         }
+        builder.reflection_passes();
         let (real, total) = builder.stats;
         tracing::debug!("{real} of {total} draws use their real shader");
         let (frame, cache) = builder.finish();
@@ -355,10 +386,23 @@ impl Wallpaper {
             b: c.z as f64,
             a: 1.0,
         };
+        self.renderer.set_scene_format(if scene.hdr {
+            wpe_render::HDR_FORMAT
+        } else {
+            wpe_render::DEFAULT_FORMAT
+        });
         self.renderer.set_frame(gpu, frame.targets, frame.steps);
+        for (step, name, scale) in &frame.texel_uniforms {
+            self.renderer.set_texel_uniform(*step, name, *scale);
+        }
         for (name, values) in &lights.uniforms {
             self.renderer.set_global_uniform(name, values);
         }
+        let casters = shadow::casters(&objects(&self.scene_json), &self.props, &frame.layer_steps);
+        tracing::debug!("{} draws cast shadows", casters.len());
+        self.renderer.set_shadow_casters(casters);
+        self.light_fx = shadow::LightEffects::new(volumetrics, scene.is_3d);
+        self.light_fx.update(&mut self.renderer, &scene.lights);
         for id in &frame.hidden {
             for &step in frame.layer_steps.get(id).map_or(&[][..], |s| &s.all) {
                 self.renderer.set_visible(step, false);
@@ -584,6 +628,7 @@ impl Wallpaper {
             for light in lights.iter_mut() {
                 light.set_transform(light.motion.transform_at(time));
             }
+            self.light_fx.update(&mut self.renderer, lights);
             for (name, values) in wpe_scene::light_uniforms(lights, *ambient, *skylight).uniforms {
                 self.renderer.set_global_uniform(&name, &values);
             }
@@ -630,6 +675,28 @@ impl Wallpaper {
         self.pointer += (self.pointer_target - self.pointer) * t;
     }
 
+    /// Move the perspective camera along its camera paths to this frame's time.
+    fn advance_camera_path(&mut self) {
+        let time = self
+            .time_override
+            .unwrap_or_else(|| self.start.elapsed().as_secs_f32());
+        if let Some(player) = &mut self.camera_paths {
+            let dt = self.camera_path_time.map_or(time, |last| time - last);
+            self.camera_path_time = Some(time);
+            player.advance(dt.max(0.0) as f64);
+            if let Some(camera) = &mut self.perspective {
+                (camera.eye, camera.center, camera.up) = player.look_at();
+            }
+        }
+        // Scripts see the 3D camera and may move it (`setCameraTransforms`).
+        self.script_view = None;
+        if self.is_3d
+            && let (Some(camera), Some(scripts)) = (&self.perspective, &mut self.scripts)
+        {
+            self.script_view = scripts.view_camera([camera.eye, camera.center, camera.up]);
+        }
+    }
+
     fn globals(&self, size: (u32, u32)) -> FrameGlobals {
         let now = chrono::Local::now().time();
         let centred = Vec2::new(self.pointer.x - 0.5, 0.5 - self.pointer.y);
@@ -651,12 +718,20 @@ impl Wallpaper {
             let offset = shake.offset(time) * self.camera.scene_size * 0.01;
             view_proj *= glam::Mat4::from_translation(offset.extend(0.0));
         }
-        let perspective = match &self.perspective {
+        let mut perspective_camera = self.perspective;
+        if let (Some(p), Some([eye, center, up])) = (&mut perspective_camera, self.script_view) {
+            (p.eye, p.center, p.up) = (eye, center, up);
+        }
+        let perspective = match &perspective_camera {
             Some(p) => FrameGlobals {
                 perspective: p.view_proj(size, self.fill),
                 perspective_view: p.view(size, self.fill),
                 perspective_proj: p.proj(size, self.fill),
                 perspective_eye: p.eye(),
+                reflected_view: p.reflected_view(size, self.fill),
+                reflected_proj: p.reflected_proj(size, self.fill),
+                reflected: p.reflected_view_proj(size, self.fill),
+                reflected_eye: p.reflected_eye(),
                 ..Default::default()
             },
             None => FrameGlobals::default(),
@@ -683,8 +758,10 @@ impl Wallpaper {
     ) {
         self.upload_video_frames(gpu);
         self.smooth_pointer();
+        self.advance_camera_path();
         let globals = self.globals(size);
         self.animate(globals.time);
+        self.light_fx.select(&mut self.renderer, &globals);
         self.update_audio(globals.time);
         self.run_scripts(gpu, globals.time, size);
         self.renderer.render(gpu, encoder, globals, output, size);
@@ -696,8 +773,10 @@ impl Wallpaper {
             stream.wait_started(std::time::Duration::from_secs(5));
         }
         self.upload_video_frames(gpu);
+        self.advance_camera_path();
         let globals = self.globals(size);
         self.animate(globals.time);
+        self.light_fx.select(&mut self.renderer, &globals);
         self.update_audio(globals.time);
         self.run_scripts(gpu, globals.time, size);
         self.renderer.capture(gpu, globals, size)

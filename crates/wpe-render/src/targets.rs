@@ -47,6 +47,10 @@ pub(crate) struct Targets {
 /// in non-linear 8-bit space, so no sRGB conversion happens anywhere.
 pub const DEFAULT_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba8Unorm;
 
+/// Format of the scene's colour buffers in HDR scenes: values above 1 survive
+/// blending and effects until the output clamps them.
+pub const HDR_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba16Float;
+
 impl Targets {
     pub fn new(gpu: &Gpu) -> Self {
         Self {
@@ -64,6 +68,15 @@ impl Targets {
                 min_filter: wgpu::FilterMode::Linear,
                 ..Default::default()
             }),
+        }
+    }
+
+    /// Change the format of `_rt_default`; it is reallocated on the next prepare.
+    pub fn set_default_format(&mut self, format: wgpu::TextureFormat) {
+        if self.descs[0].format != format {
+            self.descs[0].format = format;
+            self.textures[0] = None;
+            self.generation += 1;
         }
     }
 
@@ -147,6 +160,9 @@ pub(crate) struct DepthBuffers<T = wgpu::TextureView> {
     buffers: Vec<Option<((u32, u32), T)>>,
     /// Targets whose depth was cleared this frame.
     cleared: Vec<bool>,
+    /// Bumped whenever a buffer is (re)allocated, invalidating bind groups
+    /// that sample one.
+    pub generation: u64,
 }
 
 impl<T> Default for DepthBuffers<T> {
@@ -154,6 +170,7 @@ impl<T> Default for DepthBuffers<T> {
         Self {
             buffers: Vec::new(),
             cleared: Vec::new(),
+            generation: 0,
         }
     }
 }
@@ -186,10 +203,35 @@ impl<T> DepthBuffers<T> {
         let slot = &mut self.buffers[target.0];
         if slot.as_ref().is_none_or(|(s, _)| *s != size) {
             *slot = Some((size, make(size)));
+            self.generation += 1;
         }
         let first = !std::mem::replace(&mut self.cleared[target.0], true);
         let (_, buffer) = slot.as_ref().expect("allocated above");
         (buffer, first)
+    }
+
+    /// Allocate the depth buffer of `target` at `size` ahead of its first
+    /// use (for draws sampling it), without counting as that use.
+    pub fn ensure(
+        &mut self,
+        target: TargetId,
+        size: (u32, u32),
+        make: impl FnOnce((u32, u32)) -> T,
+    ) {
+        if self.buffers.len() <= target.0 {
+            self.buffers.resize_with(target.0 + 1, || None);
+            self.cleared.resize(target.0 + 1, false);
+        }
+        let slot = &mut self.buffers[target.0];
+        if slot.as_ref().is_none_or(|(s, _)| *s != size) {
+            *slot = Some((size, make(size)));
+            self.generation += 1;
+        }
+    }
+
+    /// The depth buffer of `target`, if it has one.
+    pub fn view(&self, target: TargetId) -> Option<&T> {
+        self.buffers.get(target.0)?.as_ref().map(|(_, b)| b)
     }
 }
 
@@ -207,7 +249,8 @@ pub(crate) fn depth_view(gpu: &Gpu, size: (u32, u32)) -> wgpu::TextureView {
             sample_count: 1,
             dimension: wgpu::TextureDimension::D2,
             format: crate::material::DEPTH_FORMAT,
-            usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
+            // Volumetric light passes sample the scene's depth.
+            usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING,
             view_formats: &[],
         })
         .create_view(&Default::default())
