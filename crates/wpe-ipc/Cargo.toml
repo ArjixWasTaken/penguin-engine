@@ -8,6 +8,6 @@ description = "Control protocol of penguind (line-delimited JSON over a Unix soc
 [dependencies]
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.154"
+toml = "1.1.8"
 
 [dev-dependencies]
-toml = "1.1.8"

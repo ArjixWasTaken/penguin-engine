@@ -883,11 +883,6 @@ fn main() -> Result<()> {
         .init();
     let args = Args::parse();
     wpe_library::migrate_dirs();
-    let assets = args
-        .assets
-        .clone()
-        .or_else(wpe_runtime::steam::default_assets_dir)
-        .context("Wallpaper Engine assets directory not found; pass --assets")?;
 
     let config_path = state::config_path();
     let config = match &config_path {
@@ -897,6 +892,12 @@ fn main() -> Result<()> {
         }),
         None => Settings::default(),
     };
+    let assets = args
+        .assets
+        .clone()
+        .or_else(|| config.assets.clone())
+        .or_else(wpe_runtime::steam::default_assets_dir)
+        .context("Wallpaper Engine assets directory not found; pass --assets or configure in config.toml")?;
     let state_path = state::state_path();
     let mut state = state_path.as_deref().map(State::load).unwrap_or_default();
     let cli = args.overrides();
