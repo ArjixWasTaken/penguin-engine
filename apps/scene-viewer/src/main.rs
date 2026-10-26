@@ -108,6 +108,7 @@ fn main() -> Result<()> {
     let assets = args
         .assets
         .clone()
+        .and_then(wpe_runtime::steam::resolve_assets_dir)
         .or_else(wpe_runtime::steam::default_assets_dir)
         .context("Wallpaper Engine assets directory not found; pass --assets")?;
 

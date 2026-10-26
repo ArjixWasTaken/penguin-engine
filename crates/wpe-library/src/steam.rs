@@ -21,6 +21,32 @@ pub struct SteamLibrary {
     pub has_app: bool,
 }
 
+/// Expand leading `~` or `~/` to the user's home directory.
+pub fn expand_home(path: PathBuf) -> PathBuf {
+    if let Ok(stripped) = path.strip_prefix("~")
+        && let Some(home) = dirs::home_dir()
+    {
+        return home.join(stripped);
+    }
+    path
+}
+
+/// Verify and normalize `path` as a Wallpaper Engine stock assets directory,
+/// or a Wallpaper Engine root directory containing `assets/`.
+/// Expands leading `~` if present.
+pub fn resolve_assets_dir(path: PathBuf) -> Option<PathBuf> {
+    let path = expand_home(path);
+    if path.join("effects").is_dir() {
+        Some(path)
+    } else if path.join("assets/effects").is_dir() {
+        Some(path.join("assets"))
+    } else if path.is_dir() {
+        Some(path)
+    } else {
+        None
+    }
+}
+
 /// Parse Steam library paths and app metadata from `libraryfolders.vdf` text.
 /// Supports both modern block format (`"1" { "path" "..." "apps" { ... } }`)
 /// and legacy format (`"1" "/..."`).
@@ -129,12 +155,11 @@ fn configured_settings() -> Option<wpe_ipc::Settings> {
 
 /// Wallpaper Engine's install directory (`steamapps/common/wallpaper_engine`).
 pub fn we_dir() -> Option<PathBuf> {
-    if let Some(assets) = default_assets_dir() {
-        if let Some(parent) = assets.parent() {
-            if parent.join("projects").is_dir() {
-                return Some(parent.to_owned());
-            }
-        }
+    if let Some(assets) = default_assets_dir()
+        && let Some(parent) = assets.parent()
+        && parent.join("projects").is_dir()
+    {
+        return Some(parent.to_owned());
     }
     steam_dirs("steamapps/common/wallpaper_engine")
         .into_iter()
@@ -144,26 +169,17 @@ pub fn we_dir() -> Option<PathBuf> {
 /// Wallpaper Engine's stock assets directory, if Steam installed it in a
 /// usual place, or as specified in `WPE_ASSETS` / `config.toml`.
 pub fn default_assets_dir() -> Option<PathBuf> {
-    if let Some(env_val) = std::env::var_os("WPE_ASSETS").map(PathBuf::from) {
-        if env_val.join("effects").is_dir() {
-            return Some(env_val);
-        } else if env_val.join("assets/effects").is_dir() {
-            return Some(env_val.join("assets"));
-        } else if env_val.is_dir() {
-            return Some(env_val);
-        }
+    if let Some(env_val) = std::env::var_os("WPE_ASSETS").map(PathBuf::from)
+        && let Some(dir) = resolve_assets_dir(env_val)
+    {
+        return Some(dir);
     }
 
-    if let Some(settings) = configured_settings() {
-        if let Some(assets) = settings.assets {
-            if assets.join("effects").is_dir() {
-                return Some(assets);
-            } else if assets.join("assets/effects").is_dir() {
-                return Some(assets.join("assets"));
-            } else if assets.is_dir() {
-                return Some(assets);
-            }
-        }
+    if let Some(settings) = configured_settings()
+        && let Some(assets) = settings.assets
+        && let Some(dir) = resolve_assets_dir(assets)
+    {
+        return Some(dir);
     }
 
     steam_dirs("steamapps/common/wallpaper_engine/assets")
@@ -203,6 +219,7 @@ pub fn workshop_dirs() -> Vec<PathBuf> {
 
     if let Some(custom) = std::env::var_os("WPE_WORKSHOP") {
         for part in std::env::split_paths(&custom) {
+            let part = expand_home(part);
             if part.is_dir() {
                 dirs.push(part);
             }
@@ -211,6 +228,7 @@ pub fn workshop_dirs() -> Vec<PathBuf> {
 
     if let Some(settings) = configured_settings() {
         for dir in settings.workshop {
+            let dir = expand_home(dir);
             if dir.is_dir() {
                 dirs.push(dir);
             }
@@ -315,6 +333,25 @@ mod tests {
         assert!(!legacy[0].has_app);
         assert_eq!(legacy[1].path, PathBuf::from("/mnt/Legacy2/Steam"));
         assert!(!legacy[1].has_app);
+    }
+
+    #[test]
+    fn resolves_custom_assets_directories() {
+        let temp = tempfile::tempdir().unwrap();
+        let we_root = temp.path().join("wallpaper_engine");
+        let assets_dir = we_root.join("assets");
+        let effects_dir = assets_dir.join("effects");
+        std::fs::create_dir_all(&effects_dir).unwrap();
+
+        // Direct assets dir
+        assert_eq!(
+            resolve_assets_dir(assets_dir.clone()),
+            Some(assets_dir.clone())
+        );
+        // Parent WE root dir containing assets/effects
+        assert_eq!(resolve_assets_dir(we_root), Some(assets_dir));
+        // Nonexistent dir
+        assert_eq!(resolve_assets_dir(temp.path().join("nonexistent")), None);
     }
 
     #[test]
