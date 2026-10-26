@@ -135,6 +135,12 @@ pub struct Settings {
     pub particles: u32,
     /// What holds wallpapers back, and when. (Protocol 2.)
     pub rules: Vec<Rule>,
+    /// Wallpaper Engine's stock assets directory.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub assets: Option<PathBuf>,
+    /// Extra workshop content directories holding subscribed wallpapers.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub workshop: Vec<PathBuf>,
 }
 
 impl Settings {
@@ -149,6 +155,25 @@ impl Settings {
             passthrough: patch.passthrough.unwrap_or(self.passthrough),
             particles: patch.particles.unwrap_or(self.particles),
             rules: patch.rules.clone().unwrap_or_else(|| self.rules.clone()),
+            assets: patch.assets.clone().or_else(|| self.assets.clone()),
+            workshop: patch
+                .workshop
+                .clone()
+                .unwrap_or_else(|| self.workshop.clone()),
+        }
+    }
+
+    /// Parse settings from a TOML document.
+    pub fn from_toml(text: &str) -> Result<Self, toml::de::Error> {
+        toml::from_str(text)
+    }
+
+    /// Read settings from the config file at `path`, returning defaults if missing.
+    pub fn load(path: &Path) -> Result<Self, String> {
+        match std::fs::read_to_string(path) {
+            Ok(text) => Self::from_toml(&text).map_err(|e| format!("{}: {e}", path.display())),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(Self::default()),
+            Err(e) => Err(format!("reading {}: {e}", path.display())),
         }
     }
 }
@@ -175,6 +200,10 @@ pub struct SettingsPatch {
     /// All the rules, replacing the old ones.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub rules: Option<Vec<Rule>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub assets: Option<PathBuf>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub workshop: Option<Vec<PathBuf>>,
 }
 
 impl Default for Settings {
@@ -188,6 +217,8 @@ impl Default for Settings {
             passthrough: false,
             particles: 100,
             rules: Rule::defaults(),
+            assets: None,
+            workshop: Vec::new(),
         }
     }
 }
@@ -927,6 +958,22 @@ mod tests {
         assert_eq!("bottom".parse::<Layer>().unwrap(), Layer::Bottom);
         assert!("zoom".parse::<Fill>().is_err());
         assert_eq!(Fill::Stretch.to_string(), "stretch");
+
+        let toml_src = r#"
+            fps = 60
+            assets = "/custom/assets"
+            workshop = ["/custom/workshop1", "/custom/workshop2"]
+        "#;
+        let from_toml = Settings::from_toml(toml_src).unwrap();
+        assert_eq!(from_toml.fps, 60);
+        assert_eq!(from_toml.assets, Some(PathBuf::from("/custom/assets")));
+        assert_eq!(
+            from_toml.workshop,
+            vec![
+                PathBuf::from("/custom/workshop1"),
+                PathBuf::from("/custom/workshop2")
+            ]
+        );
     }
 
     #[test]

@@ -49,8 +49,11 @@ Elsewhere, build from source (see [The app](#the-app) and [systemd](#systemd)).
 ## Requirements
 
 Rendering needs the stock assets shipped with Wallpaper Engine (shaders, effects, materials).
-Nothing from Wallpaper Engine is bundled here. With a Steam install they live at
-`~/.local/share/Steam/steamapps/common/wallpaper_engine/assets`.
+Nothing from Wallpaper Engine is bundled here. With a Steam install they are found automatically
+across all configured Steam libraries (`steamapps/libraryfolders.vdf`).
+They can also be set explicitly with `assets = "path/to/assets"` in `config.toml`, via
+`WPE_ASSETS=/path/to/assets`, or passed with `--assets`.
+Additional workshop folders can be configured with `workshop = ["..."]` or `WPE_WORKSHOP`.
 
 Video textures need libmpv. Frames are decoded with VA-API and handed to wgpu as dma-bufs
 without touching the CPU; this needs the Vulkan backend and a Mesa EGL driver. Otherwise
@@ -296,6 +299,11 @@ fill = "auto"        # auto | crop | fit | stretch
 layer = "background" # background | bottom
 passthrough = false
 particles = 100      # percent of the particles wallpapers ask for
+
+# Custom Wallpaper Engine assets and workshop paths (optional; Steam installs
+# across all libraries in libraryfolders.vdf are discovered automatically)
+# assets = "/path/to/wallpaper_engine/assets"
+# workshop = ["/path/to/steamapps/workshop/content/431960"]
 
 # Rules hold wallpapers back while something else goes on (without any, the
 # default pauses behind a fullscreen window). `when` is one of
