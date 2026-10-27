@@ -1,16 +1,18 @@
 /// Normalize an asset path into the canonical lookup key: forward slashes,
-/// no leading `/` or `./`, no empty or `.` segments, lowercase.
+/// no leading `/` or `./`, no empty or `.` segments, resolved `..` segments, lowercase.
 pub fn normalize(path: &str) -> String {
-    let mut out = String::with_capacity(path.len());
+    let mut segments: Vec<&str> = Vec::new();
     for seg in path.split(['/', '\\']) {
         if seg.is_empty() || seg == "." {
             continue;
         }
-        if !out.is_empty() {
-            out.push('/');
+        if seg == ".." {
+            segments.pop();
+        } else {
+            segments.push(seg);
         }
-        out.push_str(seg);
     }
+    let mut out = segments.join("/");
     out.make_ascii_lowercase();
     out
 }
@@ -24,5 +26,9 @@ mod tests {
         assert_eq!(normalize("/Materials//Foo.JSON"), "materials/foo.json");
         assert_eq!(normalize("./a\\b/./c"), "a/b/c");
         assert_eq!(normalize(""), "");
+        assert_eq!(normalize("a/b/../c"), "a/c");
+        assert_eq!(normalize("a/b/../../c"), "c");
+        assert_eq!(normalize("../../etc/passwd"), "etc/passwd");
+        assert_eq!(normalize("a/.."), "");
     }
 }

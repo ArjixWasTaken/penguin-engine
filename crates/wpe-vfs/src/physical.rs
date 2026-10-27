@@ -14,6 +14,7 @@ pub struct PhysicalFs {
 impl PhysicalFs {
     pub fn new(root: impl Into<PathBuf>) -> Result<Self> {
         let root = root.into();
+        let canonical_root = root.canonicalize().unwrap_or_else(|_| root.clone());
         let mut index = HashMap::new();
         for entry in walkdir::WalkDir::new(&root).follow_links(true) {
             let entry = entry.map_err(|e| VfsError::Io {
@@ -21,6 +22,18 @@ impl PhysicalFs {
                 source: e.into(),
             })?;
             if !entry.file_type().is_file() {
+                continue;
+            }
+            if let Ok(canon) = entry.path().canonicalize() {
+                if !canon.starts_with(&canonical_root) {
+                    tracing::warn!(
+                        "skipping symlink target outside root: {} -> {}",
+                        entry.path().display(),
+                        canon.display()
+                    );
+                    continue;
+                }
+            } else {
                 continue;
             }
             let rel = entry.path().strip_prefix(&root).unwrap_or(entry.path());
@@ -54,5 +67,47 @@ impl FileSystem for PhysicalFs {
 
     fn files(&self) -> Box<dyn Iterator<Item = &str> + '_> {
         Box::new(self.index.keys().map(String::as_str))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    #[cfg(unix)]
+    fn rejects_symlinks_outside_root() {
+        let temp_dir = std::env::temp_dir().join(format!("wpe_test_symlink_{}", std::process::id()));
+        let root_dir = temp_dir.join("root");
+        let outside_dir = temp_dir.join("outside");
+
+        std::fs::create_dir_all(&root_dir).unwrap();
+        std::fs::create_dir_all(&outside_dir).unwrap();
+
+        let outside_file = outside_dir.join("secret.txt");
+        std::fs::write(&outside_file, b"secret").unwrap();
+
+        let inside_file = root_dir.join("inside.txt");
+        std::fs::write(&inside_file, b"inside").unwrap();
+
+        // Symlink pointing outside root
+        let symlink_outside = root_dir.join("link_to_secret.txt");
+        std::os::unix::fs::symlink(&outside_file, &symlink_outside).unwrap();
+
+        // Symlink pointing inside root
+        let symlink_inside = root_dir.join("link_to_inside.txt");
+        std::os::unix::fs::symlink(&inside_file, &symlink_inside).unwrap();
+
+        let fs = PhysicalFs::new(&root_dir).unwrap();
+
+        // Inside file and inside symlink should be indexed
+        assert!(fs.contains("inside.txt"));
+        assert!(fs.contains("link_to_inside.txt"));
+
+        // Symlink pointing outside root must NOT be indexed
+        assert!(!fs.contains("link_to_secret.txt"));
+
+        // Cleanup
+        let _ = std::fs::remove_dir_all(&temp_dir);
     }
 }
