@@ -137,7 +137,7 @@ impl Clock {
 /// Every clock of a wallpaper, by layer id and key.
 #[derive(Debug, Default)]
 pub struct Clocks {
-    clocks: HashMap<(i32, String), Clock>,
+    clocks: HashMap<i32, HashMap<String, Clock>>,
     /// Scene time of the last advance.
     last: Option<f32>,
 }
@@ -148,34 +148,40 @@ pub type SharedClocks = Rc<RefCell<Clocks>>;
 impl Clocks {
     /// Add a clock unless one exists (clocks outlive frame rebuilds).
     pub fn register(&mut self, layer: i32, key: String, clock: Clock) {
-        self.clocks.entry((layer, key)).or_insert(clock);
+        self.clocks
+            .entry(layer)
+            .or_default()
+            .entry(key)
+            .or_insert(clock);
     }
 
     pub fn get(&self, layer: i32, key: &str) -> Option<&Clock> {
-        self.clocks.get(&(layer, key.to_owned()))
+        self.clocks.get(&layer)?.get(key)
     }
 
     pub fn get_mut(&mut self, layer: i32, key: &str) -> Option<&mut Clock> {
-        self.clocks.get_mut(&(layer, key.to_owned()))
+        self.clocks.get_mut(&layer)?.get_mut(key)
     }
 
     /// Forget animation layer `index` of `layer`, moving later layers' clocks
     /// down to their new indices.
     pub fn remove_layer_clock(&mut self, layer: i32, index: usize) {
-        self.clocks.remove(&(layer, layer_key(index)));
-        let mut i = index + 1;
-        while let Some(clock) = self.clocks.remove(&(layer, layer_key(i))) {
-            self.clocks.insert((layer, layer_key(i - 1)), clock);
-            i += 1;
+        if let Some(map) = self.clocks.get_mut(&layer) {
+            map.remove(&layer_key(index));
+            let mut i = index + 1;
+            while let Some(clock) = map.remove(&layer_key(i)) {
+                map.insert(layer_key(i - 1), clock);
+                i += 1;
+            }
         }
     }
 
     /// The layer with a clock `key` (`thisScene.getAnimation(name)`).
     pub fn find_layer(&self, key: &str) -> Option<i32> {
         self.clocks
-            .keys()
-            .filter(|(_, k)| k == key)
-            .map(|&(l, _)| l)
+            .iter()
+            .filter(|(_, map)| map.contains_key(key))
+            .map(|(&l, _)| l)
             .min()
     }
 
@@ -183,21 +189,19 @@ impl Clocks {
     pub fn layer_keys(&self, layer: i32) -> Vec<String> {
         let mut keys: Vec<String> = self
             .clocks
-            .keys()
-            .filter(|(l, _)| *l == layer)
-            .map(|(_, k)| k.clone())
-            .collect();
+            .get(&layer)
+            .map(|map| map.keys().cloned().collect())
+            .unwrap_or_default();
         keys.sort();
         keys
     }
 
     /// The key of `layer`'s first keyframe animation (`getAnimation()`).
     pub fn first_animation(&self, layer: i32) -> Option<String> {
-        let mut keys: Vec<&String> = self
-            .clocks
+        let map = self.clocks.get(&layer)?;
+        let mut keys: Vec<&String> = map
             .keys()
-            .filter(|(l, k)| *l == layer && k.starts_with("animation:"))
-            .map(|(_, k)| k)
+            .filter(|k| k.starts_with("animation:"))
             .collect();
         keys.sort();
         keys.first().map(|k| (*k).clone())
@@ -207,8 +211,10 @@ impl Clocks {
     pub fn advance(&mut self, time: f32) -> f32 {
         let dt = self.last.map_or(time, |last| time - last).max(0.0);
         self.last = Some(time);
-        for clock in self.clocks.values_mut() {
-            clock.advance(dt);
+        for map in self.clocks.values_mut() {
+            for clock in map.values_mut() {
+                clock.advance(dt);
+            }
         }
         dt
     }
@@ -218,10 +224,13 @@ impl Clocks {
         let mut ended: Vec<(i32, String)> = self
             .clocks
             .iter_mut()
-            .filter(|(_, clock)| clock.ended)
-            .map(|((layer, key), clock)| {
-                clock.ended = false;
-                (*layer, key.clone())
+            .flat_map(|(&layer, map)| {
+                map.iter_mut()
+                    .filter(|(_, clock)| clock.ended)
+                    .map(move |(key, clock)| {
+                        clock.ended = false;
+                        (layer, key.clone())
+                    })
             })
             .collect();
         ended.sort();
@@ -233,10 +242,12 @@ impl Clocks {
         let mut events: Vec<(i32, String, f32)> = self
             .clocks
             .iter_mut()
-            .flat_map(|((layer, _), clock)| {
-                std::mem::take(&mut clock.fired)
-                    .into_iter()
-                    .map(|(name, frame)| (*layer, name, frame))
+            .flat_map(|(&layer, map)| {
+                map.iter_mut().flat_map(move |(_, clock)| {
+                    std::mem::take(&mut clock.fired)
+                        .into_iter()
+                        .map(move |(name, frame)| (layer, name, frame))
+                })
             })
             .collect();
         events.sort_by(|a, b| a.0.cmp(&b.0).then(a.2.total_cmp(&b.2)));
