@@ -26,15 +26,43 @@ impl Gpu {
         instance: wgpu::Instance,
         compatible_surface: Option<&wgpu::Surface<'_>>,
     ) -> Result<Self, GpuError> {
+        let power_preference = match std::env::var("WPE_POWER_PREFERENCE")
+            .ok()
+            .as_deref()
+            .map(str::to_lowercase)
+            .as_deref()
+        {
+            Some("low-power" | "low" | "battery" | "integrated") => {
+                wgpu::PowerPreference::LowPower
+            }
+            Some("none" | "default") => wgpu::PowerPreference::None,
+            Some("high-performance" | "high" | "performance" | "discrete") => {
+                wgpu::PowerPreference::HighPerformance
+            }
+            _ => wgpu::PowerPreference::LowPower,
+        };
+        Self::with_power_preference(instance, compatible_surface, power_preference).await
+    }
+
+    pub async fn with_power_preference(
+        instance: wgpu::Instance,
+        compatible_surface: Option<&wgpu::Surface<'_>>,
+        power_preference: wgpu::PowerPreference,
+    ) -> Result<Self, GpuError> {
         let adapter = instance
             .request_adapter(&wgpu::RequestAdapterOptions {
-                power_preference: wgpu::PowerPreference::HighPerformance,
+                power_preference,
                 compatible_surface,
                 ..Default::default()
             })
             .await?;
         let info = adapter.get_info();
-        tracing::info!("using {} ({:?}, {})", info.name, info.backend, info.driver);
+        tracing::info!(
+            "using {} ({:?}, {}, power_preference: {power_preference:?})",
+            info.name,
+            info.backend,
+            info.driver
+        );
 
         let required_features = adapter.features() & Self::OPTIONAL_FEATURES;
         if !required_features.contains(wgpu::Features::TEXTURE_COMPRESSION_BC) {
