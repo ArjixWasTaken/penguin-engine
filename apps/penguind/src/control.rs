@@ -152,7 +152,17 @@ fn bind(path: &Path) -> Result<UnixListener> {
     if let Some(dir) = path.parent() {
         std::fs::create_dir_all(dir)?;
     }
-    UnixListener::bind(path).with_context(|| format!("binding {}", path.display()))
+    let listener = UnixListener::bind(path).with_context(|| format!("binding {}", path.display()))?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        if let Ok(metadata) = std::fs::metadata(path) {
+            let mut permissions = metadata.permissions();
+            permissions.set_mode(0o600);
+            let _ = std::fs::set_permissions(path, permissions);
+        }
+    }
+    Ok(listener)
 }
 
 /// The socket systemd passed in, or else `path` bound here.
@@ -227,10 +237,52 @@ pub fn serve<D: Handler + 'static>(
 /// Keeps the socket (file) until dropped.
 pub struct SocketGuard(#[allow(dead_code)] ControlSocket);
 
+#[cfg(target_os = "linux")]
+fn verify_peer_creds(stream: &UnixStream) -> Result<()> {
+    use std::os::unix::io::AsRawFd;
+    let fd = stream.as_raw_fd();
+    let mut ucred = libc::ucred {
+        pid: 0,
+        uid: 0,
+        gid: 0,
+    };
+    let mut len = std::mem::size_of::<libc::ucred>() as libc::socklen_t;
+    let res = unsafe {
+        libc::getsockopt(
+            fd,
+            libc::SOL_SOCKET,
+            libc::SO_PEERCRED,
+            &mut ucred as *mut _ as *mut libc::c_void,
+            &mut len,
+        )
+    };
+    if res != 0 {
+        bail!(
+            "failed to get peer credentials: {}",
+            std::io::Error::last_os_error()
+        );
+    }
+    let current_uid = unsafe { libc::getuid() };
+    if ucred.uid != current_uid && ucred.uid != 0 {
+        bail!(
+            "control client UID {} does not match current UID {}",
+            ucred.uid,
+            current_uid
+        );
+    }
+    Ok(())
+}
+
+#[cfg(not(target_os = "linux"))]
+fn verify_peer_creds(_stream: &UnixStream) -> Result<()> {
+    Ok(())
+}
+
 fn add_client<D: Handler + 'static>(
     handle: &LoopHandle<'static, D>,
     stream: UnixStream,
 ) -> Result<()> {
+    verify_peer_creds(&stream)?;
     // Reads happen only when the loop says the socket is readable; writes
     // block for at most the timeout.
     stream.set_nonblocking(false)?;

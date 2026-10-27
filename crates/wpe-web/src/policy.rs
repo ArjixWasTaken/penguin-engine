@@ -28,8 +28,8 @@ impl NetworkPolicy {
     pub fn check(&self, url: &Url) -> Verdict {
         match url.scheme() {
             "http" | "https" | "ws" | "wss" => {}
-            "file" => return Verdict::Block,
-            _ => return Verdict::Allow,
+            "data" | "blob" => return Verdict::Allow,
+            _ => return Verdict::Block,
         }
         let Some(host) = url.host() else {
             return Verdict::Block;
@@ -58,22 +58,53 @@ impl NetworkPolicy {
     }
 }
 
-/// Whether `host` resolves to a local address (or doesn't resolve).
+/// Whether `host` resolves to a local address (or cannot be resolved).
 pub fn resolves_local(host: &str, port: u16) -> bool {
     match (host, port).to_socket_addrs() {
-        Ok(addrs) => addrs.into_iter().any(|a| is_local(a.ip())),
-        // Servo will fail it too.
-        Err(_) => false,
+        Ok(addrs) => {
+            let mut any = false;
+            for a in addrs {
+                any = true;
+                if is_local(a.ip()) {
+                    return true;
+                }
+            }
+            !any
+        }
+        // Fail-closed on DNS resolution error
+        Err(_) => true,
     }
 }
 
 fn is_local(ip: IpAddr) -> bool {
     match ip {
         IpAddr::V4(ip) => is_local_v4(ip),
-        IpAddr::V6(ip) => match ip.to_ipv4_mapped() {
-            Some(v4) => is_local_v4(v4),
-            None => is_local_v6(ip),
-        },
+        IpAddr::V6(ip) => {
+            if is_local_v6(ip) {
+                return true;
+            }
+            if let Some(v4) = ip.to_ipv4_mapped() {
+                is_local_v4(v4)
+            } else if let Some(v4) = to_ipv4_compatible(&ip) {
+                is_local_v4(v4)
+            } else {
+                false
+            }
+        }
+    }
+}
+
+fn to_ipv4_compatible(ip: &Ipv6Addr) -> Option<Ipv4Addr> {
+    let segs = ip.segments();
+    if segs[0] == 0 && segs[1] == 0 && segs[2] == 0 && segs[3] == 0 && segs[4] == 0 && segs[5] == 0 {
+        Some(Ipv4Addr::new(
+            (segs[6] >> 8) as u8,
+            segs[6] as u8,
+            (segs[7] >> 8) as u8,
+            segs[7] as u8,
+        ))
+    } else {
+        None
     }
 }
 
@@ -114,6 +145,7 @@ mod tests {
             "http://[fd00::1]/",
             "http://[fe80::1]/",
             "http://[::ffff:192.168.0.1]/",
+            "http://[::192.168.0.1]/",
             "http://localhost:3000/",
             "ws://LOCALHOST./",
             "http://foo.localhost/",
@@ -133,7 +165,16 @@ mod tests {
             Verdict::Resolve("example.com".into(), 443)
         );
         assert_eq!(check(&p, "data:text/plain,hi"), Verdict::Allow);
+        assert_eq!(check(&p, "blob:http://localhost/uuid"), Verdict::Allow);
         assert_eq!(check(&p, "file:///etc/passwd"), Verdict::Block);
+        assert_eq!(check(&p, "gopher://evil.com/"), Verdict::Block);
+        assert_eq!(check(&p, "ftp://evil.com/"), Verdict::Block);
+    }
+
+    #[test]
+    fn resolution_fails_closed() {
+        // A non-existent domain must fail-closed (return true meaning treated as local/blocked)
+        assert!(resolves_local("nonexistent.invalid.domain.penguin", 80));
     }
 
     #[test]

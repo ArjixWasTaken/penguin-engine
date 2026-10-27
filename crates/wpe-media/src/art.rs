@@ -79,6 +79,45 @@ fn truncate(s: &str) -> &str {
     }
 }
 
+fn is_safe_http_url(url_str: &str) -> bool {
+    use std::net::ToSocketAddrs;
+    let Ok(url) = url::Url::parse(url_str) else {
+        return false;
+    };
+    if url.scheme() != "http" && url.scheme() != "https" {
+        return false;
+    }
+    let Some(host) = url.host_str() else {
+        return false;
+    };
+    if host.eq_ignore_ascii_case("localhost") || host.ends_with(".localhost") {
+        return false;
+    }
+    let port = url.port_or_known_default().unwrap_or(80);
+    let Ok(addrs) = (host, port).to_socket_addrs() else {
+        return false;
+    };
+    let mut any = false;
+    for addr in addrs {
+        any = true;
+        let is_local = match addr.ip() {
+            std::net::IpAddr::V4(v4) => {
+                v4.is_loopback() || v4.is_private() || v4.is_link_local() || v4.is_unspecified()
+            }
+            std::net::IpAddr::V6(v6) => {
+                v6.is_loopback()
+                    || v6.is_unspecified()
+                    || (v6.segments()[0] & 0xfe00 == 0xfc00)
+                    || (v6.segments()[0] & 0xffc0 == 0xfe80)
+            }
+        };
+        if is_local {
+            return false;
+        }
+    }
+    any
+}
+
 /// Reads the encoded bytes behind an [`ArtSource`]. Blocking.
 pub fn fetch(source: &ArtSource) -> Result<Vec<u8>, MediaError> {
     match source {
@@ -93,6 +132,12 @@ pub fn fetch(source: &ArtSource) -> Result<Vec<u8>, MediaError> {
             Ok(buf)
         }
         ArtSource::Http(url) => {
+            if !is_safe_http_url(url) {
+                return Err(MediaError::Art(format!(
+                    "blocked request to local or invalid URL: {}",
+                    truncate(url)
+                )));
+            }
             let agent: ureq::Agent = ureq::Agent::config_builder()
                 .timeout_global(Some(HTTP_TIMEOUT))
                 .build()
@@ -241,5 +286,17 @@ mod tests {
         }
         let t = load(&format!("data:image/png;base64,{b64}")).unwrap();
         assert_eq!((t.width, t.height), (4, 4));
+    }
+
+    #[test]
+    fn blocks_unsafe_http_urls() {
+        assert!(!is_safe_http_url("http://127.0.0.1/test"));
+        assert!(!is_safe_http_url("http://localhost:8080/secret"));
+        assert!(!is_safe_http_url("http://169.254.169.254/latest/meta-data"));
+        assert!(!is_safe_http_url("http://192.168.1.1/admin"));
+        assert!(!is_safe_http_url("http://10.0.0.1/internal"));
+        assert!(!is_safe_http_url("http://[::1]/test"));
+        assert!(!is_safe_http_url("ftp://example.com/file"));
+        assert!(!is_safe_http_url("http://invalid.domain.that.cannot.resolve.penguin/"));
     }
 }

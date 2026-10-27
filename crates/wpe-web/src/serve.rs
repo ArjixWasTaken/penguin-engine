@@ -104,7 +104,15 @@ pub fn find(root: &Path, path: &str) -> Option<PathBuf> {
     } else {
         at
     };
-    at.is_file().then_some(at)
+    if !at.is_file() {
+        return None;
+    }
+    let canon_root = root.canonicalize().ok()?;
+    let canon_at = at.canonicalize().ok()?;
+    if !canon_at.starts_with(&canon_root) {
+        return None;
+    }
+    Some(at)
 }
 
 fn percent_decode(s: &str) -> Option<String> {
@@ -212,6 +220,23 @@ mod tests {
         assert_eq!(find(&root, "/../etc/passwd"), None);
         assert_eq!(find(&root, "/image/%2e%2e/%2e%2e/x"), None);
         assert_eq!(find(&root, "/missing.js"), None);
+
+        #[cfg(unix)]
+        {
+            let outside = std::env::temp_dir().join(format!("wpe-web-outside-{}", std::process::id()));
+            std::fs::create_dir_all(&outside).unwrap();
+            let outside_file = outside.join("secret.txt");
+            std::fs::write(&outside_file, b"secret").unwrap();
+
+            let link = root.join("link_to_secret.txt");
+            let _ = std::fs::remove_file(&link);
+            std::os::unix::fs::symlink(&outside_file, &link).unwrap();
+
+            // Symlink to outside must return None
+            assert_eq!(find(&root, "/link_to_secret.txt"), None);
+
+            let _ = std::fs::remove_dir_all(&outside);
+        }
     }
 
     #[test]

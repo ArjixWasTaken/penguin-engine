@@ -439,13 +439,35 @@ fn serve(load: WebResourceLoad, root: std::path::PathBuf, url: Url) {
     respond(load, url, response);
 }
 
+fn origin(load: &WebResourceLoad) -> Option<String> {
+    load.request()
+        .headers
+        .get(http::header::ORIGIN)
+        .and_then(|v| v.to_str().ok())
+        .map(ToOwned::to_owned)
+}
+
+fn is_local_origin(origin: &str) -> bool {
+    let Ok(url) = Url::parse(origin) else {
+        return false;
+    };
+    if url.scheme() != "http" {
+        return false;
+    }
+    matches!(url.host_str(), Some("localhost" | "127.0.0.1"))
+}
+
 /// Answer a `file:` request for a file the page may read.
 fn serve_file(load: WebResourceLoad, path: &std::path::Path, url: Url) {
     let mut response = crate::serve::respond(path, range(&load).as_deref());
-    // Pages fetch them from their http origin.
-    response
-        .headers
-        .push(("Access-Control-Allow-Origin", "*".to_owned()));
+    // Only mirror the Origin header for verified local origins
+    if let Some(req_origin) = origin(&load)
+        && is_local_origin(&req_origin)
+    {
+        response
+            .headers
+            .push(("Access-Control-Allow-Origin", req_origin));
+    }
     respond(load, url, response);
 }
 

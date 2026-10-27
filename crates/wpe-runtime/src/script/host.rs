@@ -1591,15 +1591,29 @@ impl SceneHost for ScriptHost {
         let bound = shortcut
             .get("isbound")
             .and_then(Value::as_bool)
-            .unwrap_or(true);
+            .unwrap_or(false);
         let Some(target) = target.filter(|_| bound) else {
             return false;
         };
-        std::process::Command::new("xdg-open")
+        match std::process::Command::new("xdg-open")
             .arg(target)
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
             .spawn()
-            .inspect_err(|e| tracing::warn!("opening {target}: {e}"))
-            .is_ok()
+        {
+            Ok(mut child) => {
+                // Reap the child in the background to prevent zombies
+                std::thread::spawn(move || {
+                    let _ = child.wait();
+                });
+                true
+            }
+            Err(e) => {
+                tracing::warn!("opening {target}: {e}");
+                false
+            }
+        }
     }
 
     fn hit_box(&self, layer: i32, world: [f32; 2]) -> Option<String> {
