@@ -239,9 +239,13 @@ fn mp4_header(file: &Path) -> Option<Vec<u8>> {
             size = u64::from_be_bytes(head[8..16].try_into().ok()?);
             header_len = 16;
         } else if size == 0 {
-            size = len - pos;
+            size = len.checked_sub(pos)?;
         }
-        if size < header_len || pos + size > len {
+        if size < header_len {
+            return None;
+        }
+        let next_pos = pos.checked_add(size)?;
+        if next_pos > len {
             return None;
         }
         if &kind == b"ftyp" || &kind == b"moov" {
@@ -250,13 +254,13 @@ fn mp4_header(file: &Path) -> Option<Vec<u8>> {
             }
             f.seek(SeekFrom::Start(pos)).ok()?;
             let start = out.len();
-            out.resize(start + size as usize, 0);
+            out.resize(start.checked_add(size as usize)?, 0);
             f.read_exact(&mut out[start..]).ok()?;
             if &kind == b"moov" {
                 return Some(out);
             }
         }
-        pos += size;
+        pos = next_pos;
     }
     None
 }

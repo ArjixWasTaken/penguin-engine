@@ -17,6 +17,8 @@ const RATE: u32 = 48_000;
 pub enum CaptureError {
     #[error("connecting to the audio server: {0}")]
     Connect(String),
+    #[error("starting capture thread: {0}")]
+    Thread(#[from] std::io::Error),
 }
 
 /// Records the default output's monitor on a background thread and turns
@@ -68,15 +70,16 @@ impl AudioCapture {
                         return;
                     }
                     let samples = bytes
-                        .chunks_exact(4)
-                        .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]));
+                        .as_chunks::<4>()
+                        .0
+                        .iter()
+                        .map(|c| f32::from_le_bytes(*c));
                     let mut window = shared.lock().unwrap_or_else(|e| e.into_inner());
                     window.extend(samples);
                     let excess = window.len().saturating_sub(FFT_SIZE * 2);
                     window.drain(..excess);
                 }
-            })
-            .expect("spawn audio thread");
+            })?;
         Ok(Self {
             latest,
             stop,

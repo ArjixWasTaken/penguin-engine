@@ -365,8 +365,20 @@ fn decode_vertices(data: &[u8], format: VertexFormat, count: usize) -> MdlMesh {
         ..MdlMesh::default()
     };
     let stride = data.len().checked_div(count).unwrap_or(0);
-    let f = |b: &[u8], at: usize| f32::from_le_bytes([b[at], b[at + 1], b[at + 2], b[at + 3]]);
-    let u = |b: &[u8], at: usize| u32::from_le_bytes([b[at], b[at + 1], b[at + 2], b[at + 3]]);
+    let f = |b: &[u8], at: usize| {
+        if at + 4 <= b.len() {
+            f32::from_le_bytes([b[at], b[at + 1], b[at + 2], b[at + 3]])
+        } else {
+            0.0
+        }
+    };
+    let u = |b: &[u8], at: usize| {
+        if at + 4 <= b.len() {
+            u32::from_le_bytes([b[at], b[at + 1], b[at + 2], b[at + 3]])
+        } else {
+            0
+        }
+    };
     let has = |flag| format.contains(flag);
     for v in data.chunks_exact(stride.max(1)).take(count) {
         let mut at = 0;

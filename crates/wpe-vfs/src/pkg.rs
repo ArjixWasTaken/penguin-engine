@@ -41,10 +41,10 @@ struct RawEntry {
 }
 
 #[binread]
-#[br(little)]
+#[br(little, import(map_len: usize))]
 struct Header {
     version: SizedString,
-    #[br(temp, assert(entry_count <= MAX_ENTRIES, "entry count {} too large", entry_count))]
+    #[br(temp, assert(entry_count <= MAX_ENTRIES && (entry_count as usize) <= map_len / 12, "entry count {} too large", entry_count))]
     entry_count: u32,
     #[br(count = entry_count)]
     entries: Vec<RawEntry>,
@@ -85,13 +85,20 @@ impl PkgFs {
     fn from_mmap(map: Mmap) -> Result<Self> {
         let mut cursor = Cursor::new(&map[..]);
         let header =
-            Header::read(&mut cursor).map_err(|e| VfsError::MalformedPkg(e.to_string()))?;
-        let data_start = cursor.stream_position().expect("cursor position") as usize;
+            Header::read_args(&mut cursor, (map.len(),)).map_err(|e| VfsError::MalformedPkg(e.to_string()))?;
+        let data_start = cursor
+            .stream_position()
+            .map_err(|e| VfsError::MalformedPkg(e.to_string()))? as usize;
 
         let mut entries = Vec::with_capacity(header.entries.len());
         let mut index = HashMap::with_capacity(header.entries.len());
         for raw in header.entries {
-            let offset = data_start + raw.offset as usize;
+            let Some(offset) = data_start.checked_add(raw.offset as usize) else {
+                return Err(VfsError::MalformedPkg(format!(
+                    "entry {:?} offset wraps usize",
+                    raw.path.value
+                )));
+            };
             let length = raw.length as usize;
             if offset.checked_add(length).is_none_or(|end| end > map.len()) {
                 return Err(VfsError::MalformedPkg(format!(
