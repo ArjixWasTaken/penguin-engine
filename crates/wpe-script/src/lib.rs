@@ -84,6 +84,8 @@ pub struct ScriptOptions {
     pub load_budget: Duration,
     /// QuickJS heap limit in bytes (0 = unlimited).
     pub memory_limit: usize,
+    /// QuickJS maximum stack size in bytes.
+    pub max_stack_size: usize,
 }
 
 impl Default for ScriptOptions {
@@ -93,6 +95,7 @@ impl Default for ScriptOptions {
             call_budget: Duration::from_millis(250),
             load_budget: Duration::from_secs(1),
             memory_limit: 256 << 20,
+            max_stack_size: 4 << 20,
         }
     }
 }
@@ -214,7 +217,7 @@ impl ScriptRuntime {
         let engine = |e: rquickjs::Error| ScriptError::Engine(e.to_string());
         let runtime = Runtime::new().map_err(engine)?;
         runtime.set_memory_limit(options.memory_limit);
-        runtime.set_max_stack_size(1 << 20);
+        runtime.set_max_stack_size(options.max_stack_size);
         let resolver = BuiltinResolver::default()
             .with_module("WEMath")
             .with_module("WEVector")
@@ -226,8 +229,15 @@ impl ScriptRuntime {
         runtime.set_loader(resolver, loader);
         let deadline: Rc<Cell<Option<Instant>>> = Rc::default();
         let d = deadline.clone();
+        let tick = Cell::new(0u32);
         runtime.set_interrupt_handler(Some(Box::new(move || {
-            d.get().is_some_and(|t| Instant::now() >= t)
+            let count = tick.get().wrapping_add(1);
+            tick.set(count);
+            if count & 0x3ff == 0 {
+                d.get().is_some_and(|t| Instant::now() >= t)
+            } else {
+                false
+            }
         })));
         let context = Context::full(&runtime).map_err(engine)?;
         let host: Rc<HostSlot> = Rc::default();

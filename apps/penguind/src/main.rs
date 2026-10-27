@@ -370,6 +370,7 @@ impl Screen {
             self.config.width = bw;
             self.config.height = bh;
             self.surface.configure(&gpu.device, &self.config);
+            self.frame_pending = false;
             tracing::info!(
                 "{}: {}x{} logical, {bw}x{bh} buffer",
                 self.name,
@@ -466,6 +467,7 @@ impl Screen {
             | wgpu::CurrentSurfaceTexture::Suboptimal(f) => f,
             wgpu::CurrentSurfaceTexture::Outdated | wgpu::CurrentSurfaceTexture::Lost => {
                 self.surface.configure(&gpu.device, &self.config);
+                self.frame_pending = false;
                 return false;
             }
             other => {
