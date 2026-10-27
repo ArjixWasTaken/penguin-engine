@@ -2,6 +2,7 @@
 
 use std::io::Read;
 use std::path::PathBuf;
+use std::sync::LazyLock;
 use std::time::Duration;
 
 use crate::MediaError;
@@ -13,6 +14,13 @@ pub const MAX_THUMBNAIL_SIDE: u32 = 512;
 /// Largest encoded art accepted from a file or HTTP response.
 pub const MAX_ART_BYTES: u64 = 32 * 1024 * 1024;
 const HTTP_TIMEOUT: Duration = Duration::from_secs(10);
+
+static HTTP_AGENT: LazyLock<ureq::Agent> = LazyLock::new(|| {
+    ureq::Agent::config_builder()
+        .timeout_global(Some(HTTP_TIMEOUT))
+        .build()
+        .into()
+});
 
 /// Decoded album art plus its derived colours.
 #[derive(Debug, Clone, PartialEq)]
@@ -93,11 +101,7 @@ pub fn fetch(source: &ArtSource) -> Result<Vec<u8>, MediaError> {
             Ok(buf)
         }
         ArtSource::Http(url) => {
-            let agent: ureq::Agent = ureq::Agent::config_builder()
-                .timeout_global(Some(HTTP_TIMEOUT))
-                .build()
-                .into();
-            let mut resp = agent
+            let mut resp = HTTP_AGENT
                 .get(url)
                 .call()
                 .map_err(|e| MediaError::Art(format!("{}: {e}", truncate(url))))?;
@@ -110,10 +114,21 @@ pub fn fetch(source: &ArtSource) -> Result<Vec<u8>, MediaError> {
     }
 }
 
+/// Maximum dimension of decoded raw image (to guard against decompression bombs).
+pub const MAX_IMAGE_DIMENSION: u32 = 4096;
+
 /// Decodes encoded art, downscales it so the longest side is at most
 /// [`MAX_THUMBNAIL_SIDE`] and computes its colours. `generation` is left 0.
 pub fn decode(bytes: &[u8]) -> Result<Thumbnail, MediaError> {
-    let img = image::load_from_memory(bytes)
+    let mut limits = image::Limits::default();
+    limits.max_image_width = Some(MAX_IMAGE_DIMENSION);
+    limits.max_image_height = Some(MAX_IMAGE_DIMENSION);
+    let mut reader = image::ImageReader::new(std::io::Cursor::new(bytes))
+        .with_guessed_format()
+        .map_err(|e| MediaError::Art(format!("decode: {e}")))?;
+    reader.limits(limits);
+    let img = reader
+        .decode()
         .map_err(|e| MediaError::Art(format!("decode: {e}")))?
         .into_rgba8();
     let (w, h) = img.dimensions();
@@ -241,5 +256,13 @@ mod tests {
         }
         let t = load(&format!("data:image/png;base64,{b64}")).unwrap();
         assert_eq!((t.width, t.height), (4, 4));
+    }
+
+    #[test]
+    fn decode_rejects_oversized_dimensions() {
+        let mut bytes = png(4, 4, [255, 0, 0, 255]);
+        // PNG IHDR width is at offset 16..20 (big-endian). Set width to 5000 (> MAX_IMAGE_DIMENSION 4096).
+        bytes[16..20].copy_from_slice(&(5000u32).to_be_bytes());
+        assert!(decode(&bytes).is_err());
     }
 }

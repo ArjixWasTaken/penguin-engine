@@ -8,6 +8,6 @@ pub mod reflect;
 pub mod rewrite;
 pub mod source;
 
-pub use compile::{CompiledShader, ShaderError, ShaderRequest, annotations, compile};
+pub use compile::{CompiledShader, ShaderError, ShaderRequest, annotations, clear_cache, compile};
 pub use reflect::Reflection;
 pub use source::{ShaderInfo, TexSlot};

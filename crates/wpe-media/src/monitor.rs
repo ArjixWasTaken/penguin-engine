@@ -205,6 +205,13 @@ fn art_loader(rx: Receiver<String>, tx: Sender<Msg>) {
                     break;
                 }
                 std::thread::sleep(Duration::from_millis(300));
+                // If a newer art request arrived while sleeping, drop stale retry.
+                if let Ok(newer) = rx.try_recv() {
+                    url = newer;
+                    while let Ok(latest) = rx.try_recv() {
+                        url = latest;
+                    }
+                }
                 result = art::load(&url);
             }
         }

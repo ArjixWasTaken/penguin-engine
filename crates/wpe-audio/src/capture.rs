@@ -25,6 +25,7 @@ pub struct AudioCapture {
     /// The most recent `FFT_SIZE` interleaved stereo frames.
     latest: Arc<Mutex<Vec<f32>>>,
     stop: Arc<AtomicBool>,
+    handle: Option<std::thread::JoinHandle<()>>,
     analyzer: Analyzer,
 }
 
@@ -58,7 +59,7 @@ impl AudioCapture {
         let latest = Arc::new(Mutex::new(vec![0.0f32; FFT_SIZE * 2]));
         let stop = Arc::new(AtomicBool::new(false));
         let (shared, stopping) = (latest.clone(), stop.clone());
-        std::thread::Builder::new()
+        let handle = std::thread::Builder::new()
             .name("audio capture".to_owned())
             .spawn(move || {
                 let mut bytes = vec![0u8; FFT_SIZE / 2 * frame_bytes as usize];
@@ -68,18 +69,21 @@ impl AudioCapture {
                         return;
                     }
                     let samples = bytes
-                        .chunks_exact(4)
-                        .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]));
+                        .as_chunks::<4>()
+                        .0
+                        .iter()
+                        .map(|c| f32::from_le_bytes(*c));
                     let mut window = shared.lock().unwrap_or_else(|e| e.into_inner());
                     window.extend(samples);
                     let excess = window.len().saturating_sub(FFT_SIZE * 2);
                     window.drain(..excess);
                 }
             })
-            .expect("spawn audio thread");
+            .map_err(|e| CaptureError::Connect(e.to_string()))?;
         Ok(Self {
             latest,
             stop,
+            handle: Some(handle),
             analyzer: Analyzer::new(RATE),
         })
     }
@@ -92,6 +96,14 @@ impl AudioCapture {
             .unwrap_or_else(|e| e.into_inner())
             .clone();
         self.analyzer.process(&window)
+    }
+
+    /// Wait for the capture worker thread to finish, if it was running.
+    pub fn join(mut self) {
+        self.stop.store(true, Ordering::Relaxed);
+        if let Some(handle) = self.handle.take() {
+            let _ = handle.join();
+        }
     }
 }
 

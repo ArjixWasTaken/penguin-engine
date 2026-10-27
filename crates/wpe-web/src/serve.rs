@@ -30,6 +30,11 @@ pub fn get(root: &Path, path: &str, range: Option<&str>) -> Response {
     }
 }
 
+/// Largest single body buffered into RAM without a Range header (64 MiB).
+const MAX_UNSTREAMED_BODY: u64 = 64 * 1024 * 1024;
+/// Maximum bytes returned in a single Range response (32 MiB).
+const MAX_RANGE_BYTES: u64 = 32 * 1024 * 1024;
+
 /// The response to a GET of `file` with an optional `Range` header.
 pub fn respond(file: &Path, range: Option<&str>) -> Response {
     let Ok(mut f) = std::fs::File::open(file) else {
@@ -43,8 +48,12 @@ pub fn respond(file: &Path, range: Option<&str>) -> Response {
         ("Cache-Control", "no-cache".to_owned()),
     ];
     match range.and_then(|r| parse_range(r, len)) {
-        Some((start, end)) => {
-            let mut body = vec![0; (end - start + 1) as usize];
+        Some((start, mut end)) => {
+            if end >= start && (end - start + 1) > MAX_RANGE_BYTES {
+                end = start + MAX_RANGE_BYTES - 1;
+            }
+            let chunk_len = (end - start + 1) as usize;
+            let mut body = vec![0; chunk_len];
             if f.seek(SeekFrom::Start(start)).is_err() || f.read_exact(&mut body).is_err() {
                 return Response::status(500);
             }
@@ -62,8 +71,10 @@ pub fn respond(file: &Path, range: Option<&str>) -> Response {
             r
         }
         None => {
-            let mut body = Vec::with_capacity(len as usize);
-            if f.read_to_end(&mut body).is_err() {
+            let read_len = len.min(MAX_UNSTREAMED_BODY) as usize;
+            let mut body = Vec::with_capacity(read_len);
+            use std::io::Read;
+            if f.take(MAX_UNSTREAMED_BODY).read_to_end(&mut body).is_err() {
                 return Response::status(500);
             }
             headers.push(("Content-Length", body.len().to_string()));

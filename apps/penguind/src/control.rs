@@ -4,6 +4,7 @@
 //! (a wallpaper loading) holds back that client's next ones, not others'.
 
 use std::cell::{Cell, RefCell};
+use std::collections::VecDeque;
 use std::io::{self, Read, Write};
 use std::os::fd::{FromRawFd, RawFd};
 use std::os::unix::net::{UnixListener, UnixStream};
@@ -34,7 +35,7 @@ pub trait Handler {
 /// bytes not handled yet.
 struct ClientState {
     stream: UnixStream,
-    pending: Vec<u8>,
+    pending: VecDeque<u8>,
     /// A request's response is outstanding.
     busy: bool,
     /// The stream failed.
@@ -238,7 +239,7 @@ fn add_client<D: Handler + 'static>(
     let (wake, wake_source) = make_ping()?;
     let client = Rc::new(RefCell::new(ClientState {
         stream: stream.try_clone()?,
-        pending: Vec::new(),
+        pending: VecDeque::new(),
         busy: false,
         closed: false,
         eof: false,
@@ -277,7 +278,7 @@ fn add_client<D: Handler + 'static>(
             };
             {
                 let mut c = client.borrow_mut();
-                c.pending.extend_from_slice(&chunk[..n]);
+                c.pending.extend(&chunk[..n]);
                 if c.pending.len() > MAX_LINE {
                     c.write(&Response::error("request too long"));
                     c.closed = true;
@@ -317,7 +318,12 @@ fn handle_lines<D: Handler>(handler: &mut D, client: &Rc<RefCell<ClientState>>) 
                 return;
             };
             let mut line: Vec<u8> = c.pending.drain(..=end).collect();
-            line.pop();
+            if line.last() == Some(&b'\n') {
+                line.pop();
+            }
+            if c.pending.is_empty() && c.pending.capacity() > 64 * 1024 {
+                c.pending.shrink_to(4096);
+            }
             line
         };
         match parse(&line) {

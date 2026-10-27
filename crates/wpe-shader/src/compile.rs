@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::sync::{Arc, LazyLock, Mutex};
 
 use wpe_vfs::Vfs;
@@ -47,11 +47,46 @@ pub struct CompiledShader {
     pub reflection: Reflection,
 }
 
-type Memo = HashMap<String, Arc<Result<(Vec<u32>, Vec<u32>, Reflection), String>>>;
+type MemoEntry = Arc<Result<(Vec<u32>, Vec<u32>, Reflection), String>>;
+
+const MAX_MEMO_ENTRIES: usize = 256;
+
+#[derive(Default)]
+struct MemoCache {
+    entries: HashMap<String, MemoEntry>,
+    order: VecDeque<String>,
+}
+
+impl MemoCache {
+    fn get(&self, key: &str) -> Option<MemoEntry> {
+        self.entries.get(key).cloned()
+    }
+
+    fn insert(&mut self, key: String, val: MemoEntry) {
+        if self.entries.insert(key.clone(), val).is_none() {
+            self.order.push_back(key);
+            if self.order.len() > MAX_MEMO_ENTRIES
+                && let Some(oldest) = self.order.pop_front()
+            {
+                self.entries.remove(&oldest);
+            }
+        }
+    }
+
+    fn clear(&mut self) {
+        self.entries.clear();
+        self.order.clear();
+    }
+}
 
 /// Compiled programs keyed by the SHA-1 of their final sources; scenes use
-/// the same shader variant from many materials.
-static MEMO: LazyLock<Mutex<Memo>> = LazyLock::new(Default::default);
+/// the same shader variant from many materials. Bounded to prevent memory leaks.
+static MEMO: LazyLock<Mutex<MemoCache>> = LazyLock::new(Default::default);
+
+/// Clear the shader compilation memoization cache.
+pub fn clear_cache() {
+    MEMO.lock().unwrap_or_else(|e| e.into_inner()).clear();
+}
 
 fn read(vfs: &Vfs, path: &str) -> Option<String> {
     vfs.read_to_string(path).ok()
@@ -138,8 +173,7 @@ pub fn compile(vfs: &Vfs, req: ShaderRequest) -> Result<CompiledShader, ShaderEr
     let cached = MEMO
         .lock()
         .unwrap_or_else(|e| e.into_inner())
-        .get(&key)
-        .cloned();
+        .get(&key);
     let result = match cached {
         Some(r) => r,
         None => {
@@ -254,5 +288,23 @@ mod strip_tests {
         let mut expected = header.to_vec();
         expected.extend([(4 << 16) | 71, 6, 30, 1]);
         assert_eq!(out, expected);
+    }
+
+    #[test]
+    fn memo_cache_evicts_oldest_on_limit() {
+        super::clear_cache();
+        let mut cache = super::MemoCache::default();
+        for i in 0..super::MAX_MEMO_ENTRIES + 10 {
+            cache.insert(
+                format!("key_{i}"),
+                std::sync::Arc::new(Err(format!("err_{i}"))),
+            );
+        }
+        assert_eq!(cache.entries.len(), super::MAX_MEMO_ENTRIES);
+        assert!(cache.get("key_0").is_none());
+        assert!(cache.get("key_9").is_none());
+        assert!(cache.get(&format!("key_{}", super::MAX_MEMO_ENTRIES + 9)).is_some());
+        cache.clear();
+        assert_eq!(cache.entries.len(), 0);
     }
 }

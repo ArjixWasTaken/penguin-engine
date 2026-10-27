@@ -2,6 +2,7 @@
 //! playback once audio is enabled.
 
 use std::collections::HashMap;
+use std::sync::Arc;
 
 use wpe_assets::scene::SceneObject;
 use wpe_audio::{Playback, SoundOutput, TrackId};
@@ -27,7 +28,7 @@ pub struct SoundState {
 
 struct SoundLayer {
     id: i32,
-    files: Vec<Vec<u8>>,
+    files: Vec<Arc<[u8]>>,
     mode: Playback,
     state: SoundState,
 }
@@ -52,7 +53,7 @@ impl Sounds {
                 _ => None,
             })
             .filter_map(|s| {
-                let files_data: Vec<Vec<u8>> = s
+                let files_data: Vec<Arc<[u8]>> = s
                     .sound
                     .iter()
                     .filter_map(|path| {
@@ -61,7 +62,7 @@ impl Sounds {
                             .read(path)
                             .inspect_err(|e| tracing::warn!("sound {path}: {e}"))
                             .ok()
-                            .map(|b| b.into_owned())
+                            .map(|b| Arc::from(b.into_owned()))
                     })
                     .collect();
                 let mode = match s.playbackmode.as_deref() {

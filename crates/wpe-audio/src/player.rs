@@ -1,6 +1,7 @@
 //! Playback of a wallpaper's sound layers.
 
 use std::io::Cursor;
+use std::sync::Arc;
 
 use rodio::{Decoder, DeviceSinkBuilder, MixerDeviceSink, Player};
 
@@ -24,7 +25,7 @@ pub enum Playback {
 /// One sound layer's player and what it plays.
 struct Track {
     player: Player,
-    files: Vec<Vec<u8>>,
+    files: Vec<Arc<[u8]>>,
     mode: Playback,
 }
 
@@ -35,12 +36,12 @@ impl Track {
             Playback::Loop => {
                 if let Some(first) = self.files.first() {
                     self.player
-                        .append(Decoder::new_looped(Cursor::new(first.clone()))?);
+                        .append(Decoder::new_looped(Cursor::new(Arc::clone(first)))?);
                 }
             }
             Playback::Single => {
                 for file in &self.files {
-                    self.player.append(Decoder::new(Cursor::new(file.clone()))?);
+                    self.player.append(Decoder::new(Cursor::new(Arc::clone(file)))?);
                 }
             }
         }
@@ -55,7 +56,7 @@ pub struct TrackId(usize);
 /// The audio output plus one player per sound layer.
 pub struct SoundOutput {
     sink: MixerDeviceSink,
-    tracks: Vec<Track>,
+    tracks: Vec<Option<Track>>,
 }
 
 impl SoundOutput {
@@ -72,7 +73,7 @@ impl SoundOutput {
     /// playing or paused at the start.
     pub fn add(
         &mut self,
-        files: Vec<Vec<u8>>,
+        files: impl IntoIterator<Item = impl Into<Arc<[u8]>>>,
         volume: f32,
         mode: Playback,
         playing: bool,
@@ -84,18 +85,18 @@ impl SoundOutput {
         }
         let track = Track {
             player,
-            files,
+            files: files.into_iter().map(Into::into).collect(),
             mode,
         };
         track.queue()?;
-        self.tracks.push(track);
+        self.tracks.push(Some(track));
         Ok(TrackId(self.tracks.len() - 1))
     }
 
     /// Start a sound layer playing right away.
     pub fn play(
         &mut self,
-        files: Vec<Vec<u8>>,
+        files: impl IntoIterator<Item = impl Into<Arc<[u8]>>>,
         volume: f32,
         mode: Playback,
     ) -> Result<TrackId, PlaybackError> {
@@ -104,7 +105,7 @@ impl SoundOutput {
 
     /// Resume, or start over when the layer finished or was stopped.
     pub fn resume(&self, id: TrackId) -> Result<(), PlaybackError> {
-        let Some(track) = self.tracks.get(id.0) else {
+        let Some(Some(track)) = self.tracks.get(id.0) else {
             return Ok(());
         };
         if track.player.empty() {
@@ -115,20 +116,20 @@ impl SoundOutput {
     }
 
     pub fn pause(&self, id: TrackId) {
-        if let Some(track) = self.tracks.get(id.0) {
+        if let Some(Some(track)) = self.tracks.get(id.0) {
             track.player.pause();
         }
     }
 
     /// Stop and rewind: the next [`Self::resume`] starts from the beginning.
     pub fn stop(&self, id: TrackId) {
-        if let Some(track) = self.tracks.get(id.0) {
+        if let Some(Some(track)) = self.tracks.get(id.0) {
             track.player.clear();
         }
     }
 
     pub fn set_volume(&self, id: TrackId, volume: f32) {
-        if let Some(track) = self.tracks.get(id.0) {
+        if let Some(Some(track)) = self.tracks.get(id.0) {
             track.player.set_volume(volume);
         }
     }
@@ -137,16 +138,53 @@ impl SoundOutput {
     pub fn is_playing(&self, id: TrackId) -> bool {
         self.tracks
             .get(id.0)
+            .and_then(|t| t.as_ref())
             .is_some_and(|t| !t.player.is_paused() && !t.player.empty())
     }
 
     pub fn set_paused(&self, paused: bool) {
-        for t in &self.tracks {
+        for t in self.tracks.iter().flatten() {
             if paused {
                 t.player.pause()
             } else {
                 t.player.play()
             }
         }
+    }
+
+    /// Remove a track and release its resources.
+    pub fn remove(&mut self, id: TrackId) {
+        if let Some(slot) = self.tracks.get_mut(id.0)
+            && let Some(track) = slot.take()
+        {
+            track.player.clear();
+        }
+    }
+
+    /// Clear all tracks and release resources.
+    pub fn clear(&mut self) {
+        for track in self.tracks.drain(..).flatten() {
+            track.player.clear();
+        }
+    }
+}
+
+impl Drop for SoundOutput {
+    fn drop(&mut self) {
+        self.clear();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn sound_output_track_lifecycle() {
+        let Ok(mut output) = SoundOutput::open() else {
+            // Audio sink may not be available in headless environment
+            return;
+        };
+        output.clear();
     }
 }
