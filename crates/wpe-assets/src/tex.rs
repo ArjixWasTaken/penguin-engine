@@ -553,7 +553,8 @@ fn sprite_frames(sprite: &RawSprite, images: &[TexImage]) -> Vec<SpriteFrame> {
             tracing::error!("sprite frame references missing image {}", f.image);
             return Vec::new();
         };
-        let (sw, sh) = (mip0.width as f32, mip0.height as f32);
+        let sw = (mip0.width as f32).max(1.0);
+        let sh = (mip0.height as f32).max(1.0);
         let c = match (f.int_coords, f.float_coords) {
             (Some(i), _) => i.map(|v| v as f32),
             (_, Some(fl)) => fl,
@@ -563,6 +564,7 @@ fn sprite_frames(sprite: &RawSprite, images: &[TexImage]) -> Vec<SpriteFrame> {
         let y_axis = [c[4], c[5]];
         let width = x_axis[0].hypot(x_axis[1]);
         let height = y_axis[0].hypot(y_axis[1]);
+        let rate = if width > 1e-6 { height / width } else { 1.0 };
         frames.push(SpriteFrame {
             image: f.image,
             frametime: f.frametime,
@@ -572,7 +574,7 @@ fn sprite_frames(sprite: &RawSprite, images: &[TexImage]) -> Vec<SpriteFrame> {
             y_axis: [y_axis[0] / sh, y_axis[1] / sh],
             width,
             height,
-            rate: height / width,
+            rate,
         });
     }
     frames
@@ -613,11 +615,16 @@ fn blit_patch(fmt: TexFormat, mip: &mut Mip, patch: &[u8], x: u32, y: u32, w: u3
     if w == 0 || h == 0 || !x.is_multiple_of(bd) || !y.is_multiple_of(bd) {
         return false;
     }
-    if x + w > mip.width || y + h > mip.height {
-        return false;
-    }
-    if (!w.is_multiple_of(bd) && x + w != mip.width)
-        || (!h.is_multiple_of(bd) && y + h != mip.height)
+    let end_x = match x.checked_add(w) {
+        Some(end) if end <= mip.width => end,
+        _ => return false,
+    };
+    let end_y = match y.checked_add(h) {
+        Some(end) if end <= mip.height => end,
+        _ => return false,
+    };
+    if (!w.is_multiple_of(bd) && end_x != mip.width)
+        || (!h.is_multiple_of(bd) && end_y != mip.height)
     {
         return false;
     }
@@ -631,7 +638,15 @@ fn blit_patch(fmt: TexFormat, mip: &mut Mip, patch: &[u8], x: u32, y: u32, w: u3
     let dst_x = (x / bd) as usize * fmt.bytes_per_unit();
     for r in 0..h.div_ceil(bd) as usize {
         let dst = (y / bd) as usize * dst_stride + r * dst_stride + dst_x;
-        mip.data[dst..dst + row_bytes].copy_from_slice(&patch[r * row_bytes..(r + 1) * row_bytes]);
+        let patch_start = r * row_bytes;
+        let patch_end = patch_start + row_bytes;
+        if patch_end > patch.len() {
+            return false;
+        }
+        let Some(dst_slice) = mip.data.get_mut(dst..dst + row_bytes) else {
+            return false;
+        };
+        dst_slice.copy_from_slice(&patch[patch_start..patch_end]);
     }
     true
 }
@@ -830,5 +845,20 @@ mod tests {
         let mut w = W::default();
         w.tag("XXXV0005");
         assert!(Texture::parse(&w.0).is_err());
+    }
+
+    #[test]
+    fn blit_patch_rejects_overflow() {
+        let mut mip = Mip {
+            width: 16,
+            height: 16,
+            depth: 1,
+            data: vec![0u8; 16 * 16 * 4],
+        };
+        let patch = vec![0u8; 4 * 4 * 4];
+        // Overflow in x + w
+        assert!(!blit_patch(TexFormat::Rgba8, &mut mip, &patch, u32::MAX - 2, 0, 4, 4));
+        // Out of bounds without wrapping
+        assert!(!blit_patch(TexFormat::Rgba8, &mut mip, &patch, 14, 0, 4, 4));
     }
 }
