@@ -5,6 +5,7 @@
 //! is dropped, so it can hold up neither the daemon nor other clients.
 
 use std::cell::RefCell;
+use std::collections::VecDeque;
 use std::io::{self, Read, Write};
 use std::os::unix::net::UnixStream;
 use std::rc::Rc;
@@ -22,7 +23,7 @@ struct Subscriber {
     id: u64,
     stream: UnixStream,
     /// Written, but not taken by the socket yet.
-    buffer: Vec<u8>,
+    buffer: VecDeque<u8>,
     /// Watches for the client hanging up.
     read: Option<RegistrationToken>,
     /// Armed while `buffer` waits for the socket.
@@ -50,7 +51,8 @@ enum Flushed {
 
 fn flush(sub: &mut Subscriber) -> Flushed {
     while !sub.buffer.is_empty() {
-        match (&sub.stream).write(&sub.buffer) {
+        let (front, _) = sub.buffer.as_slices();
+        match (&sub.stream).write(front) {
             Ok(0) => return Flushed::Failed,
             Ok(n) => {
                 sub.buffer.drain(..n);
@@ -59,6 +61,9 @@ fn flush(sub: &mut Subscriber) -> Flushed {
             Err(e) if e.kind() == io::ErrorKind::WouldBlock => return Flushed::Pending,
             Err(_) => return Flushed::Failed,
         }
+    }
+    if sub.buffer.is_empty() && sub.buffer.capacity() > 64 * 1024 {
+        sub.buffer.shrink_to(4096);
     }
     Flushed::Done
 }
@@ -119,7 +124,7 @@ impl<D: 'static> Subscribers<D> {
         self.inner.borrow_mut().list.push(Subscriber {
             id,
             stream,
-            buffer: Vec::new(),
+            buffer: VecDeque::new(),
             read: Some(read),
             write: None,
         });
@@ -161,7 +166,7 @@ impl<D: 'static> Subscribers<D> {
                     gone.push(sub.id);
                     continue;
                 }
-                sub.buffer.extend_from_slice(line.as_bytes());
+                sub.buffer.extend(line.as_bytes());
                 match flush(sub) {
                     Flushed::Done => {}
                     Flushed::Pending => {
