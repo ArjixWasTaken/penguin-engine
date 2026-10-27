@@ -83,6 +83,7 @@ pub struct Analyzer {
 }
 
 fn band_edges(sample_rate: u32) -> [usize; 65] {
+    let sample_rate = if sample_rate == 0 { 48_000 } else { sample_rate };
     let per_bin = sample_rate as f32 / FFT_SIZE as f32;
     let (lo, hi) = (MIN_FREQ.log10(), MAX_FREQ.log10());
     let mut edges = [0usize; 65];
@@ -122,9 +123,9 @@ impl Analyzer {
         let mut input: Vec<f32> = samples.zip(&self.window).map(|(s, w)| s * w).collect();
         input.resize(FFT_SIZE, 0.0);
         let mut output = self.fft.make_output_vec();
-        self.fft
-            .process(&mut input, &mut output)
-            .expect("buffers sized by the planner");
+        if self.fft.process(&mut input, &mut output).is_err() {
+            return vec![0.0; BINS];
+        }
         let norm = 2.0 / FFT_SIZE as f32;
         let mut mags: Vec<f32> = output.iter().map(|c| c.norm() * norm).collect();
         mags[0] *= 0.5;
@@ -134,11 +135,14 @@ impl Analyzer {
 
     fn bands(&self, mags: &[f32], smooth: &mut [f32; 64]) {
         for (b, value) in smooth.iter_mut().enumerate() {
-            let (lo, hi) = (
-                self.edges[b],
-                self.edges[b + 1].max(self.edges[b] + 1).min(BINS),
-            );
-            let mean = mags[lo..hi].iter().sum::<f32>() / (hi - lo) as f32;
+            let lo = self.edges[b].min(BINS);
+            let hi = self.edges[b + 1].max(lo + 1).min(BINS);
+            let count = hi.saturating_sub(lo).max(1);
+            let mean = if lo < hi && hi <= mags.len() {
+                mags[lo..hi].iter().sum::<f32>() / count as f32
+            } else {
+                0.0
+            };
             let new = soft_saturate(mean * GAIN);
             *value = if new >= *value {
                 new * ATTACK + *value * (1.0 - ATTACK)
@@ -202,5 +206,12 @@ mod tests {
         );
         assert!(s.right64.iter().all(|&v| v < 1e-3));
         assert!(s.left16.iter().any(|&v| v > 0.1));
+    }
+
+    #[test]
+    fn handles_zero_sample_rate() {
+        let mut a = Analyzer::new(0);
+        let s = a.process(&vec![0.0; FFT_SIZE * 2]);
+        assert!(s.left64.iter().all(|&v| !v.is_nan() && !v.is_infinite()));
     }
 }
