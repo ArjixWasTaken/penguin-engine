@@ -23,18 +23,21 @@ pub fn default_dir() -> Option<PathBuf> {
     crate::config_dir().map(|d| d.join("presets"))
 }
 
-/// `s` made safe as one path component.
+/// `s` made safe as one path component across Linux and Windows/NTFS filesystems.
 fn file_name(s: &str) -> String {
     let mut name: String = s
         .chars()
         .map(|c| match c {
-            '/' | '\\' | '\0' => '_',
+            '/' | '\\' | '\0' | ':' | '*' | '?' | '"' | '<' | '>' | '|' => '_',
             c if c.is_control() => '_',
             c => c,
         })
         .collect();
     if name.is_empty() || name.starts_with('.') {
         name.insert(0, '_');
+    }
+    while name.len() > 240 {
+        name.pop();
     }
     name
 }
@@ -176,5 +179,12 @@ mod tests {
         std::fs::write(&shared, r#"{"name": "", "wallpaper": "", "values": {}}"#).unwrap();
         assert!(import(&store, &shared, None).is_err());
         assert_eq!(import(&store, &shared, Some("x")).unwrap().name, "shared");
+    }
+
+    #[test]
+    fn file_name_sanitizes_ntfs_and_truncates() {
+        assert_eq!(file_name("Mood: Chill? *Night* <1>"), "Mood_ Chill_ _Night_ _1_");
+        let long_name = "a".repeat(300);
+        assert_eq!(file_name(&long_name).len(), 240);
     }
 }
