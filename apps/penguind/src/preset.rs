@@ -64,6 +64,9 @@ fn non_empty(v: &Value) -> Option<String> {
 /// Find workshop item `id`: next to the preset item, else where workshop
 /// items are installed.
 fn find_dependency(item: &Path, id: &str) -> Result<PathBuf, String> {
+    if id.contains('/') || id.contains('\\') || id.contains("..") {
+        return Err(format!("invalid dependency id: {id:?}"));
+    }
     if let Some(sibling) = item.parent().map(|dir| dir.join(id))
         && sibling.join("project.json").is_file()
     {
@@ -123,9 +126,13 @@ pub fn resolve(path: &Path) -> Result<Item, String> {
                 Some("file" | "directory")
             ) && let Some(rel) = value.as_str().filter(|s| !s.is_empty())
                 && !Path::new(rel).is_absolute()
-                && dir.join(rel).exists()
             {
-                value = Value::String(dir.join(rel).display().to_string());
+                let candidate = dir.join(rel);
+                if let (Ok(can_cand), Ok(can_dir)) = (candidate.canonicalize(), dir.canonicalize())
+                    && can_cand.starts_with(&can_dir)
+                {
+                    value = Value::String(can_cand.display().to_string());
+                }
             }
             values.insert(name.clone(), value);
         }
@@ -230,6 +237,11 @@ mod tests {
         let lost = root.join("333");
         write(&lost, json!({"dependency": "999999999999", "preset": {}}));
         assert!(resolve(&lost).is_err());
+
+        // Traversal dependency IDs are rejected.
+        assert!(find_dependency(&root.join("111"), "../etc").is_err());
+        assert!(find_dependency(&root.join("111"), "sub/dir").is_err());
+
         std::fs::remove_dir_all(&root).unwrap();
     }
 }

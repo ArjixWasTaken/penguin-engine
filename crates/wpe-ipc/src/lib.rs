@@ -517,7 +517,20 @@ impl Client {
     /// Give up on a response after `timeout` (loading a wallpaper can take a
     /// while; the default is to wait forever).
     pub fn set_timeout(&self, timeout: Option<Duration>) -> io::Result<()> {
+        self.reader.get_ref().set_read_timeout(timeout)?;
+        self.writer.set_read_timeout(timeout)?;
+        self.writer.set_write_timeout(timeout)
+    }
+
+    /// Read timeout for incoming responses and events.
+    pub fn set_read_timeout(&self, timeout: Option<Duration>) -> io::Result<()> {
+        self.reader.get_ref().set_read_timeout(timeout)?;
         self.writer.set_read_timeout(timeout)
+    }
+
+    /// Write timeout for sending requests.
+    pub fn set_write_timeout(&self, timeout: Option<Duration>) -> io::Result<()> {
+        self.writer.set_write_timeout(timeout)
     }
 
     /// Send `request` and wait for its response.

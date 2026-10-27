@@ -143,4 +143,17 @@ mod tests {
         assert_eq!(vfs.layer_of("Shaders\\X.frag"), Some("b"));
         assert!(matches!(vfs.read("missing"), Err(VfsError::NotFound(_))));
     }
+
+    #[test]
+    fn physical_fs_skips_symlink_loops() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("file.txt"), "hello").unwrap();
+        #[cfg(unix)]
+        {
+            let loop_link = dir.path().join("loop");
+            let _ = std::os::unix::fs::symlink(dir.path(), loop_link);
+        }
+        let fs = PhysicalFs::new(dir.path()).expect("should handle cyclic symlink without crashing");
+        assert!(fs.contains("file.txt"));
+    }
 }

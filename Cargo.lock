@@ -6313,6 +6313,7 @@ dependencies = [
  "serde_json",
  "signal-hook",
  "smithay-client-toolkit",
+ "tempfile",
  "toml 1.1.8+spec-1.1.0",
  "tracing",
  "tracing-subscriber",

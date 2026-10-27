@@ -953,6 +953,9 @@ fn main() -> Result<()> {
                 systemd::notify(&[NotifyState::Reloading]);
                 if let Err(e) = app.reload_settings() {
                     tracing::error!("{e}");
+                    systemd::status(&format!("settings reload failed: {e}"));
+                } else {
+                    app.update_status();
                 }
                 systemd::notify(&[NotifyState::Ready]);
                 Ok(PostAction::Continue)

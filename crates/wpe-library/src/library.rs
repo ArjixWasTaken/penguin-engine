@@ -114,8 +114,8 @@ fn candidates(sources: &Sources) -> Vec<Candidate> {
         };
         let mut children: Vec<PathBuf> = entries
             .flatten()
-            .filter(|e| e.file_type().is_ok_and(|t| t.is_dir() || t.is_symlink()))
             .map(|e| e.path())
+            .filter(|p| p.is_dir())
             .collect();
         children.sort();
         children
@@ -202,7 +202,7 @@ fn rating_of(project: &Project) -> Rating {
 /// `name` in `dir`, matched case-insensitively, if it exists.
 pub(crate) fn find_file(dir: &Path, name: &str) -> Option<PathBuf> {
     let name = name.trim_start_matches(['/', '\\']).replace('\\', "/");
-    if name.is_empty() {
+    if name.is_empty() || name.contains('\\') || name.split('/').any(|p| p == ".." || p == ".") {
         return None;
     }
     let exact = dir.join(&name);
