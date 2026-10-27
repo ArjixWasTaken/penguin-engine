@@ -461,12 +461,12 @@ fn is_local_origin(origin: &str) -> bool {
 fn serve_file(load: WebResourceLoad, path: &std::path::Path, url: Url) {
     let mut response = crate::serve::respond(path, range(&load).as_deref());
     // Only mirror the Origin header for verified local origins
-    if let Some(req_origin) = origin(&load) {
-        if is_local_origin(&req_origin) {
-            response
-                .headers
-                .push(("Access-Control-Allow-Origin", req_origin));
-        }
+    if let Some(req_origin) = origin(&load)
+        && is_local_origin(&req_origin)
+    {
+        response
+            .headers
+            .push(("Access-Control-Allow-Origin", req_origin));
     }
     respond(load, url, response);
 }
