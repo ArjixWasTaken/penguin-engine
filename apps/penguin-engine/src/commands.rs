@@ -288,7 +288,7 @@ pub async fn set_autostart(enabled: bool) -> Result<(), String> {
 /// `systemctl --user ...`: its output, or why it failed.
 async fn systemctl(args: &[&str]) -> Result<String, String> {
     let args: Vec<String> = args.iter().map(|s| s.to_string()).collect();
-    tauri::async_runtime::spawn_blocking(move || {
+    let fut = tauri::async_runtime::spawn_blocking(move || {
         let out = std::process::Command::new("systemctl")
             .arg("--user")
             .args(&args)
@@ -301,9 +301,11 @@ async fn systemctl(args: &[&str]) -> Result<String, String> {
         } else {
             Err(String::from_utf8_lossy(&out.stderr).trim().to_owned())
         }
-    })
-    .await
-    .map_err(|e| e.to_string())?
+    });
+    match tokio::time::timeout(Duration::from_secs(5), fut).await {
+        Ok(res) => res.map_err(|e| e.to_string())?,
+        Err(_) => Err("systemctl timed out after 5s".to_owned()),
+    }
 }
 
 fn presets_dir() -> Result<PathBuf, String> {
