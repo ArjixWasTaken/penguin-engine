@@ -16,10 +16,16 @@ impl PhysicalFs {
         let root = root.into();
         let mut index = HashMap::new();
         for entry in walkdir::WalkDir::new(&root).follow_links(true) {
-            let entry = entry.map_err(|e| VfsError::Io {
-                path: root.display().to_string(),
-                source: e.into(),
-            })?;
+            let entry = match entry {
+                Ok(e) => e,
+                Err(e) => {
+                    tracing::debug!(
+                        "skipping unreadable or looping entry in {}: {e}",
+                        root.display()
+                    );
+                    continue;
+                }
+            };
             if !entry.file_type().is_file() {
                 continue;
             }
