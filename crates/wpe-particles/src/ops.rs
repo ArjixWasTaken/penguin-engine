@@ -373,6 +373,7 @@ pub(crate) fn initialize(
         } => {
             let seq = state.sequence;
             state.sequence = state.sequence.wrapping_add(1);
+            let count = (*count).max(1.0);
             let mut f = (seq as f32 / count).fract();
             if *mirror {
                 let k = (seq as f32 / count).floor() as i64;
