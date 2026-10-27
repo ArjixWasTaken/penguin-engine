@@ -96,9 +96,13 @@ impl ShaderHandle {
     }
 
     fn log(&self) -> String {
-        // SAFETY: the handle is live; glslang returns a NUL-terminated string.
-        let log = unsafe { CStr::from_ptr(sys::glslang_shader_get_info_log(self.raw.as_ptr())) };
-        log.to_string_lossy().trim().to_owned()
+        let ptr = unsafe { sys::glslang_shader_get_info_log(self.raw.as_ptr()) };
+        if ptr.is_null() {
+            String::new()
+        } else {
+            let log = unsafe { CStr::from_ptr(ptr) };
+            log.to_string_lossy().trim().to_owned()
+        }
     }
 
     fn preprocess(&self) -> Result<(), String> {
@@ -110,10 +114,13 @@ impl ShaderHandle {
     }
 
     fn preprocessed_code(&self) -> String {
-        // SAFETY: called after a successful preprocess.
-        let code =
-            unsafe { CStr::from_ptr(sys::glslang_shader_get_preprocessed_code(self.raw.as_ptr())) };
-        code.to_string_lossy().into_owned()
+        let ptr = unsafe { sys::glslang_shader_get_preprocessed_code(self.raw.as_ptr()) };
+        if ptr.is_null() {
+            String::new()
+        } else {
+            let code = unsafe { CStr::from_ptr(ptr) };
+            code.to_string_lossy().into_owned()
+        }
     }
 
     fn parse(&self) -> Result<(), String> {
@@ -226,9 +233,13 @@ impl Program {
     }
 
     fn log(&self) -> String {
-        // SAFETY: the handle is live; glslang returns a NUL-terminated string.
-        let log = unsafe { CStr::from_ptr(sys::glslang_program_get_info_log(self.0.as_ptr())) };
-        log.to_string_lossy().trim().to_owned()
+        let ptr = unsafe { sys::glslang_program_get_info_log(self.0.as_ptr()) };
+        if ptr.is_null() {
+            String::new()
+        } else {
+            let log = unsafe { CStr::from_ptr(ptr) };
+            log.to_string_lossy().trim().to_owned()
+        }
     }
 }
 
