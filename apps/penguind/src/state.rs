@@ -94,17 +94,24 @@ impl State {
     pub fn save(&self, path: &Path) -> Result<()> {
         let dir = path.parent().context("state path without a directory")?;
         std::fs::create_dir_all(dir).with_context(|| format!("creating {}", dir.display()))?;
-        let tmp = path.with_extension(format!("json.{}.tmp", std::process::id()));
-        let write = || -> std::io::Result<()> {
-            let mut file = std::fs::File::create(&tmp)?;
-            serde_json::to_writer_pretty(&mut file, self)?;
-            file.write_all(b"\n")?;
-            file.sync_all()?;
-            std::fs::rename(&tmp, path)
-        };
-        write().inspect_err(|_| {
-            let _ = std::fs::remove_file(&tmp);
-        })?;
+        let mut temp = tempfile::Builder::new()
+            .prefix(".state-")
+            .suffix(".tmp")
+            .tempfile_in(dir)
+            .with_context(|| format!("creating tempfile in {}", dir.display()))?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let _ = temp
+                .as_file()
+                .set_permissions(std::fs::Permissions::from_mode(0o600));
+        }
+        serde_json::to_writer_pretty(&mut temp, self)?;
+        temp.write_all(b"\n")?;
+        temp.as_file().sync_all()?;
+        temp.persist(path)
+            .map_err(|e| e.error)
+            .with_context(|| format!("persisting {}", path.display()))?;
         Ok(())
     }
 
